@@ -9,7 +9,7 @@ license.workspace = true
 brush-render.path = "../brush-render"
 brush-cube.path = "../brush-cube"
 
-burn = { workspace = true, features = ["autodiff"] }
+burn = { workspace = true, features = ["wgpu", "autodiff"] }
 burn-cubecl.workspace = true
 burn-fusion.workspace = true
 burn-ir.workspace = true

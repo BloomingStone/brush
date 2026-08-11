@@ -581,3 +581,69 @@ pub fn calc_sigma(px: f32, py: f32, conic: Sym2, xy_x: f32, xy_y: f32) -> f32 {
     let dy = py - xy_y;
     0.5f32 * (conic.c00 * dx * dx + conic.c11 * dy * dy) + conic.c01 * dx * dy
 }
+
+
+/// `W = (R·S)(R·S)ᵀ = R·S²·Rᵀ`, ref: `calc_cov2d`
+#[cube]
+pub fn compute_cov3d(scale: Vec3A, quat: Quat) -> Sym3 {
+    let r = quat.to_mat3();
+    // M = R·S — right-multiplying by the diagonal S scales each COLUMN of R
+    // by the matching scalar (s0, s1, s2).
+    let m = Mat3::from_cols(
+        r.col0().scale(scale.x()),
+        r.col1().scale(scale.y()),
+        r.col2().scale(scale.z()),
+    );
+    // Sigma = M·Mᵀ = R·S²·Rᵀ — symmetric, entries are row-dots.
+    let r0 = m.row0();
+    let r1 = m.row1();
+    let r2 = m.row2();
+    Sym3 {
+        c00: r0.dot(r0),
+        c01: r0.dot(r1),
+        c02: r0.dot(r2),
+        c11: r1.dot(r1),
+        c12: r1.dot(r2),
+        c22: r2.dot(r2),
+    }
+}
+
+/// Quaternion-normalize VJP: `dnormvdv(v, dv)` for a 4-vector, i.e. the
+/// gradient of `normalize(v)` back-propagated from `dv = dL/dnormalize(v)`.
+/// `v` MUST be the UNNORMALIZED input to `normalize` — passing the
+/// normalized (unit) vector drops the `1/||v||` factor.
+#[cube]
+pub fn dnormvdv4(v: Quat, dv: Quat) -> Quat {
+    let sum2 = v.dot(v);
+    let invsum32 = 1.0f32 / f32::sqrt(sum2 * sum2 * sum2);
+    let vdv = v.w() * dv.w() + v.x() * dv.x() + v.y() * dv.y() + v.z() * dv.z();
+    let dw = ((sum2 - v.w() * v.w()) * dv.w() - v.w() * (vdv - v.w() * dv.w())) * invsum32;
+    let dx = ((sum2 - v.x() * v.x()) * dv.x() - v.x() * (vdv - v.x() * dv.x())) * invsum32;
+    let dy = ((sum2 - v.y() * v.y()) * dv.y() - v.y() * (vdv - v.y() * dv.y())) * invsum32;
+    let dz = ((sum2 - v.z() * v.z()) * dv.z() - v.z() * (vdv - v.z() * dv.z())) * invsum32;
+    Quat::new(dw, dx, dy, dz)
+}
+
+/// Inverse of a symmetric 3×3 via cofactors, matching R2-Gaussian's
+/// voxelizer `preprocessCUDA` (`inv_a..inv_f`). Returns the zero matrix
+/// when `det == 0`.
+#[cube]
+pub fn sym3_inverse(self_: Sym3) -> Sym3 {
+    let a = self_.c00;
+    let b = self_.c01;
+    let c = self_.c02;
+    let d = self_.c11;
+    let e = self_.c12;
+    let f = self_.c22;
+    let det = a * d * f + 2.0f32 * b * c * e - a * e * e - f * b * b - d * c * c;
+    let invertible = det != 0.0f32;
+    let det_inv = select(invertible, 1.0f32 / det, 0.0f32);
+    Sym3 {
+        c00: (d * f - e * e) * det_inv,
+        c01: (c * e - b * f) * det_inv,
+        c02: (b * e - c * d) * det_inv,
+        c11: (a * f - c * c) * det_inv,
+        c12: (b * c - a * e) * det_inv,
+        c22: (a * d - b * b) * det_inv,
+    }
+}

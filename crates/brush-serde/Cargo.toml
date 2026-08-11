@@ -9,7 +9,7 @@ license.workspace = true
 brush-render.path = "../brush-render"
 brush-serde-macros.path = "../brush-serde-macros"
 
-burn.workspace = true
+burn = { workspace = true, features = ["wgpu"] }
 glam.workspace = true
 serde.workspace = true
 serde-ply.workspace = true

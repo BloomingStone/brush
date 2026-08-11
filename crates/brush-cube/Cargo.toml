@@ -6,7 +6,11 @@ readme.workspace = true
 license.workspace = true
 
 [dependencies]
-burn.workspace = true
+# `wgpu` feature required: host.rs uses `WgpuRuntime`/`CubeTensor<WgpuRuntime>`
+# which need `WgpuDevice: DeviceOps` (gated by burn-backend/cubecl-wgpu, only
+# reachable via burn's `wgpu` feature). Without it, isolated builds of any
+# crate that depends on brush-cube fail (e.g. `cargo bench -p brush-sort`).
+burn = { workspace = true, features = ["wgpu"] }
 burn-cubecl.workspace = true
 burn-wgpu.workspace = true
 bytemuck = { workspace = true, features = ["derive"] }

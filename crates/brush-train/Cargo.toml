@@ -29,7 +29,7 @@ ball-tree.workspace = true
 rayon.workspace = true
 
 tokio = { workspace = true, features = ["io-util", "rt"] }
-burn = { workspace = true, features = ["autodiff"] }
+burn = { workspace = true, features = ["wgpu", "autodiff"] }
 burn-cubecl.workspace = true
 
 [dev-dependencies]

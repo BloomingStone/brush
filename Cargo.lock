@@ -1243,6 +1243,71 @@ dependencies = [
 ]
 
 [[package]]
+name = "brush-voxel"
+version = "0.3.0"
+dependencies = [
+ "assert_approx_eq",
+ "brush-cube",
+ "brush-prefix-sum",
+ "brush-render",
+ "brush-sort",
+ "brush-xray",
+ "burn",
+ "burn-cubecl",
+ "burn-fusion",
+ "burn-ir",
+ "burn-wgpu",
+ "bytemuck",
+ "glam",
+ "safetensors 0.7.0",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "brush-xray"
+version = "0.3.0"
+dependencies = [
+ "assert_approx_eq",
+ "brush-cube",
+ "brush-prefix-sum",
+ "brush-render",
+ "brush-sort",
+ "burn",
+ "burn-cubecl",
+ "burn-fusion",
+ "burn-ir",
+ "burn-wgpu",
+ "bytemuck",
+ "glam",
+ "safetensors 0.7.0",
+ "serde",
+ "tokio",
+ "tracing",
+ "wasm-bindgen-test",
+]
+
+[[package]]
+name = "brush-xray-bwd"
+version = "0.3.0"
+dependencies = [
+ "assert_approx_eq",
+ "brush-cube",
+ "brush-render",
+ "brush-xray",
+ "burn",
+ "burn-cubecl",
+ "burn-fusion",
+ "burn-ir",
+ "burn-wgpu",
+ "glam",
+ "safetensors 0.7.0",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "bstr"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

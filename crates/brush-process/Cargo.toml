@@ -15,7 +15,7 @@ brush-render-bwd.path = "../brush-render-bwd"
 brush-vfs.path = "../brush-vfs"
 brush-serde.path = "../brush-serde"
 
-burn.workspace = true
+burn = { workspace = true, features = ["wgpu"] }
 burn-cubecl.workspace = true
 burn-wgpu.workspace = true
 

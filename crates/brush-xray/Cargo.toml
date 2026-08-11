@@ -1,0 +1,38 @@
+[package]
+name = "brush-xray"
+edition.workspace = true
+version.workspace = true
+readme.workspace = true
+license.workspace = true
+
+# Cone-beam X-ray (volume-rendering) rasterizer for Gaussian splats,
+# ported from R2-Gaussian's `xray-gaussian-rasterization-voxelization`
+# (CUDA) to backend-agnostic cubecl kernels. Forward-only here; the
+# differentiable wiring lives in `brush-xray-bwd`.
+
+[dependencies]
+brush-cube.path = "../brush-cube"
+brush-render.path = "../brush-render"
+brush-prefix-sum.path = "../brush-prefix-sum"
+brush-sort.path = "../brush-sort"
+
+burn = { workspace = true, features = ["wgpu"] }
+burn-wgpu.workspace = true
+burn-cubecl.workspace = true
+burn-fusion.workspace = true
+burn-ir.workspace = true
+
+assert_approx_eq.workspace = true
+glam.workspace = true
+tracing.workspace = true
+bytemuck.workspace = true
+serde.workspace = true
+
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+safetensors.workspace = true
+
+[lints]
+workspace = true

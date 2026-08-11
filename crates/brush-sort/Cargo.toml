@@ -7,7 +7,9 @@ license.workspace = true
 
 [dependencies]
 brush-cube.path = "../brush-cube"
-burn.workspace = true
+# `wgpu` feature: bench/`radix_argsort` launch with `WgpuRuntime`, which needs
+# `WgpuDevice: DeviceOps` (burn-backend/cubecl-wgpu) to implement CubeRuntime.
+burn = { workspace = true, features = ["wgpu"] }
 bytemuck = { workspace = true, features = ["derive"] }
 burn-wgpu.workspace = true
 burn-cubecl.workspace = true

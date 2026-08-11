@@ -1,0 +1,36 @@
+[package]
+name = "brush-voxel"
+edition.workspace = true
+version.workspace = true
+readme.workspace = true
+license.workspace = true
+
+# 3D density-volume voxelizer for Gaussian splats, ported from
+# R2-Gaussian's `xray-gaussian-rasterization-voxelization` (CUDA) to
+# backend-agnostic cubecl kernels. Independent of any camera — it only
+# needs splat params + a voxel grid. Forward + backward in one crate.
+
+[dependencies]
+brush-cube.path = "../brush-cube"
+brush-render.path = "../brush-render"
+brush-prefix-sum.path = "../brush-prefix-sum"
+brush-sort.path = "../brush-sort"
+brush-xray.path = "../brush-xray"
+
+burn = { workspace = true, features = ["wgpu", "autodiff"] }
+burn-wgpu.workspace = true
+burn-cubecl.workspace = true
+burn-fusion.workspace = true
+burn-ir.workspace = true
+
+assert_approx_eq.workspace = true
+glam.workspace = true
+tracing.workspace = true
+bytemuck.workspace = true
+serde.workspace = true
+
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+safetensors.workspace = true
+
+[lints]
+workspace = true

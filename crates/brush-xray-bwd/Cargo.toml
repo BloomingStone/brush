@@ -1,0 +1,34 @@
+[package]
+name = "brush-xray-bwd"
+edition.workspace = true
+version.workspace = true
+readme.workspace = true
+license.workspace = true
+
+# Differentiable cone-beam X-ray rasterization: wires `brush-xray`'s
+# forward through burn autodiff with hand-written backward kernels,
+# mirroring `brush-render-bwd`.
+
+[dependencies]
+brush-cube.path = "../brush-cube"
+brush-render.path = "../brush-render"
+brush-xray.path = "../brush-xray"
+
+burn = { workspace = true, features = ["wgpu", "autodiff"] }
+burn-wgpu.workspace = true
+burn-cubecl.workspace = true
+burn-fusion.workspace = true
+burn-ir.workspace = true
+
+glam.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+brush-render = { path = "../brush-render", features = ["debug-validation"] }
+brush-cube = { path = "../brush-cube" }
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+safetensors.workspace = true
+assert_approx_eq.workspace = true
+
+[lints]
+workspace = true

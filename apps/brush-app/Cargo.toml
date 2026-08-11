@@ -46,7 +46,7 @@ tracing-tracy = { workspace = true, optional = true }
 
 
 serde.workspace = true
-burn.workspace = true
+burn = { workspace = true, features = ["wgpu"] }
 burn-wgpu.workspace = true
 glam.workspace = true
 rand.workspace = true
