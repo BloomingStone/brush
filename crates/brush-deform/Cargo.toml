@@ -1,0 +1,22 @@
+[package]
+name = "brush-deform"
+edition.workspace = true
+version.workspace = true
+readme.workspace = true
+license.workspace = true
+description = "Cardiac-phase-guided deformation network for dynamic X-ray Gaussian splats."
+
+[dependencies]
+brush-render.path = "../brush-render"
+brush-xray.path = "../brush-xray"
+
+burn.workspace = true
+glam.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+brush-cube.path = "../brush-cube"
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }

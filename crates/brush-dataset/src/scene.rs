@@ -13,10 +13,77 @@ pub enum ViewType {
     Test,
 }
 
+/// Pre-normalized single-channel (grayscale) ground-truth image for X-ray
+/// (DICOM) views. Pixel values are in `[0, 1]`, row-major `[height, width]`.
+#[derive(Clone, Debug)]
+pub struct GrayImage {
+    pub data: Arc<[f32]>,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl GrayImage {
+    pub fn new(data: Vec<f32>, width: u32, height: u32) -> Self {
+        debug_assert_eq!(
+            data.len(),
+            (width * height) as usize,
+            "GrayImage data length must equal width * height"
+        );
+        Self {
+            data: Arc::from(data),
+            width,
+            height,
+        }
+    }
+
+    /// Pixel at `(row, col)`.
+    pub fn at(&self, row: u32, col: u32) -> f32 {
+        self.data[(row * self.width + col) as usize]
+    }
+}
+
 #[derive(Clone)]
 pub struct SceneView {
     pub image: LoadImage,
     pub camera: Camera,
+    /// Normalized time in `[0, 1]` (X-ray / dynamic scenes). Zero otherwise.
+    pub time: f32,
+    /// Cardiac phase conditioning input (X-ray). Zero otherwise.
+    pub phase: f32,
+    /// Pre-normalized single-channel GT image for X-ray views. `None` for
+    /// standard RGB scenes.
+    pub gray_image: Option<GrayImage>,
+}
+
+impl SceneView {
+    /// Build a standard RGB scene view (no time / phase / gray image).
+    pub fn rgb(camera: Camera, image: LoadImage) -> Self {
+        Self {
+            image,
+            camera,
+            time: 0.0,
+            phase: 0.0,
+            gray_image: None,
+        }
+    }
+
+    /// Build an X-ray scene view with per-frame time / phase and a
+    /// pre-normalized grayscale GT image.
+    pub fn xray(
+        camera: Camera,
+        image: LoadImage,
+        time: f32,
+        phase: f32,
+        gray_image: GrayImage,
+    ) -> Self {
+        Self {
+            image,
+            camera,
+            time,
+            phase,
+            gray_image: Some(gray_image),
+        }
+    }
 }
 
 // Encapsulates a multi-view scene including cameras and the splats.
@@ -64,6 +131,9 @@ impl Scene {
             .map(|v| SceneView {
                 image: v.image.with_scale(scale),
                 camera: v.camera,
+                time: v.time,
+                phase: v.phase,
+                gray_image: v.gray_image,
             })
             .collect();
         Self::new(views)
@@ -137,6 +207,13 @@ pub struct SceneBatch {
     pub has_alpha: bool,
     pub alpha_mode: AlphaMode,
     pub camera: Camera,
+    /// Normalized time in `[0, 1]` (X-ray / dynamic scenes). Zero otherwise.
+    pub time: f32,
+    /// Cardiac phase conditioning input (X-ray). Zero otherwise.
+    pub phase: f32,
+    /// Pre-normalized single-channel GT image `[H, W]` f32 for X-ray views.
+    /// `None` for standard RGB scenes.
+    pub img_gray: Option<TensorData>,
 }
 
 impl SceneBatch {

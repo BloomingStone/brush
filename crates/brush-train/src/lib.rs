@@ -5,6 +5,9 @@ pub mod eval;
 pub mod lod;
 pub mod msg;
 pub mod train;
+pub mod xray_eval;
+pub mod xray_refine;
+pub mod xray_train;
 
 mod adam_scaled;
 mod multinomial;

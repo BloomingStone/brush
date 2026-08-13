@@ -37,9 +37,18 @@ pub(crate) async fn train_stream(
     emitter: &Emitter,
     slot: SlotSender<Splats>,
 ) -> anyhow::Result<()> {
+    // X-ray deform-GS path: completely separate loop over DICOM frames.
+    if train_stream_config.process_config.xray {
+        return crate::xray_stream::xray_stream(vfs, train_stream_config, emitter, slot).await;
+    }
+
     log::info!("Start of training stream");
 
-    let visualize = VisualizeTools::new(train_stream_config.rerun_config.rerun_enabled).await;
+    let visualize = VisualizeTools::new(
+        train_stream_config.rerun_config.rerun_enabled,
+        train_stream_config.rerun_config.rerun_rrd.clone(),
+    )
+    .await;
 
     emitter
         .emit(ProcessMessage::TrainMessage(TrainMessage::TrainConfig {

@@ -114,3 +114,77 @@ impl XRayProjectUniforms {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify the cube-side view matrix built by [`XRayProjectUniforms`]
+    /// reproduces the Python `get_proj_matric.py` reference projection for
+    /// an AP C-arm at alpha=beta=0 (gs/COLMAP convention, `rotate_dsa`
+    /// geometry: SDD=1200, SOD=760, 648x474, delx=0.616).
+    ///
+    /// Python reference (cx=W/2=324, cy=H/2=237; brush uses (S-1)/2 → ±0.5 px):
+    ///   (0,0,0)    → (324,   237)
+    ///   (100,0,0)  → (67.7,  237)
+    ///   (0,100,0)  → (324,   237)
+    ///   (0,0,100)  → (324,  -19.3)
+    ///   (-100,0,0) → (580.3, 237)
+    ///   (0,0,-100) → (324,   493.3)
+    #[test]
+    fn from_camera_viewmat_matches_python_reference() {
+        // Reorient(AP, gs) = [[-1,0,0],[0,0,-1],[0,-1,0]] (row-major), which is
+        // symmetric, so passing it as columns gives the same matrix.
+        let rotation = glam::DQuat::from_mat3(&glam::DMat3::from_cols_array_2d(&[
+            [-1.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0],
+            [0.0, -1.0, 0.0],
+        ]));
+        // FOVs in RADIANS (brush Camera convention): fx=fy=1200/0.616=1948.05,
+        // fov_x=2·atan(324/1948.05), fov_y=2·atan(237/1948.05).
+        let cam = Camera::new(
+            glam::Vec3::new(0.0, 760.0, 0.0),
+            glam::Quat::from_xyzw(
+                rotation.x as f32,
+                rotation.y as f32,
+                rotation.z as f32,
+                rotation.w as f32,
+            ),
+            2.0 * (324.0_f64 / (1200.0 / 0.616)).atan(),
+            2.0 * (237.0_f64 / (1200.0 / 0.616)).atan(),
+            glam::Vec2::splat(0.5),
+            brush_render::kernels::camera_model::CameraModel::Pinhole,
+        );
+        let img = glam::uvec2(648, 474);
+        let u = XRayProjectUniforms::from_camera(&cam, img, 1000, 1.0);
+
+        // Column-major viewmat.
+        let v = |c: usize, r: usize| u.viewmat[c][r];
+        let w2c = |p: glam::Vec3| -> glam::Vec3 {
+            glam::Vec3::new(
+                v(0, 0) * p.x + v(1, 0) * p.y + v(2, 0) * p.z + v(3, 0),
+                v(0, 1) * p.x + v(1, 1) * p.y + v(2, 1) * p.z + v(3, 1),
+                v(0, 2) * p.x + v(1, 2) * p.y + v(2, 2) * p.z + v(3, 2),
+            )
+        };
+
+        let pts = [
+            ([0.0f32, 0.0, 0.0], (324.0, 237.0)),
+            ([100.0, 0.0, 0.0], (67.7, 237.0)),
+            ([0.0, 100.0, 0.0], (324.0, 237.0)),
+            ([0.0, 0.0, 100.0], (324.0, -19.3)),
+            ([-100.0, 0.0, 0.0], (580.3, 237.0)),
+            ([0.0, 0.0, -100.0], (324.0, 493.3)),
+        ];
+        for (p, (ref_u, ref_v)) in pts {
+            let p_c = w2c(glam::Vec3::new(p[0], p[1], p[2]));
+            let uu = u.focal.x * p_c.x / p_c.z + u.center.x;
+            let vv = u.focal.y * p_c.y / p_c.z + u.center.y;
+            let tol = 1.0;
+            assert!(
+                (uu - ref_u).abs() < tol && (vv - ref_v).abs() < tol,
+                "P={p:?} P_c={p_c:?}: uv=({uu:.2},{vv:.2}) expected ({ref_u:.1},{ref_v:.1})"
+            );
+        }
+    }
+}

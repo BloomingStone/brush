@@ -127,6 +127,9 @@ fn generate_test_batch(resolution: (u32, u32)) -> SceneBatch {
         has_alpha: false,
         alpha_mode: AlphaMode::Transparent,
         camera,
+        time: 0.0,
+        phase: 0.0,
+        img_gray: None,
     }
 }
 
@@ -253,6 +256,9 @@ async fn train_with_zero_visible_does_not_crash() {
         has_alpha: false,
         alpha_mode: AlphaMode::Transparent,
         camera,
+        time: 0.0,
+        phase: 0.0,
+        img_gray: None,
     };
 
     let config = TrainConfig::default();

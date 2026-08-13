@@ -35,6 +35,9 @@ pub struct XRayRasterizeGrads<B: burn::backend::Backend> {
 pub struct XRaySplatGrads<B: burn::backend::Backend> {
     pub v_transforms: FloatTensor<B>,
     pub v_raw_opac: FloatTensor<B>,
+    /// Dense per-splat viewspace (mean2D) gradient norm, used for
+    /// densification by the density controller.
+    pub v_refine_weight: FloatTensor<B>,
 }
 
 /// Backward pass trait mirroring [`XRayOps`].
@@ -149,6 +152,7 @@ impl XRaySplatBwdOps for MainBackendBase {
         let v_transforms =
             Self::float_zeros([num_points, 10].into(), &device, FloatDType::F32);
         let v_raw_opac = Self::float_zeros([num_points].into(), &device, FloatDType::F32);
+        let v_refine_weight = Self::float_zeros([num_points].into(), &device, FloatDType::F32);
 
         let num_visible = uniforms.num_visible;
         let launch_uniforms = uniforms.to_launch_object();
@@ -164,6 +168,7 @@ impl XRaySplatBwdOps for MainBackendBase {
                 v_combined.into_tensor_arg(),
                 v_transforms.clone().into_tensor_arg(),
                 v_raw_opac.clone().into_tensor_arg(),
+                v_refine_weight.clone().into_tensor_arg(),
                 launch_uniforms,
             );
         });
@@ -171,6 +176,7 @@ impl XRaySplatBwdOps for MainBackendBase {
         XRaySplatGrads {
             v_transforms,
             v_raw_opac,
+            v_refine_weight,
         }
     }
 }

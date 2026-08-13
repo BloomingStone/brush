@@ -9,6 +9,8 @@ members = [
     "crates/brush-bench-test",
     "crates/brush-cube",
     "crates/brush-dataset",
+    "crates/brush-deform",
+    "crates/brush-dicom",
     "crates/brush-loss",
     "crates/brush-prefix-sum",
     "crates/brush-process",
@@ -70,6 +72,16 @@ async-channel = "2.5.0"
 
 anyhow = "1.0.94"
 thiserror = "2.0"
+
+# DICOM parsing for X-ray reconstruction. Kept on the granular crates with
+# `default-features = false` so the dependency tree stays wasm-friendly and
+# doesn't pull in image/pixel-data decoding we don't need (the rotational-DSA
+# files we target are uncompressed 16-bit MONOCHROME2).
+dicom-core = { version = "0.10", default-features = false }
+dicom-object = { version = "0.10", default-features = false }
+dicom-parser = { version = "0.10", default-features = false }
+dicom-encoding = { version = "0.10", default-features = false }
+dicom-transfer-syntax-registry = { version = "0.10", default-features = false }
 
 reqwest = { version = "0.13", default-features = false, features = [
     "stream",

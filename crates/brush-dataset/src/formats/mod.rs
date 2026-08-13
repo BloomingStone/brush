@@ -7,6 +7,7 @@ use itertools::{Either, Itertools};
 use std::{path::Path, sync::Arc};
 
 pub mod colmap;
+pub mod dicom;
 pub mod nerfstudio;
 pub mod realitycapture;
 
@@ -57,7 +58,12 @@ pub async fn load_dataset(
     vfs: Arc<BrushVfs>,
     load_args: &LoadDatasetConfig,
 ) -> Result<DatasetLoadResult, DatasetError> {
-    let mut dataset = colmap::load_dataset(vfs.clone(), load_args).await;
+    // DICOM X-ray datasets are detected by the presence of a `.dcm` file.
+    let mut dataset = dicom::load_dataset(vfs.clone(), load_args).await;
+
+    if dataset.is_none() {
+        dataset = colmap::load_dataset(vfs.clone(), load_args).await;
+    }
 
     if dataset.is_none() {
         dataset = nerfstudio::read_dataset(vfs.clone(), load_args).await;

@@ -182,6 +182,20 @@ impl BrushVfs {
                     reader: Arc::new(Mutex::new(Some(reader))),
                 },
             })
+        } else if name
+            .as_deref()
+            .is_some_and(|n| n.to_ascii_lowercase().ends_with(".dcm"))
+        {
+            // Single DICOM files stream the same way as PLY (the parser
+            // reads the whole file, so a take-once reader is fine).
+            let path = PathBuf::from(name.unwrap_or_else(|| "input.dcm".to_owned()));
+
+            Ok(Self {
+                lookup: lookup_from_paths(std::slice::from_ref(&path)),
+                container: VfsContainer::Streaming {
+                    reader: Arc::new(Mutex::new(Some(reader))),
+                },
+            })
         } else if peek.starts_with(b"PK") {
             let mut zip_reader = ZipFileReader::new(reader.compat());
             let mut entries = HashMap::new();

@@ -42,6 +42,7 @@ brush-async.path = "../brush-async"
 brush-train = { path = "../brush-train" }
 brush-dataset = { path = "../brush-dataset"}
 brush-rerun = { path = "../brush-rerun" }
+brush-xray = { path = "../brush-xray" }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"

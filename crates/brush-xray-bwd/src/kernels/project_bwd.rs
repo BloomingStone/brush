@@ -7,7 +7,7 @@
 use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::cube;
 use burn_cubecl::cubecl::prelude::*;
-use brush_cube::{Mat3, Quat, Sym2, Sym3, Vec3A, compute_cov3d, dnormvdv4, sigmoid};
+use brush_cube::{Mat3, Quat, Sym2, Sym3, Vec3A, compute_cov3d, dnormvdv4, is_finite_f32, sigmoid};
 use brush_xray::kernels::helpers::{
     XRAY_LANES, cone_geometry, read_quat_unorm_xray, read_scale_xray,
 };
@@ -242,6 +242,7 @@ pub fn project_xray_bwd_kernel(
     v_combined: &Tensor<f32>,
     v_transforms: &mut Tensor<f32>,
     v_raw_opac: &mut Tensor<f32>,
+    v_refine_weight: &mut Tensor<f32>,
     u: XRayProjectUniforms,
 ) {
     let compact_gid = ABSOLUTE_POS as u32;
@@ -296,6 +297,13 @@ pub fn project_xray_bwd_kernel(
     // Opacity: sigmoid → logit.
     let opac = sigmoid(raw_opac);
     let v_raw = v_opac * opac * (1.0f32 - opac);
+
+    // Refine weight: viewspace (mean2D) gradient norm per splat, used by the
+    // density controller for densification (mirrors the RGB render path's
+    // `v_refine_weight`). Clamped to stay finite / non-negative.
+    let refine_norm = f32::sqrt(v_xy.x() * v_xy.x() + v_xy.y() * v_xy.y());
+    let refine_clean = select(is_finite_f32(refine_norm), refine_norm, 0.0f32);
+    v_refine_weight[global_gid as usize] = clamp(refine_clean, 0.0f32, 1.0e32f32);
 
     // Write dense outputs (global-gid indexed).
     v_transforms[base] = v_mean.x();

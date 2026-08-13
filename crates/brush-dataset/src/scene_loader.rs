@@ -135,6 +135,24 @@ async fn run_loader(
 
         let batch = if let Some(batch) = cache.lock().await.get(index) {
             batch
+        } else if let Some(gray) = &view.gray_image {
+            // X-ray view: GT lives in the pre-normalized gray image; there is
+            // no RGB image to decode. The RGB buffer is a tiny dummy.
+            let img_gray = burn::tensor::TensorData::new(
+                gray.data.to_vec(),
+                [gray.height as usize, gray.width as usize],
+            );
+            let batch = Arc::new(SceneBatch {
+                img_packed: burn::tensor::TensorData::new(vec![0i32], [1usize, 1usize]),
+                has_alpha: false,
+                alpha_mode: view.image.alpha_mode(),
+                camera: view.camera,
+                time: view.time,
+                phase: view.phase,
+                img_gray: Some(img_gray),
+            });
+            cache.lock().await.insert(index, batch.clone());
+            batch
         } else {
             let raw = view
                 .image
@@ -143,11 +161,15 @@ async fn run_loader(
                 .expect("Scene loader failed to load an image");
             let sample = view_to_sample_image(raw, view.image.alpha_mode());
             let (img_packed, has_alpha) = sample_to_packed_data(sample);
+
             let batch = Arc::new(SceneBatch {
                 img_packed,
                 has_alpha,
                 alpha_mode: view.image.alpha_mode(),
                 camera: view.camera,
+                time: view.time,
+                phase: view.phase,
+                img_gray: None,
             });
             cache.lock().await.insert(index, batch.clone());
             batch

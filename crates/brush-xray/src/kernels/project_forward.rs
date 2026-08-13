@@ -68,7 +68,13 @@ pub fn project_forward_xray_kernel(
     }
 
     let opac = sigmoid(raw_opac);
-    if !(opac >= 1.0f32 / 255.0f32) {
+    // Physical-density floor: μ_water ≈ 0.002 mm⁻¹ is a perfectly meaningful
+    // Beer-Lambert path-integral contribution (0.002 × 200 mm ≈ 0.4 optical
+    // depth ≈ exp(-0.4) ≈ 0.67 intensity) even though it sits below the RGB
+    // opacity-visibility threshold of 1/255 ≈ 0.0039. Gate on the same tiny
+    // per-splat alpha floor as the rasterizer (MIN_ALPHA) instead, so low-μ
+    // soft-tissue/water backgrounds are actually projected.
+    if !(opac >= 1.0e-5f32) {
         terminate!();
     }
 

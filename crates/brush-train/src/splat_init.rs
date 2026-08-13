@@ -177,7 +177,14 @@ impl ball_tree::Point for BallPoint {
 }
 
 /// Compute scales using KNN based on point density.
-fn compute_knn_scales(pos_data: &[f32]) -> Vec<f32> {
+///
+/// Mirrors the Python reference (`sklearn NearestNeighbors`): per splat, the
+/// scale is derived from the average distance to its nearest neighbors —
+/// `dist = (1st + 2nd NN distance) / 4` (half the mean), clamped to
+/// `[1e-3, median_size * 0.1]`, then taken in log space. Dense regions get
+/// small splats, sparse regions get large ones. Shared by the RGB point-cloud
+/// init and the X-ray random-ball init.
+pub(crate) fn compute_knn_scales(pos_data: &[f32]) -> Vec<f32> {
     let _ = trace_span!("compute_knn_scales").entered();
 
     let n_splats = pos_data.len() / 3;

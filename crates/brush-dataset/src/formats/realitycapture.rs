@@ -149,7 +149,7 @@ async fn read_dataset_inner(
             continue;
         }
 
-        views.push(SceneView { camera, image });
+        views.push(SceneView::rgb(camera, image));
     }
 
     let (train_views, eval_views) = split_eval_every(views, load_args.eval_split_every);

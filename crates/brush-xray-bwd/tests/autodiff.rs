@@ -56,9 +56,9 @@ async fn autodiff_grads_match_pipeline() {
     );
 
     // Differentiable forward.
-    let img = render_xray(splats.clone(), &cam, img_size, 1.0).await;
-    assert_eq!(img.dims(), [64, 64]);
-    let loss = img.sum();
+    let out = render_xray(splats.clone(), &cam, img_size, 1.0).await;
+    assert_eq!(out.img.dims(), [64, 64]);
+    let loss = out.img.sum();
     let grads = loss.backward();
 
     let t_grad = splats.transforms.grad(&grads).expect("transforms grad");

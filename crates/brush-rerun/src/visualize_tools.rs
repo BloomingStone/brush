@@ -82,13 +82,31 @@ mod visualize_tools_impl {
     }
 
     impl VisualizeTools {
+        /// Create a visualization handle. When `rrd_path` is `Some`, log to a
+        /// `.rrd` file on disk (headless — no GUI / X11 needed, ideal for
+        /// remote SSH sessions); otherwise spawn a local Rerun Viewer. Either
+        /// of `enabled` / `rrd_path` turns logging on.
         #[allow(unused_variables)]
-        pub async fn new(enabled: bool) -> Self {
+        pub async fn new(enabled: bool, rrd_path: Option<String>) -> Self {
             let rec = tokio::task::spawn_blocking(move || {
-                if enabled {
-                    rerun::RecordingStreamBuilder::new("Brush")
-                        .spawn()
-                        .expect("Failed to spawn rerun")
+                if enabled || rrd_path.is_some() {
+                    match rrd_path {
+                        Some(path) => {
+                            // Rerun's FileSink does not create parent dirs.
+                            if let Some(parent) = std::path::Path::new(&path).parent()
+                                && !parent.as_os_str().is_empty()
+                            {
+                                std::fs::create_dir_all(parent)
+                                    .expect("Failed to create rerun rrd dir");
+                            }
+                            rerun::RecordingStreamBuilder::new("Brush")
+                                .save(path)
+                                .expect("Failed to open rerun rrd sink")
+                        }
+                        None => rerun::RecordingStreamBuilder::new("Brush")
+                            .spawn()
+                            .expect("Failed to spawn rerun"),
+                    }
                 } else {
                     rerun::RecordingStream::disabled()
                 }
@@ -335,6 +353,126 @@ mod visualize_tools_impl {
                     )?;
                 }
             }
+
+            Ok(())
+        }
+
+        /// Convert a single-channel `[H, W]` f32 tensor (normalized to
+        /// `[0, 1]`) into a downscaled RGB image for rerun.
+        fn gray_to_rgb(data: &TensorData, max_img_size: u32) -> image::RgbImage {
+            let [h, w] = [data.shape[0], data.shape[1]];
+            let f32_buf = data.as_slice::<f32>().expect("gray f32 buffer");
+            let rgb: Vec<u8> = f32_buf
+                .iter()
+                .flat_map(|v| {
+                    let g = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    [g, g, g]
+                })
+                .collect();
+            let img = image::RgbImage::from_raw(w as u32, h as u32, rgb)
+                .expect("Failed to build RgbImage from gray tensor");
+            resize_to_max(img, max_img_size)
+        }
+
+        /// Log a rendered X-ray view pair: the predicted intensity image and
+        /// the normalized GT frame, plus the current cardiac phase.
+        pub async fn log_xray_render(
+            &self,
+            iter: u32,
+            view_idx: u32,
+            phase: f32,
+            pred: &TensorData,
+            gt: &TensorData,
+            max_img_size: u32,
+        ) -> Result<()> {
+            if !self.rec.is_enabled() {
+                return Ok(());
+            }
+            self.rec.set_time_sequence("iterations", iter);
+
+            let path = format!("xray/view_{view_idx}");
+            let pred_img = Self::gray_to_rgb(pred, max_img_size);
+            let [pw, ph]: [u32; 2] = pred_img.dimensions().into();
+            self.rec.log(
+                format!("{path}/render"),
+                &rerun::Image::from_rgb24(pred_img.into_vec(), [pw, ph]),
+            )?;
+            let gt_img = Self::gray_to_rgb(gt, max_img_size);
+            let [gw, gh]: [u32; 2] = gt_img.dimensions().into();
+            self.rec.log(
+                format!("{path}/ground_truth"),
+                &rerun::Image::from_rgb24(gt_img.into_vec(), [gw, gh]),
+            )?;
+
+            self.rec
+                .log("xray/phase", &rerun::Scalars::new(vec![phase as f64]))?;
+            Ok(())
+        }
+
+        /// Log per-step X-ray training scalars (loss, splat count, LR).
+        pub fn log_xray_train_stats(
+            &self,
+            iter: u32,
+            loss: f32,
+            num_splats: u32,
+            num_visible: u32,
+            lr_mean: f64,
+        ) -> Result<()> {
+            if !self.rec.is_enabled() {
+                return Ok(());
+            }
+            self.rec.set_time_sequence("iterations", iter);
+            self.rec
+                .log("loss/total", &rerun::Scalars::new(vec![loss as f64]))?;
+            self.rec.log(
+                "splats/num_splats",
+                &rerun::Scalars::new(vec![num_splats as f64]),
+            )?;
+            self.rec.log(
+                "splats/splats_visible",
+                &rerun::Scalars::new(vec![num_visible as f64]),
+            )?;
+            self.rec
+                .log("lr/mean", &rerun::Scalars::new(vec![lr_mean]))?;
+            Ok(())
+        }
+
+        /// Default blueprint for X-ray runs: a 3D scene (canonical splats +
+        /// C-arm cameras), a 2D pred/GT view, and loss / splat curves.
+        pub fn send_xray_blueprint(&self) -> Result<()> {
+            use rerun::blueprint::{
+                Blueprint, BlueprintActivation, ContainerLike, Horizontal, Spatial2DView,
+                Spatial3DView, TimeSeriesView, Vertical,
+            };
+
+            if !self.rec.is_enabled() {
+                return Ok(());
+            }
+
+            let scene_view = Spatial3DView::new("Scene")
+                .with_origin("world")
+                .with_contents(["world/**"]);
+            let xray_view = Spatial2DView::new("X-ray render")
+                .with_origin("xray/view_0")
+                .with_contents(["xray/**"]);
+            let loss_view = TimeSeriesView::new("Loss").with_contents([
+                "loss/**",
+                "xray/phase",
+                "psnr/eval",
+                "ssim/eval",
+            ]);
+            let splats_view = TimeSeriesView::new("Splats").with_contents(["splats/**"]);
+            let lr_view = TimeSeriesView::new("Learning rate").with_contents(["lr/**"]);
+
+            let main_row = Horizontal::new([xray_view.into(), scene_view.into()]);
+            let graphs = Horizontal::new([loss_view.into(), splats_view.into(), lr_view.into()]);
+            let root =
+                Vertical::new([main_row.into(), graphs.into()]).with_row_shares([3.0, 2.0]);
+
+            Blueprint::new(root)
+                .with_auto_layout(false)
+                .with_auto_views(false)
+                .send(&self.rec, BlueprintActivation::default())?;
 
             Ok(())
         }

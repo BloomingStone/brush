@@ -13,6 +13,12 @@ pub struct RerunConfig {
     /// Whether to enable rerun.io logging for this run.
     #[arg(long, help_heading = "Rerun options", default_value = "false")]
     pub rerun_enabled: bool,
+    /// Headless rerun output: write the recording to this .rrd file instead
+    /// of spawning a local viewer. Works without any GUI / X11 (ideal for
+    /// remote SSH sessions) — open the file later with a local Rerun Viewer
+    /// (`rerun out.rrd`). Implies rerun logging is on.
+    #[arg(long, help_heading = "Rerun options")]
+    pub rerun_rrd: Option<String>,
     /// How often to log basic training statistics.
     #[arg(
         long,

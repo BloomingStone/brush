@@ -42,6 +42,10 @@ use burn_fusion::{
 use burn_ir::{CustomOpIr, HandleContainer, OperationIr, OperationOutput, TensorIr};
 use glam::Vec3;
 
+/// Single-channel (grayscale) image loss for X-ray training. See
+/// [`gray::gray_loss`] and [`gray::GrayLossConfig`].
+pub mod gray;
+
 mod kernels {
     use burn_cubecl::cubecl;
     use burn_cubecl::cubecl::cube;

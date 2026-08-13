@@ -81,8 +81,8 @@ async fn render_loss(
     device: &burn::tensor::Device,
 ) -> f32 {
     let splats = build_splats(scene, device);
-    let img = render_xray(splats, cam, img_size, 1.0).await;
-    img.sum().into_scalar_async::<f32>()
+    let out = render_xray(splats, cam, img_size, 1.0).await;
+    out.img.sum().into_scalar_async::<f32>()
         .await
         .expect("loss readback")
 }
@@ -94,8 +94,8 @@ async fn analytical_grads(
     device: &burn::tensor::Device,
 ) -> (XRaySplats, Gradients) {
     let splats = build_splats(scene, device);
-    let img = render_xray(splats.clone(), cam, img_size, 1.0).await;
-    let grads = img.sum().backward();
+    let out = render_xray(splats.clone(), cam, img_size, 1.0).await;
+    let grads = out.img.sum().backward();
     (splats, grads)
 }
 

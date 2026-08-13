@@ -69,6 +69,20 @@ impl XRaySplats {
         }
     }
 
+    /// Like [`from_tensor_data`](Self::from_tensor_data) but **without**
+    /// detaching or re-requiring gradients: the packed tensors keep their
+    /// autodiff graph, so gradients flow back through the tensors that
+    /// produced them (e.g. a deformation network applied to the canonical
+    /// splats). The tensors must already be tracked (autodiff) — this is the
+    /// training path.
+    pub fn from_tensor_data_autodiff(transforms: Tensor<2>, raw_opacities: Tensor<1>) -> Self {
+        assert_eq!(transforms.dims()[1], 10, "transforms must be [N,10]");
+        Self {
+            transforms: Param::initialized(ParamId::new(), transforms),
+            raw_opacities: Param::initialized(ParamId::new(), raw_opacities),
+        }
+    }
+
     pub fn num_splats(&self) -> u32 {
         self.transforms.dims()[0] as u32
     }
