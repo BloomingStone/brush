@@ -6,7 +6,7 @@
 use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::cube;
 use burn_cubecl::cubecl::prelude::*;
-use brush_cube::{is_finite_f32, MU_WATER, softplus};
+use brush_cube::{is_finite_f32, MU_WATER, silu};
 
 use super::helpers::{
     compute_radius, cone_cov2d_mu, count_tiles, get_tile_bbox_xray, project_xy,
@@ -67,7 +67,7 @@ pub fn project_forward_xray_kernel(
         terminate!();
     }
 
-    let opac = MU_WATER * softplus(raw_opac);
+    let opac = MU_WATER * silu(raw_opac); // exp6: silu 代替 softplus
     // Physical-density floor: μ_water ≈ 0.002 mm⁻¹ is a perfectly meaningful
     // Beer-Lambert path-integral contribution (0.002 × 200 mm ≈ 0.4 optical
     // depth ≈ exp(-0.4) ≈ 0.67 intensity) even though it sits below the RGB

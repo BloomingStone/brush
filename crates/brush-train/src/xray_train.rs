@@ -662,13 +662,9 @@ pub fn create_xray_trainer(
     // `clamp(proj, 14)` → all-black). The optimizer + density controller then
     // grow/lower density where the anatomy (iodine, bone) demands it.
     const MU_WATER: f32 = 0.002; // mm^-1 (density activation scale)
-    // Density activation is `MU_WATER · softplus(raw)` (matches the Python
-    // project, see brush-cube::softplus). Start at the configured init density
-    // (default μ_water; raise it when the normalized / gamma-corrected target
-    // sits at higher intensity so the random ball starts at the right gray
-    // level — Beer-Lambert `proj` scales linearly with density):
-    // raw = inverse_softplus(init_density / MU_WATER).
-    let init_raw_opac = brush_cube::inverse_softplus(config.init_density / MU_WATER);
+    // Density activation is `MU_WATER · silu(raw)` (exp6). Start at the
+    // configured init density: raw = inverse_silu(init_density / MU_WATER).
+    let init_raw_opac = brush_cube::inverse_silu(config.init_density / MU_WATER);
     let mut raw_opac = Vec::with_capacity(num_points as usize);
     for _ in 0..num_points {
         let u: f32 = rng.random_range(0.0..1.0);

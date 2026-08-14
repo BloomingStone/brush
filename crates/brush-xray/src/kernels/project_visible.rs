@@ -4,7 +4,7 @@
 use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::cube;
 use burn_cubecl::cubecl::prelude::*;
-use brush_cube::{MU_WATER, softplus};
+use brush_cube::{MU_WATER, silu};
 
 use super::helpers::{
     XRAY_LANES, compute_radius, cone_cov2d_mu, project_xy, read_mean_viewspace_xray,
@@ -37,7 +37,7 @@ pub fn project_visible_xray_kernel(
 
     let (conic, mu, cov3) = cone_cov2d_mu(mean_c, scale, quat, u);
     // Activated density = MU_WATER · softplus(raw) (see project_forward.rs).
-    let opac = MU_WATER * softplus(raw_opacities[global_gid as usize]);
+    let opac = MU_WATER * silu(raw_opacities[global_gid as usize]); // exp6
     let (xy_x, xy_y) = project_xy(mean_c, u);
     let radius = compute_radius(cov3);
 
