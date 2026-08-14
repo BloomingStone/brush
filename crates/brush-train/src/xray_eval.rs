@@ -29,6 +29,9 @@ pub struct XRayEvalSample {
     pub gt: TensorData,
     pub psnr: f32,
     pub ssim: f32,
+    /// Learned perceptual similarity (VGG-LPIPS, lower = more similar).
+    /// `NaN` when the LPIPS model is unavailable.
+    pub lpips: f32,
 }
 
 /// Write a `[H, W]` f32 image (in `[0, 1]`) as a lossless 16-bit grayscale PNG

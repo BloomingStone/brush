@@ -286,6 +286,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let mut p = 0.0f32;
         let mut s = 0.0f32;
+        let mut l = 0.0f32;
         let mut pairs = Vec::with_capacity(eval_views.len());
         for view in eval_views.iter() {
             let gray = view.gray_image.as_ref().expect("gray GT");
@@ -293,12 +294,14 @@ async fn main() -> anyhow::Result<()> {
             let sample = trainer.eval_view(&view.camera, &gt, view.phase).await;
             p += sample.psnr;
             s += sample.ssim;
+            l += sample.lpips;
             pairs.push(merge_pair(&sample.pred, &sample.gt));
         }
         save_stack(&out, 0, &pairs);
         p /= eval_views.len().max(1) as f32;
         s /= eval_views.len().max(1) as f32;
-        println!("iter {:4} psnr={:6.2} ssim={:5.3}", "init", p, s);
+        l /= eval_views.len().max(1) as f32;
+        println!("iter {:4} psnr={:6.2} ssim={:5.3} lpips={:.4}", "init", p, s, l);
     }
 
     // ---- 训练循环(与标准流程一致, 含 density control) -------------------
@@ -326,6 +329,7 @@ async fn main() -> anyhow::Result<()> {
         if step % eval_every == 0 || step == iters {
             let mut avg_psnr = 0.0f32;
             let mut avg_ssim = 0.0f32;
+            let mut avg_lpips = 0.0f32;
             let mut pairs = Vec::with_capacity(eval_views.len());
             for view in eval_views.iter() {
                 let gray = view.gray_image.as_ref().expect("gray GT");
@@ -333,20 +337,23 @@ async fn main() -> anyhow::Result<()> {
                 let sample = trainer.eval_view(&view.camera, &vgt, view.phase).await;
                 avg_psnr += sample.psnr;
                 avg_ssim += sample.ssim;
+                avg_lpips += sample.lpips;
                 pairs.push(merge_pair(&sample.pred, &sample.gt));
             }
             save_stack(&out, step, &pairs);
             avg_psnr /= eval_views.len().max(1) as f32;
             avg_ssim /= eval_views.len().max(1) as f32;
+            avg_lpips /= eval_views.len().max(1) as f32;
             // 梯度诊断: 位置每步移动 ≈ lr_mean × mean_grad。
             if let Some(g) = &stats.grad_norms {
                 println!(
-                    "iter {:4} loss={:8.4} psnr={:6.2} ssim={:5.3} visible={} splats={} (eval {} views) | \
+                    "iter {:4} loss={:8.4} psnr={:6.2} ssim={:5.3} lpips={:.4} visible={} splats={} (eval {} views) | \
                      grads mean={:.1e} rot={:.1e} scale={:.1e} density={:.1e} | pos step≈{:.2e}mm",
                     step,
                     stats.loss,
                     avg_psnr,
                     avg_ssim,
+                    avg_lpips,
                     stats.num_visible,
                     stats.num_splats,
                     eval_views.len(),
@@ -358,11 +365,12 @@ async fn main() -> anyhow::Result<()> {
                 );
             } else {
                 println!(
-                    "iter {:4} loss={:8.4} psnr={:6.2} ssim={:5.3} visible={} splats={} (eval {} views)",
+                    "iter {:4} loss={:8.4} psnr={:6.2} ssim={:5.3} lpips={:.4} visible={} splats={} (eval {} views)",
                     step,
                     stats.loss,
                     avg_psnr,
                     avg_ssim,
+                    avg_lpips,
                     stats.num_visible,
                     stats.num_splats,
                     eval_views.len(),

@@ -137,6 +137,9 @@ pub struct XRayTrainer {
     collect_pred: bool,
     /// Collect per-parameter gradient norms every step (diagnostics).
     collect_grads: bool,
+    /// VGG-LPIPS model for perceptual eval (loaded once; `None` keeps the
+    /// eval free of the extra GPU memory).
+    lpips: Option<lpips::LpipsModel>,
 }
 
 impl XRayTrainer {
@@ -171,6 +174,7 @@ impl XRayTrainer {
             step_count: 0,
             collect_pred: false,
             collect_grads: false,
+            lpips: Some(lpips::load_vgg_lpips(device)),
         }
     }
 
@@ -239,6 +243,28 @@ impl XRayTrainer {
             .into_scalar_async::<f32>()
             .await
             .expect("ssim readback");
+
+        // LPIPS: grayscale → 3-channel (VGG expects RGB), on the inner
+        // (non-autodiff) device. Lower is more perceptually similar.
+        let lpips = match &self.lpips {
+            Some(model) => {
+                let pred_inner = intensity.clone().inner();
+                let gt_inner = gt_t.clone().inner();
+                let [h, w] = [pred_inner.dims()[0], pred_inner.dims()[1]];
+                // `[H,W]` → `[1,H,W,1]` → expand to `[1,H,W,3]` (broadcast
+                // aligns from the trailing dim, so the channel axis must be
+                // explicit).
+                let pred3 = pred_inner.reshape([1, h, w, 1]).expand([1, h, w, 3]);
+                let gt3 = gt_inner.reshape([1, h, w, 1]).expand([1, h, w, 3]);
+                model
+                    .lpips(pred3, gt3)
+                    .into_scalar_async::<f32>()
+                    .await
+                    .expect("lpips readback")
+            }
+            None => f32::NAN,
+        };
+
         let pred = intensity
             .into_data_async()
             .await
@@ -249,6 +275,7 @@ impl XRayTrainer {
             gt: gt.clone(),
             psnr,
             ssim,
+            lpips,
         }
     }
 

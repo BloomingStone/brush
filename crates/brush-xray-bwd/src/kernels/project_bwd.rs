@@ -7,7 +7,7 @@
 use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::cube;
 use burn_cubecl::cubecl::prelude::*;
-use brush_cube::{Mat3, Quat, Sym2, Sym3, Vec3A, compute_cov3d, dnormvdv4, is_finite_f32, sigmoid};
+use brush_cube::{MU_WATER, Mat3, Quat, Sym2, Sym3, Vec3A, compute_cov3d, dnormvdv4, is_finite_f32, sigmoid};
 use brush_xray::kernels::helpers::{
     XRAY_LANES, cone_geometry, read_quat_unorm_xray, read_scale_xray,
 };
@@ -294,9 +294,11 @@ pub fn project_xray_bwd_kernel(
     let (v_scale, v_quat_norm) = compute_cov3d_bwd(scale, quat, v_cov3d);
     let v_quat = dnormvdv4(quat_unorm, v_quat_norm);
 
-    // Opacity: sigmoid → logit.
-    let opac = sigmoid(raw_opac);
-    let v_raw = v_opac * opac * (1.0f32 - opac);
+    // Opacity: activated density is `MU_WATER · softplus(raw)` (forward), so
+    // d opac/d raw = MU_WATER · sigmoid(raw) — softplus' = σ (no (1−σ)
+    // factor). The old form used sigmoid's own derivative and dropped the
+    // MU_WATER scale (a leftover from the RGB sigmoid-opacity path).
+    let v_raw = v_opac * MU_WATER * sigmoid(raw_opac);
 
     // Refine weight: viewspace (mean2D) gradient norm per splat, used by the
     // density controller for densification (mirrors the RGB render path's
