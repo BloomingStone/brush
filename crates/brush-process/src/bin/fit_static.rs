@@ -75,6 +75,9 @@ async fn main() -> anyhow::Result<()> {
     let mut init_density = 0.02f32;
     let mut lr_mean = 2e-5f64;
     let mut lr_mean_end = 2e-7f64;
+    let mut lr_scale = 5e-3f64;
+    let mut lr_opac = 0.012f64;
+    let mut growth_frac = 0.25f32;
     let mut refine_every = 400u32;
     let mut eval_every = 100u32;
     let mut out = PathBuf::from("target/fit_static");
@@ -97,6 +100,12 @@ async fn main() -> anyhow::Result<()> {
             lr_mean = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--lr-mean-end=") {
             lr_mean_end = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--lr-scale=") {
+            lr_scale = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--lr-opac=") {
+            lr_opac = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--growth-frac=") {
+            growth_frac = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--refine-every=") {
             refine_every = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--eval-every=") {
@@ -111,7 +120,8 @@ async fn main() -> anyhow::Result<()> {
     let dcm = dcm.expect(
         "usage: fit_static <dcm> [--iters=N] [--points=N] [--scene-extent=MM] \
          [--gamma-target=G] [--init-density=MU] [--lr-mean=LR] \
-         [--lr-mean-end=LR] [--refine-every=N] [--eval-every=N] [--out=DIR]",
+         [--lr-mean-end=LR] [--lr-scale=LR] [--lr-opac=LR] [--growth-frac=F] \
+         [--refine-every=N] [--eval-every=N] [--out=DIR]",
     );
 
     // ---- 后端 + 数据集 ---------------------------------------------------
@@ -183,9 +193,12 @@ async fn main() -> anyhow::Result<()> {
     cfg.init_density = init_density;
     cfg.lr_mean = lr_mean;
     cfg.lr_mean_end = lr_mean_end;
+    cfg.lr_scale = lr_scale;
+    cfg.lr_opac = lr_opac;
     cfg.refine = XRayRefineConfig {
         refine_every,
         scene_extent,
+        growth_select_fraction: growth_frac,
         ..XRayRefineConfig::default()
     };
     let mut trainer = create_xray_trainer(cfg, points, scene_extent, &device);
