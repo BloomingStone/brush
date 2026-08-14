@@ -608,6 +608,38 @@ pub fn softplus(x: f32) -> f32 {
     select(x > 10.0f32, x, f32::ln(1.0f32 + f32::exp(x)))
 }
 
+/// `SiLU(x) = x · sigmoid(x)` (swish). **exp6 experiment**: density activation
+/// `MU_WATER · silu(raw)` instead of `MU_WATER · softplus(raw)`.
+///
+/// Key property for air-region pruning: `silu(x) < 0` for `x < 0` (minimum
+/// ≈ -0.278 at x ≈ -1.28), so a decaying air splat's activated density can
+/// cross below zero — immediately under `cull_density_threshold` and pruned.
+/// softplus stays > 0 forever with gradient → 0 as raw → -∞, stranding air
+/// splats just above the cull line. Negative μ is safe for Beer-Lambert: the
+/// `proj` clamp (1e-3) caps `intensity = exp(-proj)`.
+#[cube]
+pub fn silu(x: f32) -> f32 {
+    x * sigmoid(x)
+}
+
+/// Host-side inverse SiLU for positive targets: solve `x·σ(x) = y`, `y > 0`
+/// by bisection on `[0, y+10]` (silu is monotone increasing on x ≥ 0).
+pub fn inverse_silu(y: f32) -> f32 {
+    debug_assert!(y > 0.0, "inverse_silu requires y > 0");
+    let mut lo = 0.0f32;
+    let mut hi = (y + 10.0f32).max(1.0);
+    for _ in 0..64 {
+        let mid = 0.5 * (lo + hi);
+        let v = mid * sigmoid(mid);
+        if v < y {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
+}
+
 /// Host-side inverse softplus: `x = ln(eʸ − 1)` for `y > 0`. Use it to
 /// initialize raw density logits from a target activated density:
 /// `raw = inverse_softplus(μ_target / MU_WATER)`.

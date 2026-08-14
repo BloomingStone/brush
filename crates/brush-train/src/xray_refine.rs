@@ -228,9 +228,11 @@ impl XRayRefiner {
         };
 
         // ---- Prune -------------------------------------------------------
-        // Activated density = MU_WATER · softplus(raw) (matches the renderer).
+        // Activated density = MU_WATER · silu(raw) (exp6); silu(raw)<0 for
+        // raw<0 → decaying air splats fall under the cull threshold.
         let raw = splats.raw_opacities.val().clamp(-20.0, 20.0);
-        let density = raw.exp().add_scalar(1.0).log().mul_scalar(MU_WATER);
+        let sig = raw.clone().neg().exp().add_scalar(1.0).recip();
+        let density = raw.mul(sig).mul_scalar(MU_WATER);
         let prune_density = density.lower_elem(self.config.cull_density_threshold);
 
         let transforms_bad = row_non_finite(&splats.transforms.val());

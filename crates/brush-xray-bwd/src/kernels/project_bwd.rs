@@ -294,11 +294,11 @@ pub fn project_xray_bwd_kernel(
     let (v_scale, v_quat_norm) = compute_cov3d_bwd(scale, quat, v_cov3d);
     let v_quat = dnormvdv4(quat_unorm, v_quat_norm);
 
-    // Opacity: activated density is `MU_WATER · softplus(raw)` (forward), so
-    // d opac/d raw = MU_WATER · sigmoid(raw) — softplus' = σ (no (1−σ)
-    // factor). The old form used sigmoid's own derivative and dropped the
-    // MU_WATER scale (a leftover from the RGB sigmoid-opacity path).
-    let v_raw = v_opac * MU_WATER * sigmoid(raw_opac);
+    // Opacity: activated density is `MU_WATER · silu(raw)` (exp6), so
+    // d opac/d raw = MU_WATER · silu'(raw), silu'(x) = σ(x) + x·σ(x)(1−σ(x)).
+    let sig = sigmoid(raw_opac);
+    let silu_deriv = sig + raw_opac * sig * (1.0f32 - sig);
+    let v_raw = v_opac * MU_WATER * silu_deriv;
 
     // Refine weight: viewspace (mean2D) gradient norm per splat, used by the
     // density controller for densification (mirrors the RGB render path's
