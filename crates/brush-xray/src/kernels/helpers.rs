@@ -1,7 +1,7 @@
 //! X-ray rasterizer cube helpers: cone-beam covariance + `mu`, tiling,
 //! and packed-lane readers.
 
-use brush_cube::{Mat3, Quat, Sym2, Sym3, Vec3A, TileBbox, compute_cov3d, softplus};
+use brush_cube::{Mat3, Quat, Sym2, Sym3, Vec3A, TileBbox, compute_cov3d};
 use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::cube;
 use burn_cubecl::cubecl::prelude::*;
@@ -160,22 +160,23 @@ pub fn read_mean_viewspace_xray(transforms: &Tensor<f32>, base: usize, u: XRayPr
     u.world_to_cam(mean)
 }
 
-/// `softplus(log_scales) · scale_modifier`. Scale activation matches the
-/// Python project (`Softplus(threshold=10)`).
+/// `exp(clamp(log_scale, lo, hi)) · scale_modifier` — **exp5 experiment**:
+/// standard-3DGS `exp` activation for X-ray scale instead of softplus.
 ///
-/// X-ray is an **additive** density path integral — unlike RGB alpha
-/// compositing there is no transmittance/occlusion chain, so an oversized
-/// splat always contributes to every ray it crosses, and its per-ray weight
-/// `mu = σ·√(2π)` grows with σ. Scale must therefore be bounded above:
-/// `exp` (standard 3DGS) would let a stray logit explode the splat
-/// exponentially; `softplus` grows only linearly for large values while
-/// matching `exp` asymptotically at small scales (`softplus(x) ≈ eˣ, x→-∞`).
+/// Rationale: softplus bottoms out at 1 mm (gradient → 0 as raw → -∞), so
+/// fine structures can never shrink below 1 mm; `exp` has no positive floor
+/// and its log-space gradient is uniform (`d exp/d raw = exp = σ`), matching
+/// the backward kernel's existing `dL/draw = dL/dσ·σ` chain rule. The hard
+/// clamp replaces softplus's linear tail as the blow-up guard for the
+/// additive path integral (`hi = ln 1000 ≈ 6.9` mm; oversized splats are
+/// still caught by the refine prune).
 #[cube]
 pub fn read_scale_xray(transforms: &Tensor<f32>, base: usize, mod_: f32) -> Vec3A {
+    let hi = 6.907755f32; // ln(1000 mm)
     Vec3A::new(
-        softplus(transforms[base + 7]) * mod_,
-        softplus(transforms[base + 8]) * mod_,
-        softplus(transforms[base + 9]) * mod_,
+        f32::exp(clamp(transforms[base + 7], -20.0f32, hi)) * mod_,
+        f32::exp(clamp(transforms[base + 8], -20.0f32, hi)) * mod_,
+        f32::exp(clamp(transforms[base + 9], -20.0f32, hi)) * mod_,
     )
 }
 

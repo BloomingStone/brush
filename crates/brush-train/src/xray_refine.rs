@@ -292,11 +292,7 @@ impl XRayRefiner {
                     // (kept space): small → clone, oversized → split.
                     let kept_transforms = splats.transforms.val().select(0, keep_inds.clone());
                     let kept_raw_scale = kept_transforms.slice(s![.., 7..10]);
-                    let kept_scales = kept_raw_scale
-                        .clamp(-20.0, 20.0)
-                        .exp()
-                        .add_scalar(1.0)
-                        .log();
+                    let kept_scales = kept_raw_scale.clamp(-20.0, 6.9078).exp();
                     let max_scale: Tensor<1> = kept_scales.max_dim(1).squeeze_dim(1); // [N_kept]
                     let oversized_thr = self.config.scene_extent * self.config.percent_dense;
                     let oversized = max_scale.greater_elem(oversized_thr);
@@ -395,9 +391,9 @@ impl XRayRefiner {
             let parent_means = parent_t.clone().slice(s![.., 0..3]);
             let parent_rots = parent_t.clone().slice(s![.., 3..7]);
             let parent_log_scale = parent_t.slice(s![.., 7..10]);
-            // Reverse activation: stored raw → rendered scale `softplus(raw)`.
-            let raw_clamped = parent_log_scale.clamp(-20.0, 20.0);
-            let parent_scales = raw_clamped.exp().add_scalar(1.0).log();
+            // Reverse activation: stored raw → rendered scale `exp(raw)` (exp5).
+            let raw_clamped = parent_log_scale.clamp(-20.0, 6.9078);
+            let parent_scales = raw_clamped.exp();
 
             // Child scale: half of parent, capped at scene_extent * percent_dense.
             let max_scale = self.config.scene_extent * self.config.percent_dense;
@@ -409,7 +405,7 @@ impl XRayRefiner {
                 .to_vec::<f32>()
                 .expect("f32")
                 .into_iter()
-                .map(brush_cube::inverse_softplus)
+                .map(|s| s.max(1e-6).ln()) // inverse of exp activation
                 .collect::<Vec<f32>>();
             let child_log_scale = Tensor::<2>::from_data(
                 TensorData::new(child_log_scale, [parent_scales.dims()[0], 3]),
@@ -453,10 +449,8 @@ impl XRayRefiner {
             let parent_log_scale = parent_t.slice(s![.., 7..10]);
             let parent_scales = parent_log_scale
                 .clone()
-                .clamp(-20.0, 20.0)
-                .exp()
-                .add_scalar(1.0)
-                .log();
+                .clamp(-20.0, 6.9078)
+                .exp();
 
             // Smooth covariance-aware shrink: k=1 on minor axes, k=
             // split_scale_factor on the dominant axis.

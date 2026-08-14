@@ -690,15 +690,11 @@ pub fn create_xray_trainer(
     // distances → `proj ≈ 0` → an all-white Beer-Lambert image with ~zero
     // gradients; KNN sizing guarantees continuous early coverage.
     //
-    // Scale activation is `softplus(raw)` (matches the Python project), so
-    // to render a Gaussian of size `σ` the stored raw must be
-    // `inverse_softplus(σ)` (i.e. `softplus(inverse_softplus(σ)) = σ`).
+    // Scale activation is `exp(raw)` (exp5 experiment), so the stored raw is
+    // just the log-scale itself: `raw = ln(σ)`.
     let log_scales = crate::splat_init::compute_knn_scales(&means);
     debug_assert_eq!(log_scales.len(), means.len(), "one log-scale per axis");
-    let raw_scales: Vec<f32> = log_scales
-        .iter()
-        .map(|log_s| brush_cube::inverse_softplus(log_s.exp()))
-        .collect();
+    let raw_scales: Vec<f32> = log_scales;
     let canonical = XRaySplats::from_raw(means, rots, raw_scales, raw_opac, device);
 
     // Deform network only in deform mode; static mode omits it entirely.
