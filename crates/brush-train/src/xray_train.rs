@@ -304,9 +304,24 @@ impl XRayTrainer {
         self.refiner.gather_stats(refine_weight, visible);
 
         // ---- Optimizer: canonical splats --------------------------------
+        // Mean LR decays exponentially via `sched_mean`. The actual
+        // per-component LR is encoded in the transforms scaling record, which
+        // is **rebuilt every step** from the current `lr_mean` (mirrors the
+        // RGB path in `train.rs`). Previously the scaling record was created
+        // once with the first-step LR, so `lr_mean_end` never reached the
+        // optimizer (the decay was only used for logging). Transforms are
+        // stepped at base lr=1.0 (LR lives in the scaling) and the opacity
+        // logits are stepped separately at `lr_opac` — the old code stepped
+        // both together at lr=1.0, silently giving opacity an LR of 1.0
+        // instead of the configured `lr_opac` (~80× too large → density
+        // oscillation / saturation).
         let lr_mean = self.sched_mean.step();
         let opt_device = device.clone();
         let optimizer = self.optim_splats.get_or_insert_with(|| {
+            AdamScaledConfig::new().with_epsilon(1e-15).init::<XRaySplats>()
+        });
+        {
+            use burn::optim::record::AdaptorRecord;
             // transforms layout: means(3) + rotations(4) + log_scales(3).
             let lr_values: [f32; 10] = [
                 lr_mean as f32, lr_mean as f32, lr_mean as f32,
@@ -315,38 +330,51 @@ impl XRayTrainer {
                 self.config.lr_scale as f32, self.config.lr_scale as f32,
                 self.config.lr_scale as f32,
             ];
-            let scaling = Tensor::<1>::from_floats(lr_values.as_slice(), &opt_device)
-                .reshape([1, 10]);
-            let mut optim = AdamScaledConfig::new().with_epsilon(1e-15).init::<XRaySplats>();
-            use burn::optim::record::AdaptorRecord;
-            let record = optim.to_record();
-            let mut record = record;
+            let transform_scaling =
+                Tensor::<1>::from_floats(lr_values.as_slice(), &opt_device).reshape([1, 10]);
+            let mut record = optimizer.to_record();
+            let existing = record.remove(&canonical_ad.transforms.id);
+            let momentum = existing.and_then(|r| r.into_state::<2>().momentum);
             record.insert(
                 canonical_ad.transforms.id,
                 AdaptorRecord::from_state(crate::adam_scaled::AdamState::<2> {
-                    momentum: None,
-                    scaling: Some(scaling),
+                    momentum,
+                    scaling: Some(transform_scaling),
                     reduce_moment_2: false,
                 }),
             );
-            record.insert(
-                canonical_ad.raw_opacities.id,
-                AdaptorRecord::from_state(crate::adam_scaled::AdamState::<1> {
-                    momentum: None,
-                    scaling: None,
-                    reduce_moment_2: true,
-                }),
-            );
-            optim = optim.load_record(record);
-            optim
-        });
+            // Keep the opacity state in the record (created on the first step
+            // with `reduce_moment_2`); it is stepped separately at `lr_opac`
+            // below. Because the scaling tensor is rebuilt every step from the
+            // current schedule, newly densified splats automatically inherit
+            // the correct LR (no per-splat scaling rows to keep in sync).
+            if !record.contains_key(&canonical_ad.raw_opacities.id) {
+                record.insert(
+                    canonical_ad.raw_opacities.id,
+                    AdaptorRecord::from_state(crate::adam_scaled::AdamState::<1> {
+                        momentum: None,
+                        scaling: None,
+                        reduce_moment_2: true,
+                    }),
+                );
+            }
+            *optimizer = AdamScaledConfig::new()
+                .with_epsilon(1e-15)
+                .init::<XRaySplats>()
+                .load_record(record);
+        }
 
-        let splat_grads = GradientsParams::from_params(
-            &mut grads,
-            &canonical_ad,
-            &[canonical_ad.transforms.id, canonical_ad.raw_opacities.id],
-        );
-        let canonical_updated = optimizer.step(1.0, canonical_ad, splat_grads);
+        // Step transforms at base lr=1.0 (real LR is in the scaling record),
+        // then the opacity logits separately at `lr_opac`.
+        let transforms_id = canonical_ad.transforms.id;
+        let opacities_id = canonical_ad.raw_opacities.id;
+        let grad_transforms =
+            GradientsParams::from_params(&mut grads, &canonical_ad, &[transforms_id]);
+        let canonical_updated = optimizer.step(1.0, canonical_ad, grad_transforms);
+        let grad_opac =
+            GradientsParams::from_params(&mut grads, &canonical_updated, &[opacities_id]);
+        let canonical_updated =
+            optimizer.step(self.config.lr_opac, canonical_updated, grad_opac);
 
         // ---- Optimizer: deform network (static mode: skipped) -----------
         if let Some(deform) = &self.deform {
@@ -400,48 +428,38 @@ impl XRayTrainer {
                 let transforms_id = self.canonical.transforms.id;
                 let opacities_id = self.canonical.raw_opacities.id;
                 let mut record = optim.to_record();
-                // Need the ParamIds to dispatch on rank; `&mut record` would
-                // yield `&mut (ParamId, _)` which is less ergonomic here.
+                // The per-component LR scaling is rebuilt from the current
+                // schedule on every `step()` (shape `[1,10]`, broadcastable to
+                // any splat count), so only the momentum tensors need to be
+                // reindexed here. Newly densified clones start from zero
+                // momentum (standard Adam behavior) and pick up the current LR
+                // automatically on the next step — no per-splat scaling rows
+                // to keep in sync.
                 #[allow(clippy::explicit_iter_loop)]
                 for (id, state) in record.iter_mut() {
                     let s = state.to_owned();
                     if *id == transforms_id {
-                        // Rank-2 state: `[N,10]` momentum / scaling tensors.
+                        // Rank-2 state: `[N,10]` momentum tensors.
                         let mut st: crate::adam_scaled::AdamState<2> = s.into_state();
                         if let Some(moment) = &mut st.momentum {
                             moment.moment_1 = moment.moment_1.clone().select(0, keep_inds.clone());
                             moment.moment_2 = moment.moment_2.clone().select(0, keep_inds.clone());
-                        }
-                        if let Some(scaling) = &mut st.scaling {
-                            *scaling = scaling.clone().select(0, keep_inds.clone());
-                            // Append zero state for the new clones: the
-                            // per-component LR scaling rows must match the
-                            // splat count, or the next optimizer step trips a
-                            // broadcast mismatch (`[N+add,10]` vs `[N,10]`).
-                            let [_, d] = scaling.dims();
-                            let zeros = Tensor::<2>::zeros(
-                                [add_count as usize, d],
-                                &scaling.device(),
-                            );
-                            *scaling = Tensor::cat(vec![scaling.clone(), zeros], 0);
-                        }
-                        // Append zero state for the new clones.
-                        if let Some(moment) = &mut st.momentum {
                             let [_, d] = moment.moment_1.dims();
                             let zeros = Tensor::<2>::zeros([add_count as usize, d], &moment.moment_1.device());
                             moment.moment_1 = Tensor::cat(vec![moment.moment_1.clone(), zeros.clone()], 0);
-                            let zeros2 = Tensor::<2>::zeros([add_count as usize, moment.moment_2.dims()[1]], &moment.moment_2.device());
+                            let zeros2 = Tensor::<2>::zeros(
+                                [add_count as usize, moment.moment_2.dims()[1]],
+                                &moment.moment_2.device(),
+                            );
                             moment.moment_2 = Tensor::cat(vec![moment.moment_2.clone(), zeros2], 0);
                         }
                         *state = AdaptorRecord::from_state(st);
                     } else if *id == opacities_id {
-                        // Rank-1 state: `[N]` momentum tensors, no scaling.
+                        // Rank-1 state: `[N]` momentum tensors.
                         let mut st: crate::adam_scaled::AdamState<1> = s.into_state();
                         if let Some(moment) = &mut st.momentum {
                             moment.moment_1 = moment.moment_1.clone().select(0, keep_inds.clone());
                             moment.moment_2 = moment.moment_2.clone().select(0, keep_inds.clone());
-                        }
-                        if let Some(moment) = &mut st.momentum {
                             let [_n] = moment.moment_1.dims();
                             let zeros = Tensor::<1>::zeros([add_count as usize], &moment.moment_1.device());
                             moment.moment_1 = Tensor::cat(vec![moment.moment_1.clone(), zeros.clone()], 0);
@@ -489,8 +507,12 @@ pub fn create_xray_trainer(
     // `clamp(proj, 14)` → all-black). The optimizer + density controller then
     // grow/lower density where the anatomy (iodine, bone) demands it.
     const MU_WATER: f32 = 0.002; // mm^-1
+    // Density activation is `MU_WATER · softplus(raw)` (matches the Python
+    // project, see brush-cube::softplus). Start at μ_water:
+    // raw = inverse_softplus(μ_water/MU_WATER) = inverse_softplus(1) ≈ 0.541
+    // → activated density = 0.002·softplus(0.541) = 0.002 mm⁻¹.
     let init_density = MU_WATER;
-    let init_raw_opac = (init_density / (1.0 - init_density)).ln();
+    let init_raw_opac = brush_cube::inverse_softplus(init_density / MU_WATER);
     let mut raw_opac = Vec::with_capacity(num_points as usize);
     for _ in 0..num_points {
         let u: f32 = rng.random_range(0.0..1.0);
@@ -511,9 +533,17 @@ pub fn create_xray_trainer(
     // scale (e.g. 0.135 mm) would project to well under one pixel at C-arm
     // distances → `proj ≈ 0` → an all-white Beer-Lambert image with ~zero
     // gradients; KNN sizing guarantees continuous early coverage.
+    //
+    // Scale activation is `softplus(raw)` (matches the Python project), so
+    // to render a Gaussian of size `σ` the stored raw must be
+    // `inverse_softplus(σ)` (i.e. `softplus(inverse_softplus(σ)) = σ`).
     let log_scales = crate::splat_init::compute_knn_scales(&means);
     debug_assert_eq!(log_scales.len(), means.len(), "one log-scale per axis");
-    let canonical = XRaySplats::from_raw(means, rots, log_scales, raw_opac, device);
+    let raw_scales: Vec<f32> = log_scales
+        .iter()
+        .map(|log_s| brush_cube::inverse_softplus(log_s.exp()))
+        .collect();
+    let canonical = XRaySplats::from_raw(means, rots, raw_scales, raw_opac, device);
 
     // Deform network only in deform mode; static mode omits it entirely.
     let deform = if config.enable_deform {

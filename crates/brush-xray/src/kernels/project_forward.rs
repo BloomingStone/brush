@@ -6,7 +6,7 @@
 use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::cube;
 use burn_cubecl::cubecl::prelude::*;
-use brush_cube::{is_finite_f32, sigmoid};
+use brush_cube::{is_finite_f32, MU_WATER, softplus};
 
 use super::helpers::{
     compute_radius, cone_cov2d_mu, count_tiles, get_tile_bbox_xray, project_xy,
@@ -67,13 +67,17 @@ pub fn project_forward_xray_kernel(
         terminate!();
     }
 
-    let opac = sigmoid(raw_opac);
+    let opac = MU_WATER * softplus(raw_opac);
     // Physical-density floor: μ_water ≈ 0.002 mm⁻¹ is a perfectly meaningful
     // Beer-Lambert path-integral contribution (0.002 × 200 mm ≈ 0.4 optical
     // depth ≈ exp(-0.4) ≈ 0.67 intensity) even though it sits below the RGB
     // opacity-visibility threshold of 1/255 ≈ 0.0039. Gate on the same tiny
     // per-splat alpha floor as the rasterizer (MIN_ALPHA) instead, so low-μ
     // soft-tissue/water backgrounds are actually projected.
+    //
+    // Activated density = MU_WATER · softplus(raw): μ stays in the
+    // water→iodine band (a stray large logit gives at most ~0.002·raw instead
+    // of the unbounded sigmoid → 1 mm⁻¹ that caused black-blob artifacts).
     if !(opac >= 1.0e-5f32) {
         terminate!();
     }

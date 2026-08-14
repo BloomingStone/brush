@@ -18,6 +18,7 @@ brush-xray.path = "../brush-xray"
 brush-xray-bwd.path = "../brush-xray-bwd"
 brush-deform.path = "../brush-deform"
 lpips.path = "../lpips"
+brush-cube.path = "../brush-cube"
 
 anyhow.workspace = true
 image.workspace = true

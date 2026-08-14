@@ -567,6 +567,55 @@ pub fn sigmoid(x: f32) -> f32 {
     1.0f32 / (1.0f32 + f32::exp(-x))
 }
 
+/// Water linear attenuation coefficient (mm⁻¹) — the density scale of the
+/// X-ray path. Activated density is `density = MU_WATER · softplus(raw)`
+/// (matching the Python project's `XrayCoronaryGaussian`).
+///
+/// WHY a *bounded* activation is mandatory for X-ray density (unlike RGB 3DGS):
+/// RGB composes with an alpha chain `C = Σ Tᵢ·αᵢ·cᵢ` where the transmittance
+/// `Tᵢ = Π(1-αⱼ)` lets opaque foreground splats **occlude** large background
+/// primitives — a giant background blob simply disappears behind the anatomy.
+/// X-ray is a purely **additive** Beer-Lambert path integral
+/// `proj = Σ μᵢ·muᵢ·exp(powerᵢ)` with **no transmittance / occlusion factor**,
+/// so every splat's μ contributes to every ray that crosses it, forever. An
+/// unbounded `sigmoid(raw) ∈ (0,1)` lets an optimizer occasionally push a
+/// background logit far positive, exploding μ to ~1 mm⁻¹ (500× water) and
+/// burning a black blob into every frame that sees that splat.
+///
+/// `MU_WATER · softplus(raw)` keeps μ in the water→iodine band (≈0.002–0.05):
+/// softplus grows only linearly for large raw, so even a stray logit of +50
+/// gives μ ≈ 0.1 (50× water) instead of an exponential blow-up.
+pub const MU_WATER: f32 = 0.002; // mm⁻¹
+
+/// `softplus(x) = ln(1 + eˣ)`, treated as linear for `x > 10` (matches
+/// `torch.nn.Softplus(threshold=10)`), numerically stable.
+///
+/// Used as the X-ray **scale** activation (see `read_scale_xray`) and inside
+/// `MU_WATER · softplus` for density. Rationale vs. standard 3DGS `exp`:
+/// - Small-scale behaviour is asymptotically identical: `softplus(x) ≈ eˣ` as
+///   `x → -∞`, so log-space optimization of small splats is preserved (and
+///   `inverse_softplus(σ)` init keeps the "compressed" parameter space with
+///   the same relative-update property as `log`).
+/// - Large-scale behaviour is the whole point: `exp(x)` grows exponentially
+///   (a logit of +10 → ×22026), while `softplus(x) ≈ x` grows linearly. In
+///   RGB this is only a soft problem (occlusion + densify/cull prune big
+///   splats); in X-ray a big splat **always** contributes — the path integral
+///   is additive and its per-ray weight `mu = σ·√(2π)` scales with σ, so an
+///   oversized splat is doubly harmful (covers many rays AND injects more
+///   optical depth into each). Hence scale must be bounded above too.
+#[cube]
+pub fn softplus(x: f32) -> f32 {
+    select(x > 10.0f32, x, f32::ln(1.0f32 + f32::exp(x)))
+}
+
+/// Host-side inverse softplus: `x = ln(eʸ − 1)` for `y > 0`. Use it to
+/// initialize raw density logits from a target activated density:
+/// `raw = inverse_softplus(μ_target / MU_WATER)`.
+pub fn inverse_softplus(y: f32) -> f32 {
+    debug_assert!(y > 0.0, "inverse_softplus requires y > 0");
+    y.exp_m1().ln()
+}
+
 /// Bit-level finite check. NaN / ±Inf have an all-ones exponent.
 #[cube]
 pub fn is_finite_f32(x: f32) -> bool {

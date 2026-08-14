@@ -508,6 +508,15 @@ pub(crate) async fn train_stream(
         .emit(ProcessMessage::TrainMessage(TrainMessage::DoneTraining))
         .await;
 
+    // Ensure the rerun `.rrd` sink is flushed before the process may be torn
+    // down with `std::process::exit` (which skips destructors — a truncated
+    // recording would lose the final splats / eval logs).
+    if visualize.is_enabled()
+        && let Err(error) = visualize.flush()
+    {
+        emitter.emit(ProcessMessage::Warning { error }).await;
+    }
+
     Ok(())
 }
 

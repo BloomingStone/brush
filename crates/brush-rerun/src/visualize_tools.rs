@@ -121,6 +121,21 @@ mod visualize_tools_impl {
             }
         }
 
+        /// Flush any pending rerun data to the sink. For `.rrd` file sinks this
+        /// pushes the batcher through to disk so the file is complete even if
+        /// the process is torn down with `std::process::exit` right after
+        /// training (which skips destructors / stream drops and could
+        /// otherwise truncate the recording).
+        #[allow(unused_variables)]
+        pub fn flush(&self) -> Result<()> {
+            if self.rec.is_enabled() {
+                self.rec
+                    .flush_blocking()
+                    .map_err(|e| anyhow::anyhow!("Failed to flush rerun sink: {e}"))?;
+            }
+            Ok(())
+        }
+
         #[allow(unused_variables)]
         pub async fn log_splats(&self, iter: u32, splats: Splats) -> Result<()> {
             if self.rec.is_enabled() {

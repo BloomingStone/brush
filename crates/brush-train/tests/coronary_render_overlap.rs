@@ -34,9 +34,6 @@ use glam::{uvec2, Vec3};
 use std::path::Path;
 
 /// Inverse sigmoid → raw-opacity logit for a target density `μ` (mm⁻¹).
-fn inverse_sigmoid(x: f32) -> f32 {
-    (x / (1.0 - x)).ln()
-}
 
 #[tokio::test]
 #[allow(clippy::print_stdout)]
@@ -78,8 +75,12 @@ async fn coronary_centerline_splats_render_overlap_label() {
     // 4.5 mm) overflowed the vessel and dropped precision to ~0.27. Density
     // is that of an iodinated vessel (μ = 0.02 mm⁻¹).
     const MU: f32 = 0.02; // mm⁻¹
-    let log_scale = 0.7f32.ln();
-    let raw_opac_logit = inverse_sigmoid(MU);
+    // Activated density = MU_WATER · softplus(raw) (see brush-cube).
+    // raw = inverse_softplus(10) ≈ 10 → density = 0.002·softplus(10) ≈ 0.02.
+    let raw_opac_logit = brush_cube::inverse_softplus(MU / brush_cube::MU_WATER);
+    // Scale activation = softplus(raw): to render σ = 0.7 mm, store
+    // inverse_softplus(0.7) (softplus(inverse_softplus(0.7)) = 0.7).
+    let raw_scale = brush_cube::inverse_softplus(0.7f32);
     let mut means = Vec::with_capacity(pts.len() * 3);
     let mut rots = Vec::with_capacity(pts.len() * 4);
     let mut log_scales = Vec::with_capacity(pts.len() * 3);
@@ -87,7 +88,7 @@ async fn coronary_centerline_splats_render_overlap_label() {
     for p in &pts {
         means.extend_from_slice(&[p.x, p.y, p.z]);
         rots.extend_from_slice(&[1.0, 0.0, 0.0, 0.0]); // identity rotation
-        log_scales.extend_from_slice(&[log_scale, log_scale, log_scale]);
+        log_scales.extend_from_slice(&[raw_scale, raw_scale, raw_scale]);
         raw_opacs.push(raw_opac_logit);
     }
     let splats = XRaySplats::from_raw(means, rots, log_scales, raw_opacs, &device);

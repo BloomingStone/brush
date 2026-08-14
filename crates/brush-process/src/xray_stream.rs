@@ -45,6 +45,18 @@ fn xray_to_splats(canonical: &XRaySplats, device: &burn::tensor::Device) -> Spla
     Splats::from_tensor_data(means, rots, log_scales, sh, opac, SplatRenderMode::Default)
 }
 
+/// Sample up to `count` views, spread evenly across the sequence so each eval
+/// round covers a range of C-arm angles / cardiac phases. Returns all views
+/// when `count` exceeds the sequence length.
+fn sample_eval_views(views: &[SceneView], count: usize) -> Vec<&SceneView> {
+    let n = views.len();
+    if count >= n {
+        views.iter().collect()
+    } else {
+        (0..count).map(|i| &views[i * n / count]).collect()
+    }
+}
+
 #[allow(clippy::large_stack_frames)]
 pub(crate) async fn xray_stream(
     vfs: Arc<BrushVfs>,
@@ -182,16 +194,24 @@ pub(crate) async fn xray_stream(
     let client = WgpuRuntime::<AutoCompiler>::client(wgpu_device);
     client.memory_cleanup();
 
-    // Sample eval views evenly across the DICOM sequence, so each eval round
-    // covers a spread of C-arm angles / cardiac phases.
-    let n_train = dataset.train.views.len();
+    // Sample eval views for PSNR/SSIM. When `--eval-split-every` is set the
+    // DICOM loader holds out every `eval_split_every`-th frame in
+    // `dataset.eval` — those are *never* seen during training, so eval on them
+    // is honest generalization. Otherwise fall back to evenly sampling the
+    // train views (that scores training views, so the reported PSNR/SSIM is
+    // optimistic — log a warning so the numbers aren't misread).
     let eval_count = process_config.xray_eval_views as usize;
-    let eval_views: Vec<&SceneView> = if eval_count >= n_train {
-        dataset.train.views.iter().collect()
+    let eval_views: Vec<&SceneView> = if let Some(eval_scene) = &dataset.eval
+        && !eval_scene.views.is_empty()
+    {
+        // Held-out views (never seen during training) → honest generalization.
+        sample_eval_views(&eval_scene.views, eval_count)
     } else {
-        (0..eval_count)
-            .map(|i| &dataset.train.views[i * n_train / eval_count])
-            .collect()
+        log::warn!(
+            "No held-out eval split (pass --eval-split-every=N): evaluating on \
+             training views, PSNR/SSIM will be optimistic"
+        );
+        sample_eval_views(&dataset.train.views, eval_count)
     };
 
     // Startup diagnostic: render the first eval view BEFORE training and log
@@ -426,6 +446,15 @@ pub(crate) async fn xray_stream(
     std::fs::write(export_path.join(&export_name), ply)
         .with_context(|| format!("Failed to export ply {}", export_path.display()))?;
     log::info!("Exported canonical splats to {}", export_path.join(&export_name).display());
+
+    // Ensure the rerun `.rrd` sink is flushed before the process may be torn
+    // down with `std::process::exit` (which skips destructors — a truncated
+    // recording would lose the final splats / eval logs).
+    if visualize.is_enabled()
+        && let Err(error) = visualize.flush()
+    {
+        emitter.emit(ProcessMessage::Warning { error }).await;
+    }
 
     Ok(())
 }

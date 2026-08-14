@@ -18,8 +18,8 @@
 
 use std::collections::VecDeque;
 
+use brush_cube::MU_WATER;
 use brush_xray::XRaySplats;
-use burn::tensor::activation::sigmoid;
 use burn::tensor::{Bool, Device, Distribution, Int, Tensor, TensorData, s};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -72,12 +72,11 @@ impl Default for XRayRefineConfig {
             densify_until_frac: 0.8,
             densify_grad_percentile: 0.98,
             fixed_grad_threshold: None,
-            // Physical floor: μ_water ≈ 0.002 mm⁻¹ is a meaningful Beer-Lambert
-            // contribution, so only prune splats that are numerically dead (a
-            // density below MIN_ALPHA-level). A higher threshold (e.g. 5e-4 =
-            // a quarter of water) culls nearly all low-density splats during
-            // early training and starves the reconstruction.
-            cull_density_threshold: 1e-5,
+            // Activated density = MU_WATER·softplus(raw) ≈ 0.002 mm⁻¹ at
+            // water level. 5e-5 ≈ 2.5% of water — prune splats that have
+            // essentially decayed to zero (matches the Python project's
+            // `cull_density_threshold: 5e-5`).
+            cull_density_threshold: 5e-5,
             // Disabled by default: an opacity/density reset is an RGB 3DGS
             // habit that does not survive the Beer-Lambert mapping — resetting
             // density mid-training destroys the learned attenuation field (the
@@ -209,7 +208,9 @@ impl XRayRefiner {
         };
 
         // ---- Prune -------------------------------------------------------
-        let density = sigmoid(splats.raw_opacities.val());
+        // Activated density = MU_WATER · softplus(raw) (matches the renderer).
+        let raw = splats.raw_opacities.val().clamp(-20.0, 20.0);
+        let density = raw.exp().add_scalar(1.0).log().mul_scalar(MU_WATER);
         let prune_density = density.lower_elem(self.config.cull_density_threshold);
 
         let transforms_bad = row_non_finite(&splats.transforms.val());
@@ -303,12 +304,26 @@ impl XRayRefiner {
             let parent_means = parent_t.clone().slice(s![.., 0..3]);
             let parent_rots = parent_t.clone().slice(s![.., 3..7]);
             let parent_log_scale = parent_t.slice(s![.., 7..10]);
-            let parent_scales = parent_log_scale.exp();
+            // Reverse activation: stored raw → rendered scale `softplus(raw)`.
+            let raw_clamped = parent_log_scale.clamp(-20.0, 20.0);
+            let parent_scales = raw_clamped.exp().add_scalar(1.0).log();
 
             // Child scale: half of parent, capped at scene_extent * percent_dense.
             let max_scale = self.config.scene_extent * self.config.percent_dense;
             let child_scales = (parent_scales.clone() * 0.5).clamp_max(max_scale);
-            let child_log_scale = child_scales.log();
+            let child_log_scale = child_scales
+                .into_data_async()
+                .await
+                .expect("child scales readback")
+                .to_vec::<f32>()
+                .expect("f32")
+                .into_iter()
+                .map(brush_cube::inverse_softplus)
+                .collect::<Vec<f32>>();
+            let child_log_scale = Tensor::<2>::from_data(
+                TensorData::new(child_log_scale, [parent_scales.dims()[0], 3]),
+                &splats.raw_opacities.device(),
+            );
 
             // Position jitter: rotate a small offset by the splat orientation.
             let samples = Tensor::random(
@@ -334,11 +349,11 @@ impl XRayRefiner {
             && iter.is_multiple_of(self.config.density_reset_interval)
         {
             // Reset density to the *physical water background* (μ_water ≈
-            // 0.002 mm⁻¹). Resetting raw_opac to 0 would mean `sigmoid(0) =
-            // 0.5` — 250× water — which instantly overexposes every ray
-            // (Beer-Lambert `proj` saturates) and makes training oscillate
-            // between all-black and washed-out.
-            let reset_logit = (0.002f32 / (1.0 - 0.002f32)).ln();
+            // 0.002 mm⁻¹): raw = inverse_softplus(μ_water/MU_WATER) =
+            // inverse_softplus(1) ≈ 0.541 → activated density = 0.002.
+            // (With the old `sigmoid` activation, raw=0 meant density 0.5 =
+            // 250× water, instantly overexposing every ray.)
+            let reset_logit = brush_cube::inverse_softplus(1.0);
             new_raw_opac = new_raw_opac.mul_scalar(0.0).add_scalar(reset_logit);
             density_reset = true;
         }
@@ -402,9 +417,9 @@ mod tests {
             .map(|i| if i % 4 == 0 { 1.0 } else { 0.0 })
             .collect();
         let log_scales: Vec<f32> = (0..n * 3).map(|_| -1.0).collect();
-        // First quarter have near-zero density (logit -20 → sigmoid ≈ 2e-9,
-        // below the cull_density_threshold default of 1e-5); the rest are
-        // dense (logit 2 → ≈ 0.88).
+        // First quarter have near-zero density (logit -20 → softplus ≈ 2e-9,
+        // density ≈ 4e-12 ≪ cull_density_threshold 5e-5); the rest are
+        // dense (logit 2 → density ≈ 0.002·2.13 ≈ 0.0043).
         let raw_opac: Vec<f32> = (0..n)
             .map(|i| if i < n / 4 { -20.0 } else { 2.0 })
             .collect();
