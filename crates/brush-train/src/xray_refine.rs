@@ -9,8 +9,12 @@
 //! - **prunes** splats whose density (`sigmoid(raw_opacity)`) is below
 //!   `cull_density_threshold`, plus NaN / out-of-bounds splats;
 //! - **densifies** splats whose mean viewspace gradient exceeds a
-//!   (fixed or dynamically percentile-based) threshold, capping child scale
-//!   at `scene_extent * percent_dense`;
+//!   (fixed or dynamically percentile-based) threshold. Small splats are
+//!   cloned (child scale capped at `scene_extent * percent_dense`), oversized
+//!   ones (`max_scale > scene_extent * percent_dense`) are **split** in two —
+//!   the parent shrinks by `split_scale_factor` and is offset one way while a
+//!   same-density child is appended offset the other way (centroid-
+//!   preserving), mirroring the RGB `SplatTrainer::refine_splats`;
 //! - **resets density** every `density_reset_interval` steps.
 //!
 //! The returned [`XRayRefineUpdate`] lets the owning trainer sync its
@@ -20,7 +24,7 @@ use std::collections::VecDeque;
 
 use brush_cube::MU_WATER;
 use brush_xray::XRaySplats;
-use burn::tensor::{Bool, Device, Distribution, Int, Tensor, TensorData, s};
+use burn::tensor::{Bool, Device, Distribution, IndexingUpdateOp, Int, Tensor, TensorData, s};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
@@ -59,7 +63,14 @@ pub struct XRayRefineConfig {
     pub scene_extent: f32,
     /// Fraction of above-threshold splats actually densified per refine.
     pub growth_select_fraction: f32,
-    /// RNG seed (position jitter for cloned splats).
+    /// Split oversized high-gradient splats (`max_scale > scene_extent *
+    /// percent_dense`) in two instead of only cloning them. Disabled keeps
+    /// the historical clone-only behavior.
+    pub enable_split: bool,
+    /// Per-axis scale shrink applied by a split. `1/√2` conserves the total
+    /// projected coverage (matches the RGB `SplatTrainer`).
+    pub split_scale_factor: f32,
+    /// RNG seed (position jitter for cloned / split splats).
     pub seed: u64,
 }
 
@@ -88,6 +99,8 @@ impl Default for XRayRefineConfig {
             max_splats: 1_000_000,
             scene_extent: 760.0,
             growth_select_fraction: 0.25,
+            enable_split: false,
+            split_scale_factor: std::f32::consts::FRAC_1_SQRT_2,
             seed: 0,
         }
     }
@@ -97,6 +110,9 @@ impl Default for XRayRefineConfig {
 #[derive(Debug, Clone, Default)]
 pub struct XRayRefineStats {
     pub num_added: u32,
+    /// Number of split parents (each also appends one child, counted in
+    /// `num_added`).
+    pub num_split: u32,
     pub num_pruned: u32,
     pub grad_threshold: Option<f32>,
     pub density_reset: bool,
@@ -108,8 +124,12 @@ pub struct XRayRefineStats {
 pub struct XRayRefineUpdate {
     /// Keep-mask (bool `[N]`) over the pre-refine splats (pruned → false).
     pub keep_mask: Tensor<1, Bool>,
-    /// Indices (into the kept splats) that were cloned/densified.
+    /// Indices (into the kept splats) that were cloned/densified (each
+    /// appends exactly one new splat).
     pub densify_inds: Tensor<1, Int>,
+    /// Indices (into the kept splats) of split parents — their optimizer
+    /// state must be reset (scale/position changed discontinuously).
+    pub split_inds: Tensor<1, Int>,
 }
 
 /// Per-step accumulator for the viewspace gradient statistics.
@@ -240,8 +260,9 @@ impl XRayRefiner {
             .await
             .squeeze_dim::<1>(1);
 
-        // ---- Densify -----------------------------------------------------
-        let mut densify_inds = Vec::new();
+        // ---- Densify (clone small + split oversized) ---------------------
+        let mut clone_inds = Vec::new();
+        let mut split_inds = Vec::new();
 
         if densifying {
             let threshold = threshold.expect("threshold set when densifying");
@@ -265,20 +286,89 @@ impl XRayRefiner {
                 .into_vec::<i32>()
                 .expect("above inds vec");
 
-            // Cap growth by max_splats.
+            let (small_candidates, big_candidates): (Vec<i32>, Vec<i32>) =
+                if self.config.enable_split && !candidates.is_empty() {
+                    // Partition by max rendered scale `softplus(raw_log_scale)`
+                    // (kept space): small → clone, oversized → split.
+                    let kept_transforms = splats.transforms.val().select(0, keep_inds.clone());
+                    let kept_raw_scale = kept_transforms.slice(s![.., 7..10]);
+                    let kept_scales = kept_raw_scale
+                        .clamp(-20.0, 20.0)
+                        .exp()
+                        .add_scalar(1.0)
+                        .log();
+                    let max_scale: Tensor<1> = kept_scales.max_dim(1).squeeze_dim(1); // [N_kept]
+                    let oversized_thr = self.config.scene_extent * self.config.percent_dense;
+                    let oversized = max_scale.greater_elem(oversized_thr);
+
+                    let cand_t = Tensor::<1, Int>::from_data(
+                        TensorData::new(candidates.clone(), [candidates.len()]),
+                        &device,
+                    );
+                    let cand_oversized = oversized.select(0, cand_t.clone());
+                    let big_idx: Vec<usize> = cand_oversized
+                        .clone()
+                        .argwhere_async()
+                        .await
+                        .squeeze_dim::<1>(1)
+                        .into_data_async()
+                        .await
+                        .expect("big idx")
+                        .into_vec::<i32>()
+                        .expect("big idx vec")
+                        .into_iter()
+                        .map(|v| v as usize)
+                        .collect();
+                    let small_idx: Vec<usize> = cand_oversized
+                        .bool_not()
+                        .argwhere_async()
+                        .await
+                        .squeeze_dim::<1>(1)
+                        .into_data_async()
+                        .await
+                        .expect("small idx")
+                        .into_vec::<i32>()
+                        .expect("small idx vec")
+                        .into_iter()
+                        .map(|v| v as usize)
+                        .collect();
+
+                    (
+                        small_idx.into_iter().map(|i| candidates[i]).collect(),
+                        big_idx.into_iter().map(|i| candidates[i]).collect(),
+                    )
+                } else {
+                    (candidates, Vec::new())
+                };
+
+            // Cap growth by max_splats — both a clone and a split append
+            // exactly one new splat (the split keeps its parent).
             let cur = splats.num_splats() as usize;
             let headroom = self.config.max_splats.saturating_sub(cur as u32) as usize;
-            let mut grow = (candidates.len() as f32 * self.config.growth_select_fraction).round()
-                as usize;
-            grow = grow.min(headroom).min(candidates.len());
 
-            // Deterministic (seeded) selection of `grow` candidates.
+            // Clones keep the conservative growth fraction; splits take the
+            // full oversized set (they are the blur fix), bounded by whatever
+            // headroom the clones leave.
+            let mut grow = (small_candidates.len() as f32 * self.config.growth_select_fraction)
+                .round() as usize;
+            grow = grow.min(headroom).min(small_candidates.len());
+
+            // Deterministic (seeded) selection of `grow` clones.
             use rand::seq::SliceRandom;
-            let mut idxs: Vec<usize> = (0..candidates.len()).collect();
+            let mut idxs: Vec<usize> = (0..small_candidates.len()).collect();
             idxs.shuffle(&mut self.rng);
-            densify_inds = idxs[..grow]
+            clone_inds = idxs[..grow]
                 .iter()
-                .map(|&i| candidates[i])
+                .map(|&i| small_candidates[i])
+                .collect();
+
+            let split_budget = headroom.saturating_sub(clone_inds.len());
+            let split_grow = big_candidates.len().min(split_budget);
+            let mut sidxs: Vec<usize> = (0..big_candidates.len()).collect();
+            sidxs.shuffle(&mut self.rng);
+            split_inds = sidxs[..split_grow]
+                .iter()
+                .map(|&i| big_candidates[i])
                 .collect();
         }
 
@@ -291,10 +381,11 @@ impl XRayRefiner {
         let mut new_transforms = transforms_kept;
         let mut new_raw_opac = raw_opac_kept;
 
-        let densify_count = densify_inds.len();
-        if densify_count > 0 {
+        // ---- Clone (small high-gradient splats) --------------------------
+        let clone_count = clone_inds.len();
+        if clone_count > 0 {
             let inds = Tensor::from_data(
-                TensorData::new(densify_inds.clone(), [densify_count]),
+                TensorData::new(clone_inds.clone(), [clone_count]),
                 &device,
             );
 
@@ -327,7 +418,7 @@ impl XRayRefiner {
 
             // Position jitter: rotate a small offset by the splat orientation.
             let samples = Tensor::random(
-                [densify_count, 3],
+                [clone_count, 3],
                 Distribution::Normal(0.0, 1.0),
                 &device,
             );
@@ -341,6 +432,61 @@ impl XRayRefiner {
 
             new_transforms = Tensor::cat(vec![new_transforms, child_transforms], 0);
             new_raw_opac = Tensor::cat(vec![new_raw_opac, parent_o], 0);
+        }
+
+        // ---- Split (oversized high-gradient splats) ----------------------
+        // Mirrors the RGB `SplatTrainer::refine_splats`: the parent shrinks by
+        // `split_scale_factor` (per-axis; the dominant axis gets the full
+        // shrink) and is offset one way, while a same-density child is
+        // appended offset the other way — centroid-preserving, so the
+        // Beer-Lambert path integral is roughly conserved.
+        let split_count = split_inds.len();
+        if split_count > 0 {
+            let inds = Tensor::from_data(
+                TensorData::new(split_inds.clone(), [split_count]),
+                &device,
+            );
+
+            let parent_t = new_transforms.clone().select(0, inds.clone());
+            let parent_means = parent_t.clone().slice(s![.., 0..3]);
+            let parent_rots = parent_t.clone().slice(s![.., 3..7]);
+            let parent_log_scale = parent_t.slice(s![.., 7..10]);
+            let parent_scales = parent_log_scale
+                .clone()
+                .clamp(-20.0, 20.0)
+                .exp()
+                .add_scalar(1.0)
+                .log();
+
+            // Smooth covariance-aware shrink: k=1 on minor axes, k=
+            // split_scale_factor on the dominant axis.
+            let scales_sq = parent_scales.clone().powi_scalar(2);
+            let max_sq = scales_sq.clone().max_dim(1).clamp_min(1e-30);
+            let ratio = scales_sq / max_sq;
+            let k = -ratio * (1.0_f32 - self.config.split_scale_factor) + 1.0;
+            let offset_factor = (-k.clone().powi_scalar(2) + 1.0).clamp_min(0.0).sqrt();
+            let offset_local = offset_factor * parent_scales;
+            let samples = quaternion_vec_multiply(parent_rots.clone(), offset_local);
+            let new_log_scale = parent_log_scale.clone() + k.log();
+
+            // Parent: means -= samples, log_scale += log(k) (scatter-add).
+            let scale_diff = new_log_scale.clone() - parent_log_scale;
+            let inds_10 = inds.clone().unsqueeze_dim(1).repeat_dim(1, 10);
+            let mut update = Tensor::zeros([split_count, 10], &device);
+            update = update.slice_assign(s![.., 0..3], -samples.clone());
+            update = update.slice_assign(s![.., 7..10], scale_diff);
+            new_transforms = new_transforms.scatter(0, inds_10, update, IndexingUpdateOp::Add);
+
+            // Child: means + samples, same rotation, same shrunk scale,
+            // same density.
+            let child_transforms = Tensor::cat(
+                vec![parent_means + samples, parent_rots, new_log_scale],
+                1,
+            );
+            new_transforms = Tensor::cat(vec![new_transforms, child_transforms], 0);
+
+            let parent_raw = new_raw_opac.clone().select(0, inds);
+            new_raw_opac = Tensor::cat(vec![new_raw_opac, parent_raw], 0);
         }
 
         // ---- Density reset -----------------------------------------------
@@ -372,17 +518,24 @@ impl XRayRefiner {
         self.xyz_gradient_accum = Tensor::<1>::zeros([new_n], &device);
         self.denom = Tensor::<1>::zeros([new_n], &device);
 
-        let densify_inds_tensor = if densify_count > 0 {
-            Tensor::from_data(
-                TensorData::new(densify_inds.clone(), [densify_count]),
-                &device,
-            )
+        // Appended index list = clones then splits (each appends exactly one).
+        let mut appended = clone_inds.clone();
+        appended.extend(split_inds.iter().copied());
+        let append_count = appended.len();
+        let densify_inds_tensor = if append_count > 0 {
+            Tensor::from_data(TensorData::new(appended, [append_count]), &device)
+        } else {
+            Tensor::<1, Int>::from_data(TensorData::new(vec![0i32; 0], [0usize]), &device)
+        };
+        let split_inds_tensor = if split_count > 0 {
+            Tensor::from_data(TensorData::new(split_inds.clone(), [split_count]), &device)
         } else {
             Tensor::<1, Int>::from_data(TensorData::new(vec![0i32; 0], [0usize]), &device)
         };
 
         let stats = XRayRefineStats {
-            num_added: densify_count as u32,
+            num_added: append_count as u32,
+            num_split: split_count as u32,
             num_pruned,
             grad_threshold: threshold,
             density_reset,
@@ -394,6 +547,7 @@ impl XRayRefiner {
             XRayRefineUpdate {
                 keep_mask,
                 densify_inds: densify_inds_tensor,
+                split_inds: split_inds_tensor,
             },
             stats,
         )

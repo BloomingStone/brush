@@ -90,6 +90,43 @@ pub fn save_gray_nrrd_f32(path: &Path, data: &TensorData) -> Result<()> {
     Ok(())
 }
 
+/// Write an `[N, H, W]` f32 stack as a lossless `float32` NRRD volume
+/// (`dimension: 3`, sizes `W H N`, z = view index). Each z-slice is flipped
+/// vertically so it displays upright in NRRD viewers — same convention as
+/// [`save_gray_nrrd_f32`]. Useful to batch-browse every eval view of one
+/// iteration in 3D Slicer / ParaView / napari.
+pub fn save_gray_nrrd_f32_stack(path: &Path, data: &TensorData) -> Result<()> {
+    let [n, h, w] = [data.shape[0], data.shape[1], data.shape[2]];
+    let f32_buf = data.as_slice::<f32>().expect("gray f32 buffer");
+    let mut payload = Vec::with_capacity(f32_buf.len() * 4);
+    for z in 0..n {
+        let slice = &f32_buf[z * h * w..(z + 1) * h * w];
+        for row in (0..h).rev() {
+            for v in &slice[row * w..(row + 1) * w] {
+                payload.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+    let header = format!(
+        "NRRD0004\n\
+         # Brush X-ray eval (float32, normalized [0,1]), z = view index\n\
+         type: float\n\
+         dimension: 3\n\
+         sizes: {w} {h} {n}\n\
+         encoding: raw\n\
+         endian: little\n\
+         \n"
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = Vec::with_capacity(header.len() + payload.len());
+    file.extend_from_slice(header.as_bytes());
+    file.append(&mut payload);
+    std::fs::write(path, file)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

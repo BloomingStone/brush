@@ -27,7 +27,7 @@ use burn::{
     },
     module::AutodiffModule,
     optim::{GradientsParams, Optimizer, adaptor::OptimizerAdaptor},
-    tensor::{Device, Tensor, TensorData, Distribution, s},
+    tensor::{Device, IndexingUpdateOp, Tensor, TensorData, Distribution, s},
 };
 
 use crate::adam_scaled::{AdamScaled, AdamScaledConfig};
@@ -515,6 +515,7 @@ impl XRayTrainer {
                 .await
                 .squeeze_dim::<1>(1);
             let add_count = update.densify_inds.dims()[0] as u32;
+            let split_count = update.split_inds.dims()[0] as u32;
 
             if let Some(optim) = &mut self.optim_splats {
                 use burn::optim::record::AdaptorRecord;
@@ -538,6 +539,25 @@ impl XRayTrainer {
                             moment.moment_1 = moment.moment_1.clone().select(0, keep_inds.clone());
                             moment.moment_2 = moment.moment_2.clone().select(0, keep_inds.clone());
                             let [_, d] = moment.moment_1.dims();
+                            // Split parents reset their momentum — both
+                            // halves of a split start from zero (their
+                            // scale/position changed discontinuously).
+                            if split_count > 0 {
+                                let split_global =
+                                    keep_inds.clone().select(0, update.split_inds.clone());
+                                let inds = split_global.clone().unsqueeze_dim(1).repeat_dim(1, d);
+                                let neg1 = -moment.moment_1.clone().select(0, split_global.clone());
+                                moment.moment_1 = moment
+                                    .moment_1
+                                    .clone()
+                                    .scatter(0, inds, neg1, IndexingUpdateOp::Add);
+                                let inds2 = split_global.clone().unsqueeze_dim(1).repeat_dim(1, d);
+                                let neg2 = -moment.moment_2.clone().select(0, split_global.clone());
+                                moment.moment_2 = moment
+                                    .moment_2
+                                    .clone()
+                                    .scatter(0, inds2, neg2, IndexingUpdateOp::Add);
+                            }
                             let zeros = Tensor::<2>::zeros([add_count as usize, d], &moment.moment_1.device());
                             moment.moment_1 = Tensor::cat(vec![moment.moment_1.clone(), zeros.clone()], 0);
                             let zeros2 = Tensor::<2>::zeros(
@@ -554,6 +574,21 @@ impl XRayTrainer {
                             moment.moment_1 = moment.moment_1.clone().select(0, keep_inds.clone());
                             moment.moment_2 = moment.moment_2.clone().select(0, keep_inds.clone());
                             let [_n] = moment.moment_1.dims();
+                            // Split parents reset their momentum.
+                            if split_count > 0 {
+                                let split_global =
+                                    keep_inds.clone().select(0, update.split_inds.clone());
+                                let neg1 = -moment.moment_1.clone().select(0, split_global.clone());
+                                moment.moment_1 = moment
+                                    .moment_1
+                                    .clone()
+                                    .scatter(0, split_global.clone(), neg1, IndexingUpdateOp::Add);
+                                let neg2 = -moment.moment_2.clone().select(0, split_global.clone());
+                                moment.moment_2 = moment
+                                    .moment_2
+                                    .clone()
+                                    .scatter(0, split_global, neg2, IndexingUpdateOp::Add);
+                            }
                             let zeros = Tensor::<1>::zeros([add_count as usize], &moment.moment_1.device());
                             moment.moment_1 = Tensor::cat(vec![moment.moment_1.clone(), zeros.clone()], 0);
                             let zeros2 = Tensor::<1>::zeros([add_count as usize], &moment.moment_2.device());
