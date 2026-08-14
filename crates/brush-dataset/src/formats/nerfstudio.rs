@@ -383,5 +383,6 @@ async fn read_dataset_inner(
         init_splat,
         dataset,
         warnings,
+        gamma: None,
     })
 }

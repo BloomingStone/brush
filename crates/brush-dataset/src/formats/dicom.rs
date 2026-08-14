@@ -63,12 +63,39 @@ async fn load_dataset_inner(
     // preserved across frames. Min-max matches the Python project's
     // convention; percentile clipping is robust to bright outliers (use it
     // for low-dynamic-range / spike-heavy scans such as RXA_brain.dcm).
-    let normalized = match load_args.dicom_normalization {
+    let mut normalized = match load_args.dicom_normalization {
         crate::config::DicomNormalization::Minmax => normalize_01(&pixels.values),
         crate::config::DicomNormalization::Percentile => {
             normalize_01_percentile(&pixels.values, 0.01, 0.99)
         }
     };
+    // Gamma correction: brighten dark parts so the loss target has real
+    // contrast. Explicit `dicom_gamma` wins; otherwise auto-compute gamma so
+    // the global intensity median maps to `dicom_gamma_target` (e.g. 0.5).
+    // Since the model renders `exp(-proj)`, a gamma'd target equals scaling
+    // every density by γ — matching the init μ to the target keeps the
+    // initial gray level aligned.
+    let gamma = load_args.dicom_gamma.or_else(|| {
+        load_args.dicom_gamma_target.map(|target| {
+            let mut med: Vec<f32> = normalized
+                .iter()
+                .copied()
+                .filter(|v| v.is_finite())
+                .collect();
+            med.sort_by(|a, b| a.total_cmp(b));
+            let m = med.get(med.len() / 2).copied().unwrap_or(0.0);
+            if m > 1e-4 && target > 0.0 {
+                (target.ln() / m.ln()).clamp(0.05, 1.0)
+            } else {
+                1.0
+            }
+        })
+    });
+    if let Some(g) = gamma {
+        for v in &mut normalized {
+            *v = v.powf(g);
+        }
+    }
     let frame_len = pixels.frame_len();
 
     // The RGB `LoadImage` is unused for X-ray views (the scene loader skips
@@ -109,6 +136,7 @@ async fn load_dataset_inner(
         init_splat: None,
         dataset,
         warnings: vec![],
+        gamma,
     })
 }
 
@@ -399,6 +427,8 @@ mod tests {
             alpha_mode: None,
             dicom_orientation: XRayOrientation::Ap,
             dicom_normalization: crate::config::DicomNormalization::Minmax,
+            dicom_gamma: None,
+            dicom_gamma_target: None,
             max_scene_batch_cache_size: 1 << 30,
         };
 

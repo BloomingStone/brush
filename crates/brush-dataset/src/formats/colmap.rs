@@ -298,6 +298,7 @@ async fn load_dataset_inner(
         init_splat,
         dataset,
         warnings,
+        gamma: None,
     })
 }
 

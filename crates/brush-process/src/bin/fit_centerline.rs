@@ -115,6 +115,8 @@ async fn main() -> anyhow::Result<()> {
         alpha_mode: None,
         dicom_orientation: XRayOrientation::Ap,
         dicom_normalization: DicomNormalization::Percentile,
+        dicom_gamma: None,
+        dicom_gamma_target: None,
         max_scene_batch_cache_size: 1 << 30,
     };
     let result = brush_dataset::load_dataset(vfs, &load_config).await?;

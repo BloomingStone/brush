@@ -27,7 +27,7 @@ use burn::{
     },
     module::AutodiffModule,
     optim::{GradientsParams, Optimizer, adaptor::OptimizerAdaptor},
-    tensor::{Device, Tensor, TensorData, Distribution},
+    tensor::{Device, Tensor, TensorData, Distribution, s},
 };
 
 use crate::adam_scaled::{AdamScaled, AdamScaledConfig};
@@ -57,6 +57,11 @@ pub struct XRayTrainConfig {
     pub enable_deform: bool,
     /// Density-control configuration.
     pub refine: XRayRefineConfig,
+    /// Initial activated density (mm⁻¹) for the random splats. Defaults to
+    /// μ_water (0.002). Raise it when the normalized / gamma-corrected GT
+    /// target sits at higher intensity so the init ball starts at the right
+    /// gray level (Beer-Lambert `proj` scales linearly with density).
+    pub init_density: f32,
     /// L1 / SSIM weights for the gray loss.
     pub l1_weight: f32,
     pub ssim_weight: f32,
@@ -77,6 +82,7 @@ impl Default for XRayTrainConfig {
             warm_up: 300,
             enable_deform: true,
             refine: XRayRefineConfig::default(),
+            init_density: brush_cube::MU_WATER,
             l1_weight: 1.0,
             ssim_weight: 1.0,
         }
@@ -93,6 +99,23 @@ pub struct XRayTrainStats {
     /// Predicted intensity image `[H, W]` f32 (normalized `[0, 1]`), when
     /// [`XRayTrainer::set_collect_pred`] is enabled (visualization paths).
     pub pred_img: Option<TensorData>,
+    /// Per-parameter gradient magnitudes (mean |∂L/∂·| per splat), when
+    /// [`XRayTrainer::set_collect_grads`] is enabled. Use to check whether a
+    /// parameter's LR actually moves it (position step ≈ `lr_mean · mean_grad`).
+    pub grad_norms: Option<XRayGradStats>,
+}
+
+/// Gradient magnitude diagnostics (mean |∂L/∂·| per splat).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct XRayGradStats {
+    /// Mean |∂L/∂x| over the 3 position coords of every splat (mm⁻¹).
+    pub mean_grad: f32,
+    /// Mean |∂L/∂q| over the 4 rotation coords.
+    pub rot_grad: f32,
+    /// Mean |∂L/∂s| over the 3 scale-logits.
+    pub scale_grad: f32,
+    /// Mean |∂L/∂raw| over the density logits.
+    pub density_grad: f32,
 }
 
 type OptimType = OptimizerAdaptor<AdamScaled, XRaySplats>;
@@ -112,6 +135,8 @@ pub struct XRayTrainer {
     step_count: u32,
     /// Read back the predicted intensity image every step (for visualization).
     collect_pred: bool,
+    /// Collect per-parameter gradient norms every step (diagnostics).
+    collect_grads: bool,
 }
 
 impl XRayTrainer {
@@ -145,6 +170,7 @@ impl XRayTrainer {
             config,
             step_count: 0,
             collect_pred: false,
+            collect_grads: false,
         }
     }
 
@@ -153,6 +179,12 @@ impl XRayTrainer {
     /// GPU→CPU sync to every step.
     pub fn set_collect_pred(&mut self, collect: bool) {
         self.collect_pred = collect;
+    }
+
+    /// Enable / disable per-step gradient-magnitude diagnostics (adds a
+    /// GPU→CPU readback per step).
+    pub fn set_collect_grads(&mut self, collect: bool) {
+        self.collect_grads = collect;
     }
 
     pub fn config(&self) -> &XRayTrainConfig {
@@ -370,9 +402,69 @@ impl XRayTrainer {
         let opacities_id = canonical_ad.raw_opacities.id;
         let grad_transforms =
             GradientsParams::from_params(&mut grads, &canonical_ad, &[transforms_id]);
-        let canonical_updated = optimizer.step(1.0, canonical_ad, grad_transforms);
         let grad_opac =
-            GradientsParams::from_params(&mut grads, &canonical_updated, &[opacities_id]);
+            GradientsParams::from_params(&mut grads, &canonical_ad, &[opacities_id]);
+
+        // ---- Gradient diagnostics (optional) ----------------------------
+        // Mean |∂L/∂·| per splat — verify that each parameter's LR actually
+        // moves it (position step ≈ lr_mean · mean_grad mm/step). Non-consuming
+        // reads via `GradientsParams::get` (before the grads are consumed by
+        // the optimizer steps below).
+        let grad_norms = if self.collect_grads {
+            let n = canonical_ad.num_splats().max(1) as f32;
+            let transforms_grad = grad_transforms.get::<2>(transforms_id);
+            let density_grad = grad_opac.get::<1>(opacities_id);
+            let (mean_grad, rot_grad, scale_grad, density_grad) =
+                if let Some(t) = transforms_grad {
+                    let means = t.clone().slice(s![.., 0..3]);
+                    let rots = t.clone().slice(s![.., 3..7]);
+                    let scales = t.slice(s![.., 7..10]);
+                    let mean_grad = means
+                        .abs()
+                        .sum()
+                        .into_scalar_async::<f32>()
+                        .await
+                        .unwrap_or(0.0)
+                        / n;
+                    let rot_grad = rots
+                        .abs()
+                        .sum()
+                        .into_scalar_async::<f32>()
+                        .await
+                        .unwrap_or(0.0)
+                        / n;
+                    let scale_grad = scales
+                        .abs()
+                        .sum()
+                        .into_scalar_async::<f32>()
+                        .await
+                        .unwrap_or(0.0)
+                        / n;
+                    let density_grad = if let Some(d) = density_grad {
+                        d.abs()
+                            .sum()
+                            .into_scalar_async::<f32>()
+                            .await
+                            .unwrap_or(0.0)
+                            / n
+                    } else {
+                        0.0
+                    };
+                    (mean_grad, rot_grad, scale_grad, density_grad)
+                } else {
+                    (0.0, 0.0, 0.0, 0.0)
+                };
+            Some(XRayGradStats {
+                mean_grad,
+                rot_grad,
+                scale_grad,
+                density_grad,
+            })
+        } else {
+            None
+        };
+
+        let canonical_updated = optimizer.step(1.0, canonical_ad, grad_transforms);
         let canonical_updated =
             optimizer.step(self.config.lr_opac, canonical_updated, grad_opac);
 
@@ -406,6 +498,7 @@ impl XRayTrainer {
             num_splats: self.canonical.num_splats(),
             lr_mean,
             pred_img,
+            grad_norms,
         }
     }
 
@@ -506,13 +599,14 @@ pub fn create_xray_trainer(
     // mid-gray with real gradients (vs. `sigmoid(0)=0.5` → `proj` saturating
     // `clamp(proj, 14)` → all-black). The optimizer + density controller then
     // grow/lower density where the anatomy (iodine, bone) demands it.
-    const MU_WATER: f32 = 0.002; // mm^-1
+    const MU_WATER: f32 = 0.002; // mm^-1 (density activation scale)
     // Density activation is `MU_WATER · softplus(raw)` (matches the Python
-    // project, see brush-cube::softplus). Start at μ_water:
-    // raw = inverse_softplus(μ_water/MU_WATER) = inverse_softplus(1) ≈ 0.541
-    // → activated density = 0.002·softplus(0.541) = 0.002 mm⁻¹.
-    let init_density = MU_WATER;
-    let init_raw_opac = brush_cube::inverse_softplus(init_density / MU_WATER);
+    // project, see brush-cube::softplus). Start at the configured init density
+    // (default μ_water; raise it when the normalized / gamma-corrected target
+    // sits at higher intensity so the random ball starts at the right gray
+    // level — Beer-Lambert `proj` scales linearly with density):
+    // raw = inverse_softplus(init_density / MU_WATER).
+    let init_raw_opac = brush_cube::inverse_softplus(config.init_density / MU_WATER);
     let mut raw_opac = Vec::with_capacity(num_points as usize);
     for _ in 0..num_points {
         let u: f32 = rng.random_range(0.0..1.0);

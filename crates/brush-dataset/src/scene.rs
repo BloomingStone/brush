@@ -125,6 +125,32 @@ impl Scene {
         BoundingBox::from_min_max(min, max)
     }
 
+    /// Half-diagonal of the detector FOV at the isocenter (mm): the radius of
+    /// the sphere centered on the world origin whose projection covers the
+    /// **whole rectangular** detector from every view. The C-arm isocenter is
+    /// the world origin, so a point at the origin sits `|cam.position|` (= SOD)
+    /// in front of the source, and one world mm at the isocenter projects to
+    /// `focal/SOD` pixels. The full frame at the isocenter is `W·SOD/fx` mm per
+    /// axis, so the covering radius is the half diagonal:
+    /// `0.5·sqrt((W·SOD/fx)² + (H·SOD/fy)²)`. Used to size the random-init
+    /// splat ball so the point cloud covers the whole field of view (a
+    /// half-width-only radius leaves the image corners uncovered).
+    pub fn isocenter_fov_radius(&self) -> f32 {
+        let Some(view) = self.views.first() else {
+            return 0.0;
+        };
+        let (w, h) = view
+            .gray_image
+            .as_ref()
+            .map(|g| (g.width, g.height))
+            .unwrap_or((1, 1));
+        let focal = view.camera.focal(glam::uvec2(w, h));
+        let sod = view.camera.position.length().max(1e-3);
+        let full_x = (w as f32) * sod / focal.x;
+        let full_y = (h as f32) * sod / focal.y;
+        0.5 * (full_x * full_x + full_y * full_y).sqrt()
+    }
+
     pub fn with_image_scale(self, scale: f32) -> Self {
         let views = Arc::unwrap_or_clone(self.views)
             .into_iter()

@@ -158,6 +158,7 @@ async fn read_dataset_inner(
         init_splat: None,
         dataset: Dataset::from_views(train_views, eval_views),
         warnings,
+        gamma: None,
     })
 }
 

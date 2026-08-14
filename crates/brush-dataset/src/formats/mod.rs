@@ -17,6 +17,9 @@ pub struct DatasetLoadResult {
     pub init_splat: Option<SplatMessage>,
     pub dataset: Dataset,
     pub warnings: Vec<String>,
+    /// Auto-computed gamma (from `dicom_gamma_target`) actually applied, if
+    /// any — lets callers log the effective value.
+    pub gamma: Option<f32>,
 }
 
 #[derive(Error, Debug)]
@@ -114,6 +117,7 @@ pub async fn load_dataset(
         init_splat,
         dataset: result.dataset,
         warnings: result.warnings,
+        gamma: result.gamma,
     })
 }
 

@@ -77,6 +77,16 @@ pub struct LoadDatasetConfig {
     /// How raw uint16 DICOM pixels are normalized to `[0, 1]`.
     #[arg(long, help_heading = "Dataset Options", default_value = "minmax")]
     pub dicom_normalization: DicomNormalization,
+    /// Explicit gamma correction applied to the normalized `[0,1]` pixels
+    /// (`out = in^γ`). `γ < 1` brightens dark parts. When set, it wins over
+    /// `dicom_gamma_target`.
+    #[arg(long, help_heading = "Dataset Options")]
+    pub dicom_gamma: Option<f32>,
+    /// Auto-compute gamma so the global intensity median maps to this target
+    /// gray level (e.g. `0.5` pulls a low-signal scan up to mid-gray). Ignored
+    /// when `dicom_gamma` is set explicitly. `None` disables auto-gamma.
+    #[arg(long, help_heading = "Dataset Options")]
+    pub dicom_gamma_target: Option<f32>,
     /// Max size of the cache for frames of the dataset, larger values usually improve performance for large datasets at the cost of more memory usage, can be e.g. 6G, 6000M, 6000MiB, 6000MB
     #[arg(long, help_heading = "Dataset Options", default_value = DEFAULT_MAX_SCENE_BATCH_CACHE_SIZE, value_parser = parse_size)]
     pub max_scene_batch_cache_size: u64,
