@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use brush_dataset::config::{DicomNormalization, LoadDatasetConfig, XRayOrientation};
+use brush_dataset::scene::SceneView;
 use brush_dataset::scene_loader::SceneLoader;
 use brush_render::gaussian_splats::{SplatRenderMode, Splats};
 use brush_train::xray_eval::save_gray_nrrd_f32;
@@ -43,9 +44,20 @@ fn xray_to_splats(canonical: &XRaySplats, device: &burn::tensor::Device) -> Spla
     Splats::from_tensor_data(means, rots, log_scales, sh, opac, SplatRenderMode::Default)
 }
 
+/// Sample up to `count` views, spread evenly across the sequence (for eval on
+/// held-out sets, covering a range of C-arm angles).
+fn sample_eval_views(views: &[SceneView], count: usize) -> Vec<&SceneView> {
+    let n = views.len();
+    if count >= n {
+        views.iter().collect()
+    } else {
+        (0..count).map(|i| &views[i * n / count]).collect()
+    }
+}
+
 /// 保存 GT | pred 水平拼接图 (均为 [0,1] f32) 为 float32 NRRD
 /// (无损, 可在 3D Slicer/ParaView/napari 中调窗宽窗位)。
-fn save_pair(dir: &Path, iter: u32, pred: &TensorData, gt: &TensorData) {
+fn save_pair(dir: &Path, iter: u32, view: usize, pred: &TensorData, gt: &TensorData) {
     let pred_v: Vec<f32> = pred.as_slice::<f32>().expect("f32 pred").to_vec();
     let gt_v: Vec<f32> = gt.as_slice::<f32>().expect("f32 gt").to_vec();
     let h = pred.shape[0];
@@ -57,7 +69,7 @@ fn save_pair(dir: &Path, iter: u32, pred: &TensorData, gt: &TensorData) {
         merged.extend_from_slice(&pred_v[y * w..(y + 1) * w]); // 右: pred
     }
     let td = TensorData::new(merged, [h, w * 2]);
-    let p = dir.join(format!("gt_pred_{iter:05}.nrrd"));
+    let p = dir.join(format!("gt_pred_{iter:05}_v{view}.nrrd"));
     save_gray_nrrd_f32(&p, &td).expect("save GT|pred NRRD");
     println!("saved {}", p.display());
 }
@@ -80,6 +92,12 @@ async fn main() -> anyhow::Result<()> {
     let mut growth_frac = 0.25f32;
     let mut refine_every = 400u32;
     let mut eval_every = 100u32;
+    // 验证集: `--eval-split-every=N` 每 N 帧扣一个 held-out 视图;
+    // `--eval-views=M` 每次 eval 采 M 个验证视图(均匀)。
+    let mut eval_split_every: Option<usize> = None;
+    let mut eval_views_count = 8usize;
+    // 固定 densify 梯度阈值(替代动态百分位); None = 用 densify_grad_percentile。
+    let mut fixed_grad_thr: Option<f32> = None;
     let mut out = PathBuf::from("target/fit_static");
     let mut i = 1;
     while i < args.len() {
@@ -110,6 +128,12 @@ async fn main() -> anyhow::Result<()> {
             refine_every = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--eval-every=") {
             eval_every = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--eval-split-every=") {
+            eval_split_every = Some(v.parse()?);
+        } else if let Some(v) = a.strip_prefix("--eval-views=") {
+            eval_views_count = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--fixed-grad-thr=") {
+            fixed_grad_thr = Some(v.parse()?);
         } else if let Some(v) = a.strip_prefix("--out=") {
             out = PathBuf::from(v);
         } else if dcm.is_none() {
@@ -121,7 +145,8 @@ async fn main() -> anyhow::Result<()> {
         "usage: fit_static <dcm> [--iters=N] [--points=N] [--scene-extent=MM] \
          [--gamma-target=G] [--init-density=MU] [--lr-mean=LR] \
          [--lr-mean-end=LR] [--lr-scale=LR] [--lr-opac=LR] [--growth-frac=F] \
-         [--refine-every=N] [--eval-every=N] [--out=DIR]",
+         [--refine-every=N] [--eval-split-every=N] [--eval-views=M] \
+         [--fixed-grad-thr=F] [--eval-every=N] [--out=DIR]",
     );
 
     // ---- 后端 + 数据集 ---------------------------------------------------
@@ -145,7 +170,7 @@ async fn main() -> anyhow::Result<()> {
     let load_config = LoadDatasetConfig {
         max_frames: None,
         max_resolution: 1920,
-        eval_split_every: None,
+        eval_split_every,
         subsample_frames: None,
         subsample_points: None,
         alpha_mode: None,
@@ -199,6 +224,7 @@ async fn main() -> anyhow::Result<()> {
         refine_every,
         scene_extent,
         growth_select_fraction: growth_frac,
+        fixed_grad_threshold: fixed_grad_thr,
         ..XRayRefineConfig::default()
     };
     let mut trainer = create_xray_trainer(cfg, points, scene_extent, &device);
@@ -216,20 +242,42 @@ async fn main() -> anyhow::Result<()> {
 
     let mut dataloader = SceneLoader::new(&dataset.train, 42, &load_config);
 
-    // 固定 eval 视图: frame 0。
-    let eval_view = &dataset.train.views[0];
-    let gray = eval_view.gray_image.as_ref().expect("gray GT");
-    let gt_data = TensorData::new(gray.data.as_ref().to_vec(), [gray.height, gray.width]);
+    // ---- Eval 视图: held-out 验证集(若有 split)否则 frame 0 ----------------
+    let eval_views: Vec<&SceneView> = if let Some(eval_scene) = &dataset.eval
+        && !eval_scene.views.is_empty()
+    {
+        println!(
+            "held-out eval set: {} views (split every {})",
+            eval_scene.views.len(),
+            eval_split_every.unwrap_or(0)
+        );
+        sample_eval_views(&eval_scene.views, eval_views_count)
+    } else {
+        log::warn!(
+            "no held-out split (--eval-split-every unset): evaluating on train view 0"
+        );
+        vec![&dataset.train.views[0]]
+    };
+    println!("eval on {} views every {} steps", eval_views.len(), eval_every);
 
     std::fs::create_dir_all(&out)?;
 
-    // 初始(iter 0)。
-    let s0 = trainer.eval_view(&eval_view.camera, &gt_data, eval_view.phase).await;
-    println!(
-        "iter {:4} psnr={:6.2} ssim={:5.3}",
-        "init", s0.psnr, s0.ssim
-    );
-    save_pair(&out, 0, &s0.pred, &s0.gt);
+    // 初始(iter 0): 在验证集上平均 PSNR/SSIM。
+    {
+        let mut p = 0.0f32;
+        let mut s = 0.0f32;
+        for (vi, view) in eval_views.iter().enumerate() {
+            let gray = view.gray_image.as_ref().expect("gray GT");
+            let gt = TensorData::new(gray.data.as_ref().to_vec(), [gray.height, gray.width]);
+            let sample = trainer.eval_view(&view.camera, &gt, view.phase).await;
+            p += sample.psnr;
+            s += sample.ssim;
+            save_pair(&out, 0, vi, &sample.pred, &sample.gt);
+        }
+        p /= eval_views.len().max(1) as f32;
+        s /= eval_views.len().max(1) as f32;
+        println!("iter {:4} psnr={:6.2} ssim={:5.3}", "init", p, s);
+    }
 
     // ---- 训练循环(与标准流程一致, 含 density control) -------------------
     for iter in 0..iters {
@@ -253,21 +301,30 @@ async fn main() -> anyhow::Result<()> {
         }
 
         if step % eval_every == 0 || step == iters {
-            let sample = trainer
-                .eval_view(&eval_view.camera, &gt_data, eval_view.phase)
-                .await;
-            save_pair(&out, step, &sample.pred, &sample.gt);
+            let mut avg_psnr = 0.0f32;
+            let mut avg_ssim = 0.0f32;
+            for (vi, view) in eval_views.iter().enumerate() {
+                let gray = view.gray_image.as_ref().expect("gray GT");
+                let vgt = TensorData::new(gray.data.as_ref().to_vec(), [gray.height, gray.width]);
+                let sample = trainer.eval_view(&view.camera, &vgt, view.phase).await;
+                avg_psnr += sample.psnr;
+                avg_ssim += sample.ssim;
+                save_pair(&out, step, vi, &sample.pred, &sample.gt);
+            }
+            avg_psnr /= eval_views.len().max(1) as f32;
+            avg_ssim /= eval_views.len().max(1) as f32;
             // 梯度诊断: 位置每步移动 ≈ lr_mean × mean_grad。
             if let Some(g) = &stats.grad_norms {
                 println!(
-                    "iter {:4} loss={:8.4} psnr={:6.2} ssim={:5.3} visible={} splats={} | \
+                    "iter {:4} loss={:8.4} psnr={:6.2} ssim={:5.3} visible={} splats={} (eval {} views) | \
                      grads mean={:.1e} rot={:.1e} scale={:.1e} density={:.1e} | pos step≈{:.2e}mm",
                     step,
                     stats.loss,
-                    sample.psnr,
-                    sample.ssim,
+                    avg_psnr,
+                    avg_ssim,
                     stats.num_visible,
                     stats.num_splats,
+                    eval_views.len(),
                     g.mean_grad,
                     g.rot_grad,
                     g.scale_grad,
@@ -276,13 +333,14 @@ async fn main() -> anyhow::Result<()> {
                 );
             } else {
                 println!(
-                    "iter {:4} loss={:8.4} psnr={:6.2} ssim={:5.3} visible={} splats={}",
+                    "iter {:4} loss={:8.4} psnr={:6.2} ssim={:5.3} visible={} splats={} (eval {} views)",
                     step,
                     stats.loss,
-                    sample.psnr,
-                    sample.ssim,
+                    avg_psnr,
+                    avg_ssim,
                     stats.num_visible,
                     stats.num_splats,
+                    eval_views.len(),
                 );
             }
         }
