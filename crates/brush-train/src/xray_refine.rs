@@ -55,6 +55,12 @@ pub struct XRayRefineConfig {
     pub cull_density_threshold: f32,
     /// Reset opacity every this many steps.
     pub density_reset_interval: u32,
+    /// Soft-reset cap (mm⁻¹): every `density_reset_interval` steps, activated
+    /// densities above this are clamped back down to it
+    /// (`min(density, init_density)` — only ever lowers). Mirrors the Python
+    /// project's `_reset_density`. Kept in sync with the trainer's
+    /// `init_density`.
+    pub init_density: f32,
     /// Max child scale = `scene_extent * percent_dense` (mm).
     pub percent_dense: f32,
     /// Upper bound on splat count.
@@ -95,6 +101,7 @@ impl Default for XRayRefineConfig {
             // until it re-converges. Keep it off unless you know what you are
             // doing.
             density_reset_interval: 0,
+            init_density: MU_WATER,
             percent_dense: 0.0005,
             max_splats: 1_000_000,
             scene_extent: 760.0,
@@ -485,18 +492,23 @@ impl XRayRefiner {
             new_raw_opac = Tensor::cat(vec![new_raw_opac, parent_raw], 0);
         }
 
-        // ---- Density reset -----------------------------------------------
+        // ---- Density soft-reset (min(density, init_density), 只降不升) ---
         let mut density_reset = false;
         if self.config.density_reset_interval > 0
             && iter.is_multiple_of(self.config.density_reset_interval)
         {
-            // Reset density to the *physical water background* (μ_water ≈
-            // 0.002 mm⁻¹): raw = inverse_softplus(μ_water/MU_WATER) =
-            // inverse_softplus(1) ≈ 0.541 → activated density = 0.002.
-            // (With the old `sigmoid` activation, raw=0 meant density 0.5 =
-            // 250× water, instantly overexposing every ray.)
-            let reset_logit = brush_cube::inverse_softplus(1.0);
-            new_raw_opac = new_raw_opac.mul_scalar(0.0).add_scalar(reset_logit);
+            // 软重置: new_density = min(current_density, init_density)。
+            // 只把密度高于 init 的点压回 init（参考项目 `_reset_density`），
+            // 空气点（已低于 cull）与正常组织保持不变 —— 避免硬重置毁掉
+            // Beer-Lambert 衰减场。
+            let reset_raw = brush_cube::inverse_silu(self.config.init_density / MU_WATER);
+            let n = new_raw_opac.dims()[0];
+            let reset_t = Tensor::<1>::from_data(TensorData::new(vec![reset_raw; n], [n]), &device);
+            let raw = new_raw_opac.clone().clamp(-20.0, 20.0);
+            let sig = raw.clone().neg().exp().add_scalar(1.0).recip();
+            let density = raw.clone().mul(sig).mul_scalar(MU_WATER); // MU_WATER·silu(raw)
+            let over = density.greater_elem(self.config.init_density);
+            new_raw_opac = new_raw_opac.mask_where(over, reset_t);
             density_reset = true;
         }
 

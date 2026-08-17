@@ -115,6 +115,10 @@ async fn main() -> anyhow::Result<()> {
     let mut fixed_grad_thr: Option<f32> = None;
     // 启用 oversized 高梯度点拆分(clone-only → clone+split, 参考 RGB refine_splats)。
     let mut enable_split = false;
+    // proj 域损失权重 (在 -ln(intensity) 域比较, 0 = 关闭)。
+    let mut proj_weight = 0.0f32;
+    // 密度软重置间隔 (0 = 关闭; 参考项目用 2000)。
+    let mut density_reset_interval = 0u32;
     let mut out = PathBuf::from("target/fit_static");
     let mut i = 1;
     while i < args.len() {
@@ -153,6 +157,10 @@ async fn main() -> anyhow::Result<()> {
             fixed_grad_thr = Some(v.parse()?);
         } else if a == "--split" {
             enable_split = true;
+        } else if let Some(v) = a.strip_prefix("--proj-weight=") {
+            proj_weight = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--density-reset=") {
+            density_reset_interval = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--out=") {
             out = PathBuf::from(v);
         } else if dcm.is_none() {
@@ -165,7 +173,7 @@ async fn main() -> anyhow::Result<()> {
          [--gamma-target=G] [--init-density=MU] [--lr-mean=LR] \
          [--lr-mean-end=LR] [--lr-scale=LR] [--lr-opac=LR] [--growth-frac=F] \
          [--refine-every=N] [--eval-split-every=N] [--eval-views=M] \
-         [--fixed-grad-thr=F] [--split] [--eval-every=N] [--out=DIR]",
+         [--fixed-grad-thr=F] [--split] [--proj-weight=W] [--density-reset=N] [--eval-every=N] [--out=DIR]",
     );
 
     // ---- 后端 + 数据集 ---------------------------------------------------
@@ -239,12 +247,14 @@ async fn main() -> anyhow::Result<()> {
     cfg.lr_mean_end = lr_mean_end;
     cfg.lr_scale = lr_scale;
     cfg.lr_opac = lr_opac;
+    cfg.proj_weight = proj_weight;
     cfg.refine = XRayRefineConfig {
         refine_every,
         scene_extent,
         growth_select_fraction: growth_frac,
         fixed_grad_threshold: fixed_grad_thr,
         enable_split,
+        density_reset_interval,
         ..XRayRefineConfig::default()
     };
     let mut trainer = create_xray_trainer(cfg, points, scene_extent, &device);

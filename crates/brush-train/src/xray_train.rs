@@ -65,6 +65,10 @@ pub struct XRayTrainConfig {
     /// L1 / SSIM weights for the gray loss.
     pub l1_weight: f32,
     pub ssim_weight: f32,
+    /// Weight of the optional **projection-domain** L1 loss: compares
+    /// `proj = -ln(intensity)` (the raw attenuation path integral) instead of
+    /// the Beer-Lambert-compressed intensity. 0 disables it.
+    pub proj_weight: f32,
 }
 
 impl Default for XRayTrainConfig {
@@ -85,6 +89,7 @@ impl Default for XRayTrainConfig {
             init_density: brush_cube::MU_WATER,
             l1_weight: 1.0,
             ssim_weight: 1.0,
+            proj_weight: 0.0,
         }
     }
 }
@@ -151,6 +156,8 @@ impl XRayTrainer {
     ) -> Self {
         let mut refine_cfg = config.refine.clone();
         refine_cfg.total_iters = config.total_iters;
+        // 软重置的密度 cap 与训练初始化密度保持一致。
+        refine_cfg.init_density = config.init_density;
         let num_points = canonical.num_splats();
         let refiner = XRayRefiner::new(refine_cfg, num_points, device);
 
@@ -337,7 +344,15 @@ impl XRayTrainer {
             l1_weight: self.config.l1_weight,
             ssim_weight: self.config.ssim_weight,
         };
-        let loss = gray_loss(intensity.clone(), gt, &loss_cfg);
+        let mut loss = gray_loss(intensity.clone(), gt.clone(), &loss_cfg);
+        // Proj 域损失: 在 `proj = -ln(intensity)`（Beer-Lambert 衰减积分）域比较,
+        // 避开 exp 压缩导致暗部/高 proj 区梯度衰减的问题。
+        if self.config.proj_weight > 0.0 {
+            let proj_pred = out.img.clone().clamp(1e-3, 14.0); // = -ln(intensity)
+            let proj_gt = gt.clone().clamp(1e-4, 1.0).log().neg(); // = -ln(gt)
+            loss = loss
+                .add((proj_pred - proj_gt).abs().mean().mul_scalar(self.config.proj_weight));
+        }
         let loss_inner = loss.clone().inner();
         let mut grads = loss.backward();
 
