@@ -651,6 +651,7 @@ mod tests {
         refiner.gather_stats(
             Tensor::<1>::ones([n], &device).mul_scalar(10.0),
             Tensor::<1>::ones([n], &device),
+            None,
         );
 
         let (new_splats, update, stats) = refiner.refine(100, splats).await;
@@ -685,6 +686,7 @@ mod tests {
         refiner.gather_stats(
             Tensor::<1>::ones([n], &device).mul_scalar(10.0),
             Tensor::<1>::ones([n], &device),
+            None,
         );
 
         let (new_splats, _update, stats) = refiner.refine(100, splats).await;
