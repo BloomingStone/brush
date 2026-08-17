@@ -73,6 +73,11 @@ pub struct XRayRefineConfig {
     /// aggressive (default 3×) to kill drifted outliers that never receive
     /// gradients (they keep high opacity forever).
     pub max_bound_factor: f32,
+    /// Prune splats whose accumulated max screen radius (px, larger axis)
+    /// exceeds this every refine. 0 disables. Mirrors the Python project's
+    /// `max_radii2D > max_screen_size` prune — kills oversized-on-screen blobs
+    /// (a blur source).
+    pub max_screen_size: f32,
     /// Fraction of above-threshold splats actually densified per refine.
     pub growth_select_fraction: f32,
     /// Split oversized high-gradient splats (`max_scale > scene_extent *
@@ -112,6 +117,7 @@ impl Default for XRayRefineConfig {
             max_splats: 1_000_000,
             scene_extent: 760.0,
             max_bound_factor: 3.0,
+            max_screen_size: 0.0,
             growth_select_fraction: 0.25,
             enable_split: false,
             split_scale_factor: std::f32::consts::FRAC_1_SQRT_2,
@@ -151,6 +157,9 @@ pub struct XRayRefiner {
     config: XRayRefineConfig,
     xyz_gradient_accum: Tensor<1>,
     denom: Tensor<1>,
+    /// Accumulated per-splat max screen radius in pixels (screen-size prune).
+    #[allow(non_snake_case)]
+    max_radii2D: Tensor<1>,
     recent_grad_percentile: VecDeque<f32>,
     grad_threshold: Option<f32>,
     rng: StdRng,
@@ -161,6 +170,7 @@ impl XRayRefiner {
         Self {
             xyz_gradient_accum: Tensor::<1>::zeros([num_points as usize], device),
             denom: Tensor::<1>::zeros([num_points as usize], device),
+            max_radii2D: Tensor::<1>::zeros([num_points as usize], device),
             recent_grad_percentile: VecDeque::with_capacity(5),
             grad_threshold: config.fixed_grad_threshold,
             rng: StdRng::seed_from_u64(config.seed),
@@ -173,9 +183,19 @@ impl XRayRefiner {
     }
 
     /// Accumulate one step's viewspace gradient norm and visibility.
-    pub fn gather_stats(&mut self, refine_weight: Tensor<1>, visible: Tensor<1>) {
+    pub fn gather_stats(
+        &mut self,
+        refine_weight: Tensor<1>,
+        visible: Tensor<1>,
+        max_radius_px: Option<Tensor<1>>,
+    ) {
         self.xyz_gradient_accum = self.xyz_gradient_accum.clone() + refine_weight;
         self.denom = self.denom.clone() + visible;
+        if let Some(r) = max_radius_px {
+            // 累积每 splat 见过的最大屏幕半径 (px): max_radii2D = max(·, r)。
+            let grow = r.clone().greater(self.max_radii2D.clone());
+            self.max_radii2D = self.max_radii2D.clone().mask_where(grow, r);
+        }
     }
 
     /// Mean viewspace gradient norm since the last refine.
@@ -257,10 +277,18 @@ impl XRayRefiner {
             .any_dim(1)
             .squeeze_dim(1);
 
-        let prune_mask = prune_density
+        let mut prune_mask = prune_density
             .bool_or(transforms_bad)
             .bool_or(opac_bad)
             .bool_or(bound_mask);
+        if self.config.max_screen_size > 0.0 {
+            // 屏幕上过大的点 (参考项目 max_radii2D > max_screen_size)。
+            let screen_big = self
+                .max_radii2D
+                .clone()
+                .greater_elem(self.config.max_screen_size);
+            prune_mask = prune_mask.bool_or(screen_big);
+        }
         let num_pruned = prune_mask
             .clone()
             .int()
@@ -532,6 +560,7 @@ impl XRayRefiner {
         let new_n = splats.num_splats() as usize;
         self.xyz_gradient_accum = Tensor::<1>::zeros([new_n], &device);
         self.denom = Tensor::<1>::zeros([new_n], &device);
+        self.max_radii2D = Tensor::<1>::zeros([new_n], &device);
 
         // Appended index list = clones then splits (each appends exactly one).
         let mut appended = clone_inds.clone();

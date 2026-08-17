@@ -78,6 +78,9 @@ pub struct XRayTrainConfig {
     /// Use cosine-annealing for the mean LR (reference-project style) instead
     /// of exponential decay.
     pub cosine_lr: bool,
+    /// Weight of an optional multi-scale (pyramid) loss: the gray L1+SSIM loss
+    /// is also applied at 1/2 and 1/4 resolution. 0 disables.
+    pub multiscale_weight: f32,
 }
 
 impl Default for XRayTrainConfig {
@@ -103,6 +106,7 @@ impl Default for XRayTrainConfig {
             proj_weight: 1.0,
             proj_ssim_weight: 0.0,
             cosine_lr: false,
+            multiscale_weight: 0.0,
         }
     }
 }
@@ -396,6 +400,23 @@ impl XRayTrainer {
                     .add(ssim.ones_like().sub(ssim).mul_scalar(self.config.proj_ssim_weight));
             }
         }
+        // 多尺度(金字塔)损失: 在 1/2、1/4 分辨率上叠加 gray loss, 强制多尺度一致。
+        if self.config.multiscale_weight > 0.0 {
+            use burn::tensor::module::adaptive_avg_pool2d;
+            let i4 = intensity.clone().unsqueeze_dim::<3>(0).unsqueeze_dim::<4>(1);
+            let g4 = gt.clone().unsqueeze_dim::<3>(0).unsqueeze_dim::<4>(1);
+            for scale in [2usize, 4] {
+                let (h, w) = (img_size.y as usize / scale, img_size.x as usize / scale);
+                let p = adaptive_avg_pool2d(i4.clone(), [h, w])
+                    .squeeze_dim::<3>(0)
+                    .squeeze_dim::<2>(0);
+                let gg = adaptive_avg_pool2d(g4.clone(), [h, w])
+                    .squeeze_dim::<3>(0)
+                    .squeeze_dim::<2>(0);
+                loss = loss
+                    .add(gray_loss(p, gg, &loss_cfg).mul_scalar(self.config.multiscale_weight));
+            }
+        }
         let loss_inner = loss.clone().inner();
         let mut grads = loss.backward();
 
@@ -418,7 +439,9 @@ impl XRayTrainer {
             .expect("viewspace gradients must be computed");
         let visible = out.visible;
         let refine_weight = detach_autodiff(refine_weight);
-        self.refiner.gather_stats(refine_weight, visible);
+        // 屏幕半径(px) = 归一化半径 × 图像宽; 用于 screen-size prune。
+        let max_radius_px = out.max_radius.clone().mul_scalar(img_size.x as f32);
+        self.refiner.gather_stats(refine_weight, visible, Some(max_radius_px));
 
         // ---- Optimizer: canonical splats --------------------------------
         // Mean LR decays exponentially via `sched_mean`. The actual

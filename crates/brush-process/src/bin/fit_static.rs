@@ -129,6 +129,10 @@ async fn main() -> anyhow::Result<()> {
     let mut bound_factor: Option<f32> = None;
     // prune 密度阈值 (默认 5e-5)。
     let mut cull_density: Option<f32> = None;
+    // screen-size prune 阈值 (px, 0 = 关闭)。
+    let mut max_screen_size: Option<f32> = None;
+    // 多尺度(金字塔)损失权重 (0 = 关闭)。
+    let mut multiscale_weight = 0.0f32;
     // 密度软重置间隔 (0 = 关闭; 参考项目用 2000)。
     let mut density_reset_interval = 0u32;
     let mut out = PathBuf::from("target/fit_static");
@@ -183,6 +187,10 @@ async fn main() -> anyhow::Result<()> {
             bound_factor = Some(v.parse()?);
         } else if let Some(v) = a.strip_prefix("--cull-density=") {
             cull_density = Some(v.parse()?);
+        } else if let Some(v) = a.strip_prefix("--max-screen-size=") {
+            max_screen_size = Some(v.parse()?);
+        } else if let Some(v) = a.strip_prefix("--multiscale-weight=") {
+            multiscale_weight = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--density-reset=") {
             density_reset_interval = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--out=") {
@@ -199,8 +207,8 @@ async fn main() -> anyhow::Result<()> {
          [--refine-every=N] [--eval-split-every=N] [--eval-views=M] \
          [--fixed-grad-thr=F] [--split] [--proj-weight=W] [--proj-ssim-weight=S]
          [--cosine-lr] [--percent-dense=F] [--split-scale=F] [--bound-factor=F]
-         [--cull-density=MU] [--density-reset=N]
-         [--eval-every=N] [--out=DIR]",
+         [--cull-density=MU] [--max-screen-size=PX] [--multiscale-weight=W]
+         [--density-reset=N] [--eval-every=N] [--out=DIR]",
     );
 
     // ---- 后端 + 数据集 ---------------------------------------------------
@@ -277,6 +285,7 @@ async fn main() -> anyhow::Result<()> {
     cfg.proj_weight = proj_weight;
     cfg.proj_ssim_weight = proj_ssim_weight;
     cfg.cosine_lr = cosine_lr;
+    cfg.multiscale_weight = multiscale_weight;
     cfg.refine = XRayRefineConfig {
         refine_every,
         scene_extent,
@@ -288,6 +297,7 @@ async fn main() -> anyhow::Result<()> {
         split_scale_factor: split_scale.unwrap_or(std::f32::consts::FRAC_1_SQRT_2),
         max_bound_factor: bound_factor.unwrap_or(3.0),
         cull_density_threshold: cull_density.unwrap_or(5e-5),
+        max_screen_size: max_screen_size.unwrap_or(0.0),
         ..XRayRefineConfig::default()
     };
     // FOV 过滤初始化: 只保留至少在一个视角内投影的点, 消除 FOV 外的高
