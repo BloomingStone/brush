@@ -90,12 +90,12 @@ fn save_stack(dir: &Path, iter: u32, pairs: &[TensorData]) {
     println!("{} saved {} ({} views stacked)", ts(), p.display(), pairs.len());
 }
 
-/// `[HH:MM:SS]` UTC 时间戳(轻量, 无 chrono 依赖; 与本地时区差一个偏移)。
+/// `[HH:MM:SS]` 北京时间 (UTC+8, 固定偏移; 轻量, 无 chrono 依赖)。
 fn ts() -> String {
     let d = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let secs = d.as_secs() % 86_400;
+    let secs = (d.as_secs() + 8 * 3600) % 86_400; // +8h → 北京时间
     format!(
         "[{:02}:{:02}:{:02}]",
         secs / 3600,
@@ -105,7 +105,7 @@ fn ts() -> String {
 }
 
 /// 追加一行指标到 CSV(若启用)。列:
-/// `iter,time_utc,elapsed_s,loss,psnr,ssim,lpips,visible,splats,lr_mean,grad_*`
+/// `iter,time_bj,elapsed_s,loss,psnr,ssim,lpips,visible,splats,lr_mean,grad_*`
 fn log_metrics_row(
     w: &mut Option<std::fs::File>,
     iter: u32,
@@ -427,7 +427,7 @@ async fn main() -> anyhow::Result<()> {
             let mut f = std::fs::File::create(&path)?;
             writeln!(
                 f,
-                "iter,time_utc,elapsed_s,loss,psnr,ssim,lpips,visible,splats,lr_mean,grad_mean,grad_rot,grad_scale,grad_density"
+                "iter,time_bj,elapsed_s,loss,psnr,ssim,lpips,visible,splats,lr_mean,grad_mean,grad_rot,grad_scale,grad_density"
             )?;
             f.flush()?;
             println!("{} logging metrics -> {}", ts(), path.display());
