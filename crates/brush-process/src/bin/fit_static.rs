@@ -132,10 +132,10 @@ async fn main() -> anyhow::Result<()> {
     let mut cull_density: Option<f32> = None;
     // screen-size prune 阈值 (px, 0 = 关闭)。
     let mut max_screen_size: Option<f32> = None;
-    // 多尺度(金字塔)损失权重 (0 = 关闭)。
-    let mut multiscale_weight = 0.0f32;
-    // 多窗宽窗位损失权重 (0 = 关闭)。
-    let mut window_weight = 0.0f32;
+    // 多尺度(金字塔)损失权重 (默认 0.5, 最强项)。
+    let mut multiscale_weight = 0.5f32;
+    // 多窗宽窗位损失权重 (默认 0.5, LPIPS 感知增强)。
+    let mut window_weight = 0.5f32;
     // 梯度(Sobel 差分)损失权重 (0 = 关闭)。
     let mut grad_weight = 0.0f32;
     // 密度软重置间隔 (0 = 关闭; 参考项目用 2000)。

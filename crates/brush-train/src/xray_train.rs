@@ -111,10 +111,12 @@ impl Default for XRayTrainConfig {
             // 34.82dB vs 33.75 (+1.07), LPIPS 0.574 vs 0.594。
             proj_weight: 1.0,
             proj_ssim_weight: 0.0,
-            window_weight: 0.0,
+            // 多窗宽窗位损失默认开启 (w=0.5): LPIPS 0.5455 (vs 0.5570), 结构感知增强。
+            window_weight: 0.5,
             grad_weight: 0.0,
             cosine_lr: false,
-            multiscale_weight: 0.0,
+            // 多尺度金字塔损失默认开启 (w=0.5): 2026-08-17 最强项 34.13dB/LPIPS 0.529。
+            multiscale_weight: 0.5,
         }
     }
 }
