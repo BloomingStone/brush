@@ -19,6 +19,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use brush_dataset::config::{DicomNormalization, LoadDatasetConfig, XRayOrientation};
 use brush_dataset::scene::SceneView;
@@ -86,7 +87,55 @@ fn save_stack(dir: &Path, iter: u32, pairs: &[TensorData]) {
     let td = TensorData::new(vol, [pairs.len(), h, w2]);
     let p = dir.join(format!("gt_pred_{iter:05}.nrrd"));
     save_gray_nrrd_f32_stack(&p, &td).expect("save GT|pred NRRD stack");
-    println!("saved {} ({} views stacked)", p.display(), pairs.len());
+    println!("{} saved {} ({} views stacked)", ts(), p.display(), pairs.len());
+}
+
+/// `[HH:MM:SS]` UTC 时间戳(轻量, 无 chrono 依赖; 与本地时区差一个偏移)。
+fn ts() -> String {
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = d.as_secs() % 86_400;
+    format!(
+        "[{:02}:{:02}:{:02}]",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
+/// 追加一行指标到 CSV(若启用)。列:
+/// `iter,time_utc,elapsed_s,loss,psnr,ssim,lpips,visible,splats,lr_mean,grad_*`
+fn log_metrics_row(
+    w: &mut Option<std::fs::File>,
+    iter: u32,
+    t0: &Instant,
+    loss: f32,
+    psnr: f32,
+    ssim: f32,
+    lpips: f32,
+    visible: u32,
+    splats: u32,
+    lr_mean: f64,
+    grad: Option<&brush_train::xray_train::XRayGradStats>,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    if let Some(f) = w {
+        let grad_csv = grad.map_or_else(String::new, |g| {
+            format!(
+                ",{:.3e},{:.3e},{:.3e},{:.3e}",
+                g.mean_grad, g.rot_grad, g.scale_grad, g.density_grad
+            )
+        });
+        writeln!(
+            f,
+            "{iter},{},{:.1},{loss:.6},{psnr:.4},{ssim:.4},{lpips:.4},{visible},{splats},{lr_mean:.3e}{grad_csv}",
+            ts(),
+            t0.elapsed().as_secs_f32()
+        )?;
+        f.flush()?;
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -141,6 +190,9 @@ async fn main() -> anyhow::Result<()> {
     // 密度软重置间隔 (0 = 关闭; 参考项目用 2000)。
     let mut density_reset_interval = 0u32;
     let mut out = PathBuf::from("target/fit_static");
+    // 指标 CSV 记录器: 默认 <out>/metrics.csv, `--log-csv=FILE` 覆盖,
+    // `--log-csv=off` 关闭。每次 eval 追加一行(含时间戳 + 各指标)。
+    let mut log_csv: Option<PathBuf> = None;
     let mut i = 1;
     while i < args.len() {
         let a = &args[i];
@@ -202,6 +254,8 @@ async fn main() -> anyhow::Result<()> {
             grad_weight = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--density-reset=") {
             density_reset_interval = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--log-csv=") {
+            log_csv = Some(PathBuf::from(v));
         } else if let Some(v) = a.strip_prefix("--out=") {
             out = PathBuf::from(v);
         } else if dcm.is_none() {
@@ -218,7 +272,7 @@ async fn main() -> anyhow::Result<()> {
          [--cosine-lr] [--percent-dense=F] [--split-scale=F] [--bound-factor=F]
          [--cull-density=MU] [--max-screen-size=PX] [--multiscale-weight=W]
          [--window-weight=W] [--grad-weight=W]
-         [--density-reset=N] [--eval-every=N] [--out=DIR]",
+         [--density-reset=N] [--eval-every=N] [--log-csv=FILE] [--out=DIR]",
     );
 
     // ---- 后端 + 数据集 ---------------------------------------------------
@@ -256,7 +310,8 @@ async fn main() -> anyhow::Result<()> {
     let dataset = result.dataset;
     let g0 = dataset.train.views[0].gray_image.as_ref().expect("gray");
     println!(
-        "loaded {} views, frame0 {}x{}",
+        "{} loaded {} views, frame0 {}x{}",
+        ts(),
         dataset.train.views.len(),
         g0.width,
         g0.height
@@ -268,14 +323,14 @@ async fn main() -> anyhow::Result<()> {
         Some(r) => r,
         None => {
             let r = dataset.train.isocenter_fov_radius() * 1.05;
-            println!("auto scene_extent = {r:.1} mm (isocenter FOV radius x1.05)");
+            println!("{} auto scene_extent = {r:.1} mm (isocenter FOV radius x1.05)", ts());
             r
         }
     };
     if gamma_target.is_some() {
         // 打印实际用的 gamma(由 dicom.rs 在加载时计算)。
         if let Some(g) = result.gamma {
-            println!("auto gamma = {g:.3} (median -> {:.2})", gamma_target.unwrap());
+            println!("{} auto gamma = {g:.3} (median -> {:.2})", ts(), gamma_target.unwrap());
         }
     }
 
@@ -325,7 +380,8 @@ async fn main() -> anyhow::Result<()> {
     // 打开梯度诊断, 检查各参数实际更新幅度。
     trainer.set_collect_grads(true);
     println!(
-        "init splats: {} (random ball r={}mm, init μ={} mm⁻¹, lr_mean={}->{}), refine every {}",
+        "{} init splats: {} (random ball r={}mm, init μ={} mm⁻¹, lr_mean={}->{}), refine every {}",
+        ts(),
         trainer.num_splats(),
         scene_extent,
         init_density,
@@ -341,7 +397,8 @@ async fn main() -> anyhow::Result<()> {
         && !eval_scene.views.is_empty()
     {
         println!(
-            "held-out eval set: {} views (split every {})",
+            "{} held-out eval set: {} views (split every {})",
+            ts(),
             eval_scene.views.len(),
             eval_split_every.unwrap_or(0)
         );
@@ -352,9 +409,31 @@ async fn main() -> anyhow::Result<()> {
         );
         vec![&dataset.train.views[0]]
     };
-    println!("eval on {} views every {} steps", eval_views.len(), eval_every);
+    println!("{} eval on {} views every {} steps", ts(), eval_views.len(), eval_every);
 
     std::fs::create_dir_all(&out)?;
+
+    // 指标 CSV 记录器: 每次 eval 追加一行(时间戳 + 各指标)。
+    let t0 = Instant::now();
+    let mut csv_writer: Option<std::fs::File> = {
+        use std::io::Write;
+        let off = log_csv.as_deref() == Some(Path::new("off"));
+        if off {
+            None
+        } else {
+            let path = log_csv
+                .clone()
+                .unwrap_or_else(|| out.join("metrics.csv"));
+            let mut f = std::fs::File::create(&path)?;
+            writeln!(
+                f,
+                "iter,time_utc,elapsed_s,loss,psnr,ssim,lpips,visible,splats,lr_mean,grad_mean,grad_rot,grad_scale,grad_density"
+            )?;
+            f.flush()?;
+            println!("{} logging metrics -> {}", ts(), path.display());
+            Some(f)
+        }
+    };
 
     // 初始(iter 0): 在验证集上平均 PSNR/SSIM。
     {
@@ -375,7 +454,27 @@ async fn main() -> anyhow::Result<()> {
         p /= eval_views.len().max(1) as f32;
         s /= eval_views.len().max(1) as f32;
         l /= eval_views.len().max(1) as f32;
-        println!("iter {:4} psnr={:6.2} ssim={:5.3} lpips={:.4}", "init", p, s, l);
+        log_metrics_row(
+            &mut csv_writer,
+            0,
+            &t0,
+            f32::NAN,
+            p,
+            s,
+            l,
+            0,
+            trainer.num_splats(),
+            0.0,
+            None,
+        )?;
+        println!(
+            "{} iter {:4} psnr={:6.2} ssim={:5.3} lpips={:.4}",
+            ts(),
+            "init",
+            p,
+            s,
+            l
+        );
     }
 
     // ---- 训练循环(与标准流程一致, 含 density control) -------------------
@@ -389,7 +488,8 @@ async fn main() -> anyhow::Result<()> {
             && let Some(refine_stats) = trainer.maybe_refine(step).await
         {
             println!(
-                "refine iter {step}: {} splats (added {}, split {}, pruned {}) grad_thr={}",
+                "{} refine iter {step}: {} splats (added {}, split {}, pruned {}) grad_thr={}",
+                ts(),
                 refine_stats.total_splats,
                 refine_stats.num_added,
                 refine_stats.num_split,
@@ -418,11 +518,25 @@ async fn main() -> anyhow::Result<()> {
             avg_psnr /= eval_views.len().max(1) as f32;
             avg_ssim /= eval_views.len().max(1) as f32;
             avg_lpips /= eval_views.len().max(1) as f32;
+            log_metrics_row(
+                &mut csv_writer,
+                step,
+                &t0,
+                stats.loss,
+                avg_psnr,
+                avg_ssim,
+                avg_lpips,
+                stats.num_visible,
+                stats.num_splats,
+                stats.lr_mean,
+                stats.grad_norms.as_ref(),
+            )?;
             // 梯度诊断: 位置每步移动 ≈ lr_mean × mean_grad。
             if let Some(g) = &stats.grad_norms {
                 println!(
-                    "iter {:4} loss={:8.4} psnr={:6.2} ssim={:5.3} lpips={:.4} visible={} splats={} (eval {} views) | \
+                    "{} iter {:4} loss={:8.4} psnr={:6.2} ssim={:5.3} lpips={:.4} visible={} splats={} (eval {} views) | \
                      grads mean={:.1e} rot={:.1e} scale={:.1e} density={:.1e} | pos step≈{:.2e}mm",
+                    ts(),
                     step,
                     stats.loss,
                     avg_psnr,
@@ -439,7 +553,8 @@ async fn main() -> anyhow::Result<()> {
                 );
             } else {
                 println!(
-                    "iter {:4} loss={:8.4} psnr={:6.2} ssim={:5.3} lpips={:.4} visible={} splats={} (eval {} views)",
+                    "{} iter {:4} loss={:8.4} psnr={:6.2} ssim={:5.3} lpips={:.4} visible={} splats={} (eval {} views)",
+                    ts(),
                     step,
                     stats.loss,
                     avg_psnr,
@@ -458,8 +573,8 @@ async fn main() -> anyhow::Result<()> {
     let ply = brush_serde::splat_to_ply(splats, Some(glam::Vec3::Y)).await?;
     let ply_path = out.join("canonical_final.ply");
     std::fs::write(&ply_path, ply)?;
-    println!("exported {}", ply_path.display());
+    println!("{} exported {}", ts(), ply_path.display());
 
-    println!("done -> {}", out.display());
+    println!("{} done -> {}", ts(), out.display());
     Ok(())
 }
