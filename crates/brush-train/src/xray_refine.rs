@@ -250,9 +250,14 @@ impl XRayRefiner {
         let device = splats.device();
 
         let progress = iter as f32 / self.config.total_iters.max(1) as f32;
+        // Reset 步跳过 densify (对齐参考项目 `%reset>=interval` 规避):
+        // reset 与 densify 同时发生时, 刚 densify 的新点会被 reset 立即压帽。
+        let reset_step = self.config.density_reset_interval > 0
+            && iter.is_multiple_of(self.config.density_reset_interval);
         let densifying = iter >= self.config.densify_from_iter
             && progress < self.config.densify_until_frac
-            && splats.num_splats() < self.config.max_splats;
+            && splats.num_splats() < self.config.max_splats
+            && !reset_step;
 
         let grads = self.mean_grads();
         let threshold = if densifying {

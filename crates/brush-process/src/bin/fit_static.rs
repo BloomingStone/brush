@@ -101,7 +101,8 @@ async fn main() -> anyhow::Result<()> {
     let mut gamma_target: Option<f32> = Some(0.5);
     let mut init_density = 0.02f32;
     let mut lr_mean = 2e-5f64;
-    let mut lr_mean_end = 2e-7f64;
+    // 末期不冻结: 默认 2e-6 (cosine min / 指数末段)。
+    let mut lr_mean_end = 2e-6f64;
     let mut lr_scale = 5e-3f64;
     let mut lr_opac = 0.012f64;
     let mut growth_frac = 0.25f32;
@@ -133,6 +134,10 @@ async fn main() -> anyhow::Result<()> {
     let mut max_screen_size: Option<f32> = None;
     // 多尺度(金字塔)损失权重 (0 = 关闭)。
     let mut multiscale_weight = 0.0f32;
+    // 多窗宽窗位损失权重 (0 = 关闭)。
+    let mut window_weight = 0.0f32;
+    // 梯度(Sobel 差分)损失权重 (0 = 关闭)。
+    let mut grad_weight = 0.0f32;
     // 密度软重置间隔 (0 = 关闭; 参考项目用 2000)。
     let mut density_reset_interval = 0u32;
     let mut out = PathBuf::from("target/fit_static");
@@ -191,6 +196,10 @@ async fn main() -> anyhow::Result<()> {
             max_screen_size = Some(v.parse()?);
         } else if let Some(v) = a.strip_prefix("--multiscale-weight=") {
             multiscale_weight = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--window-weight=") {
+            window_weight = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--grad-weight=") {
+            grad_weight = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--density-reset=") {
             density_reset_interval = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--out=") {
@@ -208,6 +217,7 @@ async fn main() -> anyhow::Result<()> {
          [--fixed-grad-thr=F] [--split] [--proj-weight=W] [--proj-ssim-weight=S]
          [--cosine-lr] [--percent-dense=F] [--split-scale=F] [--bound-factor=F]
          [--cull-density=MU] [--max-screen-size=PX] [--multiscale-weight=W]
+         [--window-weight=W] [--grad-weight=W]
          [--density-reset=N] [--eval-every=N] [--out=DIR]",
     );
 
@@ -286,6 +296,8 @@ async fn main() -> anyhow::Result<()> {
     cfg.proj_ssim_weight = proj_ssim_weight;
     cfg.cosine_lr = cosine_lr;
     cfg.multiscale_weight = multiscale_weight;
+    cfg.window_weight = window_weight;
+    cfg.grad_weight = grad_weight;
     cfg.refine = XRayRefineConfig {
         refine_every,
         scene_extent,

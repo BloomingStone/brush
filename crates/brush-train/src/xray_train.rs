@@ -74,8 +74,13 @@ pub struct XRayTrainConfig {
     pub proj_weight: f32,
     /// Weight of the projection-domain SSIM term (`1 - SSIM(proj_pred, proj_gt)`)
     /// added to the proj loss. 0 keeps proj loss as pure L1.
-    pub proj_ssim_weight: f32,
-    /// Use cosine-annealing for the mean LR (reference-project style) instead
+    pub proj_ssim_weight: f32,    /// Weight of an optional multi-window (WW/WL) loss in the proj domain:
+    /// several window transforms highlight different structures (soft tissue /
+    /// bone / fine detail). 0 disables.
+    pub window_weight: f32,
+    /// Weight of an optional gradient (Sobel-style finite-difference) loss
+    /// that sharpens edges. 0 disables.
+    pub grad_weight: f32,    /// Use cosine-annealing for the mean LR (reference-project style) instead
     /// of exponential decay.
     pub cosine_lr: bool,
     /// Weight of an optional multi-scale (pyramid) loss: the gray L1+SSIM loss
@@ -88,7 +93,8 @@ impl Default for XRayTrainConfig {
         Self {
             total_iters: 30_000,
             lr_mean: 2e-5,
-            lr_mean_end: 2e-7,
+            // 末期不冻结: 2e-7 → 2e-6 (cosine/指数末段仍可微调位置)。
+            lr_mean_end: 2e-6,
             lr_scale: 5e-3,
             lr_rotation: 2e-3,
             lr_opac: 0.012,
@@ -105,6 +111,8 @@ impl Default for XRayTrainConfig {
             // 34.82dB vs 33.75 (+1.07), LPIPS 0.574 vs 0.594。
             proj_weight: 1.0,
             proj_ssim_weight: 0.0,
+            window_weight: 0.0,
+            grad_weight: 0.0,
             cosine_lr: false,
             multiscale_weight: 0.0,
         }
@@ -416,6 +424,31 @@ impl XRayTrainer {
                 loss = loss
                     .add(gray_loss(p, gg, &loss_cfg).mul_scalar(self.config.multiscale_weight));
             }
+        }
+        // 多窗宽窗位损失: 在 proj(衰减)域做多个窗变换, 各窗下增强不同结构
+        // (软组织 / 骨 / 细细节)。窗变换: clamp((x-(wl-ww/2))/ww, 0, 1)。
+        if self.config.window_weight > 0.0 {
+            let proj_pred = out.img.clone().clamp(1e-3, 14.0);
+            let proj_gt = gt.clone().clamp(1e-4, 1.0).log().neg();
+            for (wl, ww) in [(0.6, 0.4), (1.2, 0.6), (0.4, 0.25)] {
+                let wp = (proj_pred.clone() - (wl - ww / 2.0))
+                    .div_scalar(ww)
+                    .clamp(0.0, 1.0);
+                let wg = (proj_gt.clone() - (wl - ww / 2.0))
+                    .div_scalar(ww)
+                    .clamp(0.0, 1.0);
+                loss = loss
+                    .add((wp - wg).abs().mean().mul_scalar(self.config.window_weight));
+            }
+        }
+        // 梯度(Sobel 差分)损失: 增强边缘结构。
+        if self.config.grad_weight > 0.0 {
+            let pgx = intensity.clone().slice(s![.., 1..]) - intensity.clone().slice(s![.., ..-1]);
+            let pgy = intensity.clone().slice(s![1.., ..]) - intensity.clone().slice(s![..-1, ..]);
+            let ggx = gt.clone().slice(s![.., 1..]) - gt.clone().slice(s![.., ..-1]);
+            let ggy = gt.clone().slice(s![1.., ..]) - gt.clone().slice(s![..-1, ..]);
+            let gl = (pgx - ggx).abs().mean().add((pgy - ggy).abs().mean());
+            loss = loss.add(gl.mul_scalar(self.config.grad_weight));
         }
         let loss_inner = loss.clone().inner();
         let mut grads = loss.backward();
