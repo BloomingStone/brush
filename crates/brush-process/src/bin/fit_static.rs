@@ -377,8 +377,7 @@ async fn main() -> anyhow::Result<()> {
         &device,
         Some((&train_cams, glam::uvec2(g0.width, g0.height))),
     );
-    // 打开梯度诊断, 检查各参数实际更新幅度。
-    trainer.set_collect_grads(true);
+    // 梯度诊断只在 eval 步收集(打印 + CSV 用), 见训练循环。
     println!(
         "{} init splats: {} (random ball r={}mm, init μ={} mm⁻¹, lr_mean={}->{}), refine every {}",
         ts(),
@@ -480,6 +479,9 @@ async fn main() -> anyhow::Result<()> {
     // ---- 训练循环(与标准流程一致, 含 density control) -------------------
     for iter in 0..iters {
         let step = iter + 1;
+        // 梯度诊断只在 eval 步需要(打印 + CSV): 其余步关闭, 省掉每步 4 次
+        // GPU→CPU readback(原先硬编码开启时的固定开销)。
+        trainer.set_collect_grads(step % eval_every == 0 || step == iters);
         let batch = dataloader.next_batch().await;
         let stats = trainer.step(&batch).await;
 

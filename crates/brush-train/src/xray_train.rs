@@ -281,7 +281,11 @@ impl XRayTrainer {
         };
 
         let img_size = glam::uvec2(gt.shape[1] as u32, gt.shape[0] as u32);
+        // 计时探针: 设置环境变量 BRUSH_PROFILE_EVAL=1 打印各段耗时(排查瓶颈)。
+        let profile = std::env::var("BRUSH_PROFILE_EVAL").is_ok();
+        let t0 = std::time::Instant::now();
         let out = render_xray(deformed, camera, img_size, 1.0).await;
+        let t_render = t0.elapsed();
         let intensity = (-out.img.clamp(1e-3, 14.0)).exp();
         let gt_t = Tensor::<2>::from_data(gt.clone(), &device_ad);
 
@@ -289,6 +293,7 @@ impl XRayTrainer {
             .into_scalar_async::<f32>()
             .await
             .expect("psnr readback");
+        let t_psnr = t0.elapsed();
         let ssim = gray_ssim(intensity.clone(), gt_t.clone())
             .into_scalar_async::<f32>()
             .await
@@ -306,6 +311,26 @@ impl XRayTrainer {
                 // explicit).
                 let pred3 = pred_inner.reshape([1, h, w, 1]).expand([1, h, w, 3]);
                 let gt3 = gt_inner.reshape([1, h, w, 1]).expand([1, h, w, 3]);
+                // 标准 LPIPS 输入 256×256。全分辨率(862×634)下 VGG 极慢:
+                // 实测 eval_view 3.35s 里 ~99% 花在 LPIPS 上。缩放后预期
+                // <0.5s。PSNR/SSIM 仍在全分辨率算; LPIPS 是感知指标,
+                // 低分辨率输入是论文标准做法(分数会有数值偏移, 趋势一致)。
+                use burn::tensor::module::interpolate;
+                use burn::tensor::ops::{InterpolateMode, InterpolateOptions};
+                let pred3 = interpolate(
+                    pred3.permute([0, 3, 1, 2]),
+                    [256, 256],
+                    InterpolateOptions::new(InterpolateMode::Bilinear)
+                        .with_align_corners(false),
+                )
+                .permute([0, 2, 3, 1]);
+                let gt3 = interpolate(
+                    gt3.permute([0, 3, 1, 2]),
+                    [256, 256],
+                    InterpolateOptions::new(InterpolateMode::Bilinear)
+                        .with_align_corners(false),
+                )
+                .permute([0, 2, 3, 1]);
                 model
                     .lpips(pred3, gt3)
                     .into_scalar_async::<f32>()
@@ -314,11 +339,26 @@ impl XRayTrainer {
             }
             None => f32::NAN,
         };
+        let t_lpips = t0.elapsed();
 
         let pred = intensity
             .into_data_async()
             .await
             .expect("pred readback");
+        let t_readback = t0.elapsed();
+
+        if profile {
+            let splats = self.canonical.num_splats();
+            println!(
+                "[profile] eval_view {} splats: total={:.3}s render={:.3}s psnr_ssim={:.3}s lpips={:.3}s readback={:.3}s",
+                splats,
+                t_readback.as_secs_f32(),
+                t_render.as_secs_f32(),
+                t_psnr.as_secs_f32(),
+                t_lpips.as_secs_f32(),
+                t_readback.as_secs_f32()
+            );
+        }
 
         XRayEvalSample {
             pred,
