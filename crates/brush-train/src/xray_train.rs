@@ -694,16 +694,37 @@ impl XRayTrainer {
 
 /// Convenience: create an X-ray trainer with random canonical splats inside a
 /// ball of radius `scene_extent` around the isocenter (used by the CLI path).
+///
+/// `fov = Some((cameras, img_size))` filters the random points to keep only
+/// those that project inside at least one camera's FOV — points outside every
+/// view frustum receive no image gradient, so their density stays at the init
+/// value forever and they become high-opacity outliers.
 pub fn create_xray_trainer(
     config: XRayTrainConfig,
     num_points: u32,
     scene_extent: f32,
     device: &Device,
+    fov: Option<(&[brush_render::camera::Camera], glam::UVec2)>,
 ) -> XRayTrainer {
     let mut rng = rand::rngs::StdRng::seed_from_u64(config.refine.seed);
     use rand::{RngExt, SeedableRng};
 
-    // Random positions, uniform in a ball of radius scene_extent.
+    // 可选 FOV 过滤: 预计算各相机的 world→cam 变换 + 针孔参数 (fx, fy, cx, cy)。
+    let fov_views: Option<(Vec<(glam::Affine3A, (f32, f32, f32, f32))>, glam::UVec2)> =
+        fov.map(|(cams, img_size)| {
+            (
+                cams.iter()
+                    .map(|c| {
+                        let pin = c.build_pinhole_params(img_size);
+                        (c.world_to_local(), (pin.fx, pin.fy, pin.cx, pin.cy))
+                    })
+                    .collect(),
+                img_size,
+            )
+        });
+
+    // Random positions, uniform in a ball of radius scene_extent (optionally
+    // filtered to keep only points visible in ≥1 view).
     let mut means = Vec::with_capacity(num_points as usize * 3);
     let mut rots = Vec::with_capacity(num_points as usize * 4);
     // Beer-Lambert alpha = `opac · mu · exp(power)` with `mu ≈ scale·√(2π)`
@@ -724,17 +745,58 @@ pub fn create_xray_trainer(
     // configured init density: raw = inverse_silu(init_density / MU_WATER).
     let init_raw_opac = brush_cube::inverse_silu(config.init_density / MU_WATER);
     let mut raw_opac = Vec::with_capacity(num_points as usize);
-    for _ in 0..num_points {
+    let mut attempts = 0u32;
+    // 防死循环上限 (FOV 过滤可能拒绝大量随机点)。
+    let max_attempts = (num_points as usize * 30).max(10_000) as u32;
+    while means.len() < num_points as usize * 3 && attempts < max_attempts {
+        attempts += 1;
         let u: f32 = rng.random_range(0.0..1.0);
         let r = scene_extent * u.cbrt();
         let theta = rng.random_range(0.0..std::f32::consts::PI);
         let phi = rng.random_range(0.0..2.0 * std::f32::consts::PI);
         let (s, c) = theta.sin_cos();
-        means.push(r * s * phi.cos());
-        means.push(r * s * phi.sin());
-        means.push(r * c);
+        let p = [r * s * phi.cos(), r * s * phi.sin(), r * c];
+        if let Some((views, img_size)) = &fov_views {
+            let mut visible = false;
+            for (view, (fx, fy, cx, cy)) in views {
+                let cp = view.transform_point3(glam::Vec3::new(p[0], p[1], p[2]));
+                if cp.z <= 0.0 {
+                    continue;
+                }
+                let ux = fx * cp.x / cp.z + cx;
+                let uy = fy * cp.y / cp.z + cy;
+                const MARGIN: f32 = 10.0; // px, 留边避免贴边
+                if ux > -MARGIN
+                    && ux < img_size.x as f32 + MARGIN
+                    && uy > -MARGIN
+                    && uy < img_size.y as f32 + MARGIN
+                {
+                    visible = true;
+                    break;
+                }
+            }
+            if !visible {
+                continue;
+            }
+        }
+        means.extend_from_slice(&p);
         rots.extend_from_slice(&[1.0, 0.0, 0.0, 0.0]);
         raw_opac.push(init_raw_opac);
+    }
+    if means.len() < num_points as usize * 3 {
+        log::warn!(
+            "FOV filter kept only {} of requested {} points (max_attempts {})",
+            means.len() / 3,
+            num_points,
+            max_attempts
+        );
+    }
+    if fov_views.is_some() {
+        let kept = means.len() / 3;
+        println!(
+            "FOV filter: kept {kept}/{num_points} random points (rejected {} outside every view)",
+            attempts.saturating_sub(kept as u32)
+        );
     }
 
     // Scale from local point density via KNN (same routine as the RGB

@@ -67,6 +67,12 @@ pub struct XRayRefineConfig {
     pub max_splats: u32,
     /// Scene extent in mm (C-arm isocenter distance; used for the scale cap).
     pub scene_extent: f32,
+    /// Splats whose center lies farther than `max_bound_factor × scene_extent`
+    /// from the isocenter are pruned every refine. The anatomy (human) always
+    /// sits in a fixed region well inside the isocenter FOV, so this can be
+    /// aggressive (default 3×) to kill drifted outliers that never receive
+    /// gradients (they keep high opacity forever).
+    pub max_bound_factor: f32,
     /// Fraction of above-threshold splats actually densified per refine.
     pub growth_select_fraction: f32,
     /// Split oversized high-gradient splats (`max_scale > scene_extent *
@@ -105,6 +111,7 @@ impl Default for XRayRefineConfig {
             percent_dense: 0.0005,
             max_splats: 1_000_000,
             scene_extent: 760.0,
+            max_bound_factor: 3.0,
             growth_select_fraction: 0.25,
             enable_split: false,
             split_scale_factor: std::f32::consts::FRAC_1_SQRT_2,
@@ -244,7 +251,7 @@ impl XRayRefiner {
 
         let transforms_bad = row_non_finite(&splats.transforms.val());
         let opac_bad = row_non_finite(&splats.raw_opacities.val().unsqueeze_dim(1));
-        let max_allowed_bounds = self.config.scene_extent * 100.0;
+        let max_allowed_bounds = self.config.scene_extent * self.config.max_bound_factor;
         let bound_mask = (splats.means().abs())
             .greater_elem(max_allowed_bounds)
             .any_dim(1)

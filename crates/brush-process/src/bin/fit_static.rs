@@ -125,6 +125,10 @@ async fn main() -> anyhow::Result<()> {
     let mut percent_dense: Option<f32> = None;
     // split 尺度收缩系数 (默认 1/√2)。
     let mut split_scale: Option<f32> = None;
+    // 离群点位置剪枝系数 (默认 3× scene_extent, 人体固定区域)。
+    let mut bound_factor: Option<f32> = None;
+    // prune 密度阈值 (默认 5e-5)。
+    let mut cull_density: Option<f32> = None;
     // 密度软重置间隔 (0 = 关闭; 参考项目用 2000)。
     let mut density_reset_interval = 0u32;
     let mut out = PathBuf::from("target/fit_static");
@@ -175,6 +179,10 @@ async fn main() -> anyhow::Result<()> {
             percent_dense = Some(v.parse()?);
         } else if let Some(v) = a.strip_prefix("--split-scale=") {
             split_scale = Some(v.parse()?);
+        } else if let Some(v) = a.strip_prefix("--bound-factor=") {
+            bound_factor = Some(v.parse()?);
+        } else if let Some(v) = a.strip_prefix("--cull-density=") {
+            cull_density = Some(v.parse()?);
         } else if let Some(v) = a.strip_prefix("--density-reset=") {
             density_reset_interval = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--out=") {
@@ -190,7 +198,8 @@ async fn main() -> anyhow::Result<()> {
          [--lr-mean-end=LR] [--lr-scale=LR] [--lr-opac=LR] [--growth-frac=F] \
          [--refine-every=N] [--eval-split-every=N] [--eval-views=M] \
          [--fixed-grad-thr=F] [--split] [--proj-weight=W] [--proj-ssim-weight=S]
-         [--cosine-lr] [--percent-dense=F] [--split-scale=F] [--density-reset=N]
+         [--cosine-lr] [--percent-dense=F] [--split-scale=F] [--bound-factor=F]
+         [--cull-density=MU] [--density-reset=N]
          [--eval-every=N] [--out=DIR]",
     );
 
@@ -277,9 +286,20 @@ async fn main() -> anyhow::Result<()> {
         density_reset_interval,
         percent_dense: percent_dense.unwrap_or(0.0005),
         split_scale_factor: split_scale.unwrap_or(std::f32::consts::FRAC_1_SQRT_2),
+        max_bound_factor: bound_factor.unwrap_or(3.0),
+        cull_density_threshold: cull_density.unwrap_or(5e-5),
         ..XRayRefineConfig::default()
     };
-    let mut trainer = create_xray_trainer(cfg, points, scene_extent, &device);
+    // FOV 过滤初始化: 只保留至少在一个视角内投影的点, 消除 FOV 外的高
+    // opacity 离群点 (无梯度 → 密度永不下降)。
+    let train_cams: Vec<_> = dataset.train.views.iter().map(|v| v.camera).collect();
+    let mut trainer = create_xray_trainer(
+        cfg,
+        points,
+        scene_extent,
+        &device,
+        Some((&train_cams, glam::uvec2(g0.width, g0.height))),
+    );
     // 打开梯度诊断, 检查各参数实际更新幅度。
     trainer.set_collect_grads(true);
     println!(

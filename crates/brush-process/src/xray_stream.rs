@@ -142,6 +142,7 @@ pub(crate) async fn xray_stream(
         process_config.xray_num_points,
         process_config.xray_scene_extent,
         &device,
+        None,
     );
     if static_mode {
         log::info!(
