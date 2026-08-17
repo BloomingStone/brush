@@ -67,7 +67,8 @@ pub struct XRayTrainConfig {
     pub ssim_weight: f32,
     /// Weight of the optional **projection-domain** L1 loss: compares
     /// `proj = -ln(intensity)` (the raw attenuation path integral) instead of
-    /// the Beer-Lambert-compressed intensity. 0 disables it.
+    /// the Beer-Lambert-compressed intensity. 0 disables it. Default 1.0
+    /// (2026-08-17: +1.07dB on RXA_chest).
     pub proj_weight: f32,
 }
 
@@ -89,7 +90,9 @@ impl Default for XRayTrainConfig {
             init_density: brush_cube::MU_WATER,
             l1_weight: 1.0,
             ssim_weight: 1.0,
-            proj_weight: 0.0,
+            // Proj 域损失为默认开启 (w=1.0): 2026-08-17 实验 RXA_chest
+            // 34.82dB vs 33.75 (+1.07), LPIPS 0.574 vs 0.594。
+            proj_weight: 1.0,
         }
     }
 }

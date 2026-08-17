@@ -115,8 +115,8 @@ async fn main() -> anyhow::Result<()> {
     let mut fixed_grad_thr: Option<f32> = None;
     // 启用 oversized 高梯度点拆分(clone-only → clone+split, 参考 RGB refine_splats)。
     let mut enable_split = false;
-    // proj 域损失权重 (在 -ln(intensity) 域比较, 0 = 关闭)。
-    let mut proj_weight = 0.0f32;
+    // proj 域损失权重 (在 -ln(intensity) 域比较; 默认 1.0 已作为最优默认)。
+    let mut proj_weight = 1.0f32;
     // 密度软重置间隔 (0 = 关闭; 参考项目用 2000)。
     let mut density_reset_interval = 0u32;
     let mut out = PathBuf::from("target/fit_static");
