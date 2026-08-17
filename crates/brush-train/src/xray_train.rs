@@ -23,7 +23,9 @@ use brush_xray_bwd::{lift_xray_splats_to_autodiff, render_xray};
 use burn::{
     lr_scheduler::{
         LrScheduler,
-        exponential::{ExponentialLrScheduler, ExponentialLrSchedulerConfig},
+        composed::{ComposedLrScheduler, ComposedLrSchedulerConfig},
+        cosine::CosineAnnealingLrSchedulerConfig,
+        exponential::ExponentialLrSchedulerConfig,
     },
     module::AutodiffModule,
     optim::{GradientsParams, Optimizer, adaptor::OptimizerAdaptor},
@@ -70,6 +72,12 @@ pub struct XRayTrainConfig {
     /// the Beer-Lambert-compressed intensity. 0 disables it. Default 1.0
     /// (2026-08-17: +1.07dB on RXA_chest).
     pub proj_weight: f32,
+    /// Weight of the projection-domain SSIM term (`1 - SSIM(proj_pred, proj_gt)`)
+    /// added to the proj loss. 0 keeps proj loss as pure L1.
+    pub proj_ssim_weight: f32,
+    /// Use cosine-annealing for the mean LR (reference-project style) instead
+    /// of exponential decay.
+    pub cosine_lr: bool,
 }
 
 impl Default for XRayTrainConfig {
@@ -93,6 +101,8 @@ impl Default for XRayTrainConfig {
             // Proj 域损失为默认开启 (w=1.0): 2026-08-17 实验 RXA_chest
             // 34.82dB vs 33.75 (+1.07), LPIPS 0.574 vs 0.594。
             proj_weight: 1.0,
+            proj_ssim_weight: 0.0,
+            cosine_lr: false,
         }
     }
 }
@@ -139,7 +149,7 @@ pub struct XRayTrainer {
     refiner: XRayRefiner,
     optim_splats: Option<OptimType>,
     optim_deform: Option<DeformOptimType>,
-    sched_mean: ExponentialLrScheduler,
+    sched_mean: ComposedLrScheduler,
     step_count: u32,
     /// Read back the predicted intensity image every step (for visualization).
     collect_pred: bool,
@@ -164,11 +174,27 @@ impl XRayTrainer {
         let num_points = canonical.num_splats();
         let refiner = XRayRefiner::new(refine_cfg, num_points, device);
 
-        // Exponential mean LR decay: lr_end = lr_start · gamma^total_iters.
-        let decay = (config.lr_mean_end / config.lr_mean).powf(1.0 / config.total_iters.max(1) as f64);
-        let mut sched_mean = ExponentialLrSchedulerConfig::new(config.lr_mean, decay)
-            .init()
-            .expect("valid lr scheduler");
+        // Mean LR schedule: exponential decay (default) or cosine annealing
+        // (reference-project style, no warm restarts). Both end at lr_mean_end.
+        let mut sched_mean = if config.cosine_lr {
+            ComposedLrSchedulerConfig::new()
+                .cosine(
+                    CosineAnnealingLrSchedulerConfig::new(
+                        config.lr_mean,
+                        config.total_iters.max(1) as usize,
+                    )
+                    .with_min_lr(config.lr_mean_end),
+                )
+                .init()
+                .expect("valid cosine lr scheduler")
+        } else {
+            let decay = (config.lr_mean_end / config.lr_mean)
+                .powf(1.0 / config.total_iters.max(1) as f64);
+            ComposedLrSchedulerConfig::new()
+                .exponential(ExponentialLrSchedulerConfig::new(config.lr_mean, decay))
+                .init()
+                .expect("valid exponential lr scheduler")
+        };
 
         // First LR step aligns the current step count.
         sched_mean.step();
@@ -350,11 +376,25 @@ impl XRayTrainer {
         let mut loss = gray_loss(intensity.clone(), gt.clone(), &loss_cfg);
         // Proj 域损失: 在 `proj = -ln(intensity)`（Beer-Lambert 衰减积分）域比较,
         // 避开 exp 压缩导致暗部/高 proj 区梯度衰减的问题。
-        if self.config.proj_weight > 0.0 {
+        if self.config.proj_weight > 0.0 || self.config.proj_ssim_weight > 0.0 {
             let proj_pred = out.img.clone().clamp(1e-3, 14.0); // = -ln(intensity)
             let proj_gt = gt.clone().clamp(1e-4, 1.0).log().neg(); // = -ln(gt)
-            loss = loss
-                .add((proj_pred - proj_gt).abs().mean().mul_scalar(self.config.proj_weight));
+            if self.config.proj_weight > 0.0 {
+                loss = loss.add(
+                    (proj_pred.clone() - proj_gt.clone())
+                        .abs()
+                        .mean()
+                        .mul_scalar(self.config.proj_weight),
+                );
+            }
+            if self.config.proj_ssim_weight > 0.0 {
+                // Proj 域 SSIM: 结构感知项 (L1 只敏感绝对差)。值域非 [0,1],
+                // c1/c2 常数相对偏小 → 更接近纯结构比, 仍有效。
+                use brush_loss::gray::gray_ssim;
+                let ssim = gray_ssim(proj_pred, proj_gt);
+                loss = loss
+                    .add(ssim.ones_like().sub(ssim).mul_scalar(self.config.proj_ssim_weight));
+            }
         }
         let loss_inner = loss.clone().inner();
         let mut grads = loss.backward();

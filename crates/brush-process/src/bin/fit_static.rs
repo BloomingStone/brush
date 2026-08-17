@@ -117,6 +117,14 @@ async fn main() -> anyhow::Result<()> {
     let mut enable_split = false;
     // proj 域损失权重 (在 -ln(intensity) 域比较; 默认 1.0 已作为最优默认)。
     let mut proj_weight = 1.0f32;
+    // proj 域 SSIM 权重 (0 = 关闭, proj 损失保持纯 L1)。
+    let mut proj_ssim_weight = 0.0f32;
+    // 使用 cosine LR (默认指数衰减)。
+    let mut cosine_lr = false;
+    // clone/split 分界阈值系数 (默认 0.0005)。
+    let mut percent_dense: Option<f32> = None;
+    // split 尺度收缩系数 (默认 1/√2)。
+    let mut split_scale: Option<f32> = None;
     // 密度软重置间隔 (0 = 关闭; 参考项目用 2000)。
     let mut density_reset_interval = 0u32;
     let mut out = PathBuf::from("target/fit_static");
@@ -159,6 +167,14 @@ async fn main() -> anyhow::Result<()> {
             enable_split = true;
         } else if let Some(v) = a.strip_prefix("--proj-weight=") {
             proj_weight = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--proj-ssim-weight=") {
+            proj_ssim_weight = v.parse()?;
+        } else if a == "--cosine-lr" {
+            cosine_lr = true;
+        } else if let Some(v) = a.strip_prefix("--percent-dense=") {
+            percent_dense = Some(v.parse()?);
+        } else if let Some(v) = a.strip_prefix("--split-scale=") {
+            split_scale = Some(v.parse()?);
         } else if let Some(v) = a.strip_prefix("--density-reset=") {
             density_reset_interval = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--out=") {
@@ -173,7 +189,9 @@ async fn main() -> anyhow::Result<()> {
          [--gamma-target=G] [--init-density=MU] [--lr-mean=LR] \
          [--lr-mean-end=LR] [--lr-scale=LR] [--lr-opac=LR] [--growth-frac=F] \
          [--refine-every=N] [--eval-split-every=N] [--eval-views=M] \
-         [--fixed-grad-thr=F] [--split] [--proj-weight=W] [--density-reset=N] [--eval-every=N] [--out=DIR]",
+         [--fixed-grad-thr=F] [--split] [--proj-weight=W] [--proj-ssim-weight=S]
+         [--cosine-lr] [--percent-dense=F] [--split-scale=F] [--density-reset=N]
+         [--eval-every=N] [--out=DIR]",
     );
 
     // ---- 后端 + 数据集 ---------------------------------------------------
@@ -248,6 +266,8 @@ async fn main() -> anyhow::Result<()> {
     cfg.lr_scale = lr_scale;
     cfg.lr_opac = lr_opac;
     cfg.proj_weight = proj_weight;
+    cfg.proj_ssim_weight = proj_ssim_weight;
+    cfg.cosine_lr = cosine_lr;
     cfg.refine = XRayRefineConfig {
         refine_every,
         scene_extent,
@@ -255,6 +275,8 @@ async fn main() -> anyhow::Result<()> {
         fixed_grad_threshold: fixed_grad_thr,
         enable_split,
         density_reset_interval,
+        percent_dense: percent_dense.unwrap_or(0.0005),
+        split_scale_factor: split_scale.unwrap_or(std::f32::consts::FRAC_1_SQRT_2),
         ..XRayRefineConfig::default()
     };
     let mut trainer = create_xray_trainer(cfg, points, scene_extent, &device);
