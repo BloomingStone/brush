@@ -86,3 +86,44 @@ impl SkipMlp {
         self.width
     }
 }
+
+/// Light feed-forward MLP for the HexPlane decoder: `n_layers` Linear layers
+/// (`input → hidden`, then `hidden → hidden`), ReLU between them, no final
+/// activation. Output width is `hidden`.
+#[derive(Module, Debug)]
+pub struct Mlp {
+    layers: Vec<Linear>,
+    activation: Relu,
+}
+
+impl Mlp {
+    pub fn new(
+        input_ch: usize,
+        hidden: usize,
+        n_layers: usize,
+        device: &burn::tensor::Device,
+    ) -> Self {
+        let mut layers = Vec::with_capacity(n_layers.max(1));
+        let mut ch_in = input_ch;
+        for _ in 0..n_layers.max(1) {
+            layers.push(LinearConfig::new(ch_in, hidden).init(device));
+            ch_in = hidden;
+        }
+        Self {
+            layers,
+            activation: Relu::new(),
+        }
+    }
+
+    pub fn forward(&self, x: Tensor<2>) -> Tensor<2> {
+        let mut h = x;
+        let mut it = self.layers.iter().peekable();
+        while let Some(layer) = it.next() {
+            h = layer.forward(h);
+            if it.peek().is_some() {
+                h = self.activation.forward(h);
+            }
+        }
+        h
+    }
+}

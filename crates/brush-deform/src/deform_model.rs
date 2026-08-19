@@ -55,6 +55,10 @@ pub struct DeformModelConfig {
     /// mapped to `[0, 1]` before the hash grid (use the scene extent, e.g.
     /// SOD for a C-arm scan).
     pub coord_scale: f32,
+    /// Predict a per-splat scaling offset? Default `false` (mass-conserving
+    /// deform field — displacement + rotation only; a scale change would
+    /// alter a splat's integrated absorption).
+    pub predict_scaling: bool,
 }
 
 impl Default for DeformModelConfig {
@@ -70,6 +74,7 @@ impl Default for DeformModelConfig {
             combine_width: 128,
             block_depth: 2,
             coord_scale: 760.0,
+            predict_scaling: false,
         }
     }
 }
@@ -82,7 +87,7 @@ pub struct DeformModel {
     phase_enc: PositionalEncoding,
     combine_mlp: SkipMlp,
     xyz_warp: Linear,
-    scaling_warp: Linear,
+    scaling_warp: Option<Linear>,
     axial_warp: Linear,
     #[module(skip)]
     cfg: DeformModelConfig,
@@ -120,7 +125,9 @@ impl DeformModel {
             phase_enc,
             combine_mlp,
             xyz_warp: LinearConfig::new(width, 3).init(device),
-            scaling_warp: LinearConfig::new(width, 3).init(device),
+            scaling_warp: cfg
+                .predict_scaling
+                .then(|| LinearConfig::new(width, 3).init(device)),
             axial_warp: LinearConfig::new(width, 3).init(device),
             cfg,
         }
@@ -142,7 +149,10 @@ impl DeformModel {
         let h = self.combine_mlp.forward(Tensor::cat(vec![x_emb, t_emb], 1)); // [N, W]
 
         let d_xyz = self.xyz_warp.forward(h.clone());
-        let d_scaling = self.scaling_warp.forward(h.clone()).tanh();
+        let d_scaling = match &self.scaling_warp {
+            Some(warp) => warp.forward(h.clone()).tanh(),
+            None => Tensor::<2>::zeros(d_xyz.dims(), &xyz.device()),
+        };
         let axial = self.axial_warp.forward(h).tanh();
         let d_rotation = axial_angle_to_quat(axial);
 
@@ -156,7 +166,7 @@ impl DeformModel {
 
 /// Convert an axial-angle vector `v` (`[N, 3]`) to a unit quaternion
 /// `(w, x, y, z)`: `q = (cos(ω/2), v/ω · sin(ω/2))` with `ω = |v|`.
-fn axial_angle_to_quat(axial: Tensor<2>) -> Tensor<2> {
+pub(crate) fn axial_angle_to_quat(axial: Tensor<2>) -> Tensor<2> {
     let omega = axial.clone().powi_scalar(2).sum_dim(1).add_scalar(1e-10).sqrt(); // [N, 1]
     let q_w = (omega.clone() * 0.5).cos();
     // v/ω · sin(ω/2) = v · sin(ω/2)/ω
@@ -228,7 +238,13 @@ mod tests {
     async fn forward_produces_valid_deforms() {
         let device: burn::tensor::Device = brush_cube::test_helpers::test_device().await.into();
         let device = device.autodiff();
-        let model = DeformModel::new(DeformModelConfig::default(), &device);
+        let model = DeformModel::new(
+            DeformModelConfig {
+                predict_scaling: true,
+                ..DeformModelConfig::default()
+            },
+            &device,
+        );
 
         let n = 32;
         let xyz = Tensor::<2>::from_data(TensorData::new(vec![0.1f32; n * 3], [n, 3]), &device);
@@ -285,6 +301,30 @@ mod tests {
             .unwrap();
         assert!(t.iter().all(|v| v.is_finite()), "deformed has NaN/inf");
         // log-scales (cols 7..10) after deformation must be finite (1 + d > 0).
+    }
+
+    #[tokio::test]
+    async fn scaling_off_yields_zero_d_scaling() {
+        let device: burn::tensor::Device = brush_cube::test_helpers::test_device().await.into();
+        let device = device.autodiff();
+        let model = DeformModel::new(DeformModelConfig::default(), &device);
+
+        let n = 16;
+        let xyz = Tensor::<2>::from_data(TensorData::new(vec![0.1f32; n * 3], [n, 3]), &device);
+        let phase =
+            Tensor::<2>::from_data(TensorData::new(vec![0.5f32; n], [n, 1]), &device);
+        let deforms = model.forward(xyz, phase);
+        let ds = deforms
+            .d_scaling
+            .into_data_async()
+            .await
+            .unwrap()
+            .to_vec::<f32>()
+            .unwrap();
+        assert!(
+            ds.iter().all(|v| *v == 0.0),
+            "d_scaling should be zero when predict_scaling is off"
+        );
     }
 
     #[tokio::test]

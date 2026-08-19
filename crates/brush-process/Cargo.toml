@@ -41,6 +41,7 @@ brush-async.path = "../brush-async"
 
 brush-train = { path = "../brush-train" }
 brush-dataset = { path = "../brush-dataset"}
+brush-deform = { path = "../brush-deform" }
 brush-rerun = { path = "../brush-rerun" }
 brush-xray = { path = "../brush-xray" }
 brush-cube = { path = "../brush-cube" }

@@ -1091,6 +1091,7 @@ dependencies = [
  "brush-async",
  "brush-cube",
  "brush-dataset",
+ "brush-deform",
  "brush-render",
  "brush-render-bwd",
  "brush-rerun",

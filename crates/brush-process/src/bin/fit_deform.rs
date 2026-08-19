@@ -2,13 +2,21 @@
 //!
 //! 与 `fit_static` 的区别:
 //!   1. **启用 deform 模式** (`enable_deform=true`): 训练器创建
-//!      [`DeformModel`] (hash-grid 位置编码 + 相位 sin/cos 编码 + skip-MLP),
-//!      以心动相位 (DICOM 私有标签 `(0071,1010)`, creator `(0071,0010)`
+//!      [`DeformNetwork`] 生成形变场, 以心动相位 (DICOM 私有标签
+//!      `(0071,1010)`, creator `(0071,0010)`
 //!      `YOUR_INSTITUTION_PHASE_1.0`) 为条件, 预测每个 splat 的
 //!      `(d_xyz, d_scaling, d_rotation)`, 生成动态场。
-//!   2. **AST (asynchronous time) 噪声**: 训练时给 phase 加随时间衰减的
+//!      - 默认后端 **HexPlane** (`--deform-backend=hexplane`): 6 个 2D 特征
+//!        平面 (XY/XZ/YZ + XT/YT/ZT) 双线性采样求和 + 轻量 MLP; 时间轴
+//!        **环形回绕** (phase 0 与 1 是同一相位)。比 hash-grid 快 (select
+//!        56→24、MLP 9 层→5 层), 更适合低频心脏运动与 wgpu 后端。
+//!      - `--deform-backend=hashgrid` 切回多分辨率 hash-grid + skip-MLP。
+//!   2. **保质量形变** (默认): 不预测 `d_scaling` (`--predict-scaling` 开启),
+//!      形变场只有位移+旋转 —— splat 积分吸收正比于 scale, 缩放会改变总
+//!      吸收; 局部密度变化应由高斯点移动产生。
+//!   3. **AST (asynchronous time) 噪声**: 训练时给 phase 加随时间衰减的
 //!      高斯噪声 (参考项目 `get_linear_noise_func`), 增强相位泛化。
-//!   3. **warm-up**: 前 `warm_up` 步不施加形变 (dummy 梯度), 让 canonical
+//!   4. **warm-up**: 前 `warm_up` 步不施加形变 (dummy 梯度), 让 canonical
 //!      splats 先收敛到静态结构。
 //!
 //! 每 `eval_every` 步对 held-out 视图做 eval (每个视图用其真实 phase),
@@ -21,6 +29,9 @@
 //!     --iters=10000 --points=30000 --refine-every=400 \
 //!     --eval-split-every=5 --eval-views=8 --eval-every=500 \
 //!     --fixed-grad-thr=1e-6 --split --out=target/fit_deform
+//!   # HexPlane 参数 (默认): --deform-backend=hexplane \
+//!   #   --hex-res=64 --hex-time-res=32 --hex-features=16 \
+//!   #   --hex-mlp-width=128 --hex-mlp-layers=2
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,10 +40,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use brush_dataset::config::{DicomNormalization, LoadDatasetConfig, XRayOrientation};
 use brush_dataset::scene::SceneView;
 use brush_dataset::scene_loader::SceneLoader;
+use brush_deform::{HexPlaneConfig, HexPlaneDeformConfig};
 use brush_render::gaussian_splats::{SplatRenderMode, Splats};
 use brush_train::xray_eval::save_gray_nrrd_f32_stack;
 use brush_train::xray_refine::XRayRefineConfig;
-use brush_train::xray_train::{XRayTrainConfig, create_xray_trainer};
+use brush_train::xray_train::{DeformBackend, XRayTrainConfig, create_xray_trainer};
 use brush_vfs::BrushVfs;
 use brush_xray::XRaySplats;
 use burn::tensor::{Device, TensorData};
@@ -165,6 +177,16 @@ async fn main() -> anyhow::Result<()> {
     let mut enable_ast = true;
     // Warm-up 步数: 前 N 步不施加形变 (dummy 梯度), 让 canonical 先收敛。
     let mut warm_up = 300u32;
+    // Deform 后端: hexplane (默认) 或 hashgrid。
+    let mut deform_backend = DeformBackend::HexPlane;
+    // HexPlane 超参 (默认: spatial=64 / time=32 / features=16 / mlp 128x2)。
+    let mut hex_res = 64u32;
+    let mut hex_time_res = 32u32;
+    let mut hex_features = 16usize;
+    let mut hex_mlp_width = 128usize;
+    let mut hex_mlp_layers = 2usize;
+    // 保质量形变 (默认): 不预测 d_scaling, 局部密度变化由位移/旋转产生。
+    let mut predict_scaling = false;
     let mut growth_frac = 0.25f32;
     let mut refine_every = 400u32;
     let mut eval_every = 100u32;
@@ -235,6 +257,26 @@ async fn main() -> anyhow::Result<()> {
             enable_ast = false;
         } else if let Some(v) = a.strip_prefix("--warm-up=") {
             warm_up = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--deform-backend=") {
+            deform_backend = match v {
+                "hexplane" => DeformBackend::HexPlane,
+                "hashgrid" => DeformBackend::HashGrid,
+                _ => anyhow::bail!("invalid --deform-backend '{v}' (hexplane|hashgrid)"),
+            };
+        } else if let Some(v) = a.strip_prefix("--hex-res=") {
+            hex_res = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--hex-time-res=") {
+            hex_time_res = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--hex-features=") {
+            hex_features = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--hex-mlp-width=") {
+            hex_mlp_width = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--hex-mlp-layers=") {
+            hex_mlp_layers = v.parse()?;
+        } else if a == "--predict-scaling" {
+            predict_scaling = true;
+        } else if a == "--no-predict-scaling" {
+            predict_scaling = false;
         } else if let Some(v) = a.strip_prefix("--growth-frac=") {
             growth_frac = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--refine-every=") {
@@ -287,6 +329,9 @@ async fn main() -> anyhow::Result<()> {
          [--gamma-target=G] [--init-density=MU] [--lr-mean=LR] \
          [--lr-mean-end=LR] [--lr-scale=LR] [--lr-opac=LR] \
          [--lr-deform=LR] [--lr-deform-end=LR] [--no-ast] [--warm-up=N] \
+         [--deform-backend=hexplane|hashgrid] [--hex-res=N] \
+         [--hex-time-res=N] [--hex-features=N] [--hex-mlp-width=N] \
+         [--hex-mlp-layers=N] [--predict-scaling|--no-predict-scaling] \
          [--growth-frac=F] [--refine-every=N] [--eval-split-every=N] \
          [--eval-views=M] [--fixed-grad-thr=F] [--split] [--proj-weight=W] \
          [--proj-ssim-weight=S] [--cosine-lr] [--percent-dense=F] \
@@ -389,13 +434,26 @@ async fn main() -> anyhow::Result<()> {
     // ---- Trainer: 随机初始化 + deform 模式 + 启用 refine -----------------
     // `create_xray_trainer` 做随机球内点云(KNN scale + μ_water 密度初始化),
     // 并把 config.refine.scene_extent 设为 scene_extent; `enable_deform=true`
-    // 时创建 DeformModel (hash-grid + phase 编码 + skip-MLP, coord_scale =
-    // scene_extent)。
+    // 时按 `deform_backend` 创建 HexPlane (默认) 或 hash-grid 形变网络
+    // (coord_scale = scene_extent)。
     let mut cfg = XRayTrainConfig::default();
     cfg.total_iters = iters;
     cfg.enable_deform = true; // 心动相位驱动的动态场
     cfg.enable_ast = enable_ast; // 异步时间噪声 (默认开)
     cfg.warm_up = warm_up; // 前 N 步不施加形变
+    cfg.deform_backend = deform_backend;
+    cfg.predict_scaling = predict_scaling; // 保质量形变 (默认关缩放)
+    cfg.hex_plane = HexPlaneDeformConfig {
+        hex_plane: HexPlaneConfig {
+            n_feature_dim: hex_features,
+            spatial_resolution: hex_res,
+            time_resolution: hex_time_res,
+            ..HexPlaneConfig::default()
+        },
+        mlp_hidden: hex_mlp_width,
+        mlp_layers: hex_mlp_layers,
+        predict_scaling,
+    };
     cfg.init_density = init_density;
     cfg.lr_mean = lr_mean;
     cfg.lr_mean_end = lr_mean_end;
@@ -434,8 +492,17 @@ async fn main() -> anyhow::Result<()> {
         Some((&train_cams, glam::uvec2(g0.width, g0.height))),
     );
     // 梯度诊断只在 eval 步收集(打印 + CSV 用), 见训练循环。
+    let backend_name = match deform_backend {
+        DeformBackend::HexPlane => {
+            format!(
+                "hexplane rs={} rt={} C={} mlp {}x{}",
+                hex_res, hex_time_res, hex_features, hex_mlp_width, hex_mlp_layers
+            )
+        }
+        DeformBackend::HashGrid => "hashgrid".to_owned(),
+    };
     println!(
-        "{} init splats: {} (random ball r={}mm, init μ={} mm⁻¹, lr_mean={}->{}, lr_deform={}->{}), refine every {}",
+        "{} init splats: {} (random ball r={}mm, init μ={} mm⁻¹, lr_mean={}->{}, lr_deform={}->{}), deform={} (predict_scaling={}), refine every {}",
         ts(),
         trainer.num_splats(),
         scene_extent,
@@ -444,6 +511,8 @@ async fn main() -> anyhow::Result<()> {
         lr_mean_end,
         lr_deform,
         lr_deform_end,
+        backend_name,
+        predict_scaling,
         refine_every
     );
 
@@ -540,6 +609,8 @@ async fn main() -> anyhow::Result<()> {
         // 梯度诊断只在 eval 步需要(打印 + CSV): 其余步关闭, 省掉每步 4 次
         // GPU→CPU readback(原先硬编码开启时的固定开销)。
         trainer.set_collect_grads(step % eval_every == 0 || step == iters);
+        // loss 标量同样只在 eval 步读回: 关闭时 CPU 提交可与 GPU 执行重叠。
+        trainer.set_collect_loss(step % eval_every == 0 || step == iters);
         let batch = dataloader.next_batch().await;
         let stats = trainer.step(&batch).await;
 

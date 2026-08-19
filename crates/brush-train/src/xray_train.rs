@@ -15,7 +15,10 @@
 //!    controller ([`XRayRefiner`]).
 
 use brush_dataset::scene::SceneBatch;
-use brush_deform::{DeformModel, DeformModelConfig, deform_splats};
+use brush_deform::{
+    DeformModel, DeformModelConfig, Deforms, HexPlaneDeformConfig, HexPlaneDeformModel,
+    deform_splats,
+};
 use brush_loss::gray::{GrayLossConfig, gray_loss};
 use brush_render::burn_glue::detach_autodiff;
 use brush_xray::XRaySplats;
@@ -27,13 +30,43 @@ use burn::{
         cosine::CosineAnnealingLrSchedulerConfig,
         exponential::ExponentialLrSchedulerConfig,
     },
-    module::AutodiffModule,
+    module::{AutodiffModule, Module},
     optim::{GradientsParams, Optimizer, adaptor::OptimizerAdaptor},
-    tensor::{Device, IndexingUpdateOp, Tensor, TensorData, Distribution, s},
+    tensor::{Device, IndexingUpdateOp, Tensor, TensorData, s},
 };
 
 use crate::adam_scaled::{AdamScaled, AdamScaledConfig};
 use crate::xray_refine::{XRayRefineConfig, XRayRefineStats, XRayRefiner};
+
+/// Which deform-network backend to train.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeformBackend {
+    /// HexPlane encoder + small MLP (default: fast on wgpu, low-frequency
+    /// cardiac motion).
+    #[default]
+    HexPlane,
+    /// Multi-resolution hash grid + skip-MLP (original implementation).
+    HashGrid,
+}
+
+/// The active deform network: a [`Module`] union over the two backends, so
+/// the trainer optimizes whichever one is configured.
+#[derive(Module, Debug)]
+pub enum DeformNetwork {
+    HexPlane(HexPlaneDeformModel),
+    HashGrid(DeformModel),
+}
+
+impl DeformNetwork {
+    /// Predict deformations for canonical positions `xyz` (`[N, 3]`) at a
+    /// scalar `phase` (`[N, 1]`).
+    pub fn forward(&self, xyz: Tensor<2>, phase: Tensor<2>) -> Deforms {
+        match self {
+            Self::HexPlane(model) => model.forward(xyz, phase),
+            Self::HashGrid(model) => model.forward(xyz, phase),
+        }
+    }
+}
 
 /// Hyperparameters for the X-ray deform-GS trainer.
 #[derive(Debug, Clone)]
@@ -57,6 +90,15 @@ pub struct XRayTrainConfig {
     /// phase conditioning — splats stay fixed in canonical space (the deform
     /// network and its optimizer are omitted entirely).
     pub enable_deform: bool,
+    /// Deform-network backend (`HexPlane` by default).
+    pub deform_backend: DeformBackend,
+    /// `HexPlane` configuration (used when `deform_backend == HexPlane`).
+    pub hex_plane: HexPlaneDeformConfig,
+    /// Predict a per-splat scaling offset? Default `false` for both backends:
+    /// the deform field is mass-conserving (displacement + rotation only) —
+    /// a splat's integrated absorption is `∝ scale`, so scaling would alter
+    /// the scene's total absorption.
+    pub predict_scaling: bool,
     /// Density-control configuration.
     pub refine: XRayRefineConfig,
     /// Initial activated density (mm⁻¹) for the random splats. Defaults to
@@ -103,6 +145,9 @@ impl Default for XRayTrainConfig {
             enable_ast: true,
             warm_up: 300,
             enable_deform: true,
+            deform_backend: DeformBackend::HexPlane,
+            hex_plane: HexPlaneDeformConfig::default(),
+            predict_scaling: false,
             refine: XRayRefineConfig::default(),
             init_density: brush_cube::MU_WATER,
             l1_weight: 1.0,
@@ -119,6 +164,15 @@ impl Default for XRayTrainConfig {
             multiscale_weight: 0.5,
         }
     }
+}
+
+/// Standard-normal sample via Box-Muller from two `[0, 1)` uniforms
+/// (rand has no built-in normal distribution; `rand::random` is uniform).
+fn randn_f32() -> f32 {
+    let u1 = rand::random::<f64>().max(f64::MIN_POSITIVE);
+    let u2 = rand::random::<f64>();
+    let z = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+    z as f32
 }
 
 /// One training step's stats.
@@ -151,7 +205,7 @@ pub struct XRayGradStats {
 }
 
 type OptimType = OptimizerAdaptor<AdamScaled, XRaySplats>;
-type DeformOptimType = OptimizerAdaptor<burn::optim::Adam, DeformModel>;
+type DeformOptimType = OptimizerAdaptor<burn::optim::Adam, DeformNetwork>;
 
 /// X-ray (deform-)GS trainer. With `enable_deform=false` this is a plain
 /// static reconstruction: canonical splats optimized directly against the
@@ -159,7 +213,7 @@ type DeformOptimType = OptimizerAdaptor<burn::optim::Adam, DeformModel>;
 pub struct XRayTrainer {
     config: XRayTrainConfig,
     canonical: XRaySplats,
-    deform: Option<DeformModel>,
+    deform: Option<DeformNetwork>,
     refiner: XRayRefiner,
     optim_splats: Option<OptimType>,
     optim_deform: Option<DeformOptimType>,
@@ -169,6 +223,12 @@ pub struct XRayTrainer {
     collect_pred: bool,
     /// Collect per-parameter gradient norms every step (diagnostics).
     collect_grads: bool,
+    /// Read back the loss scalar every step. Disable when the loss is only
+    /// needed at eval steps — every readback is a GPU→CPU sync that
+    /// serializes the pipeline (CPU submission waits for GPU execution).
+    collect_loss: bool,
+    /// Last read-back loss value (used when `collect_loss` is off).
+    last_loss: f32,
     /// VGG-LPIPS model for perceptual eval (loaded once; `None` keeps the
     /// eval free of the extra GPU memory).
     lpips: Option<lpips::LpipsModel>,
@@ -178,7 +238,7 @@ impl XRayTrainer {
     pub fn new(
         config: XRayTrainConfig,
         canonical: XRaySplats,
-        deform: Option<DeformModel>,
+        deform: Option<DeformNetwork>,
         device: &Device,
     ) -> Self {
         let mut refine_cfg = config.refine.clone();
@@ -224,6 +284,8 @@ impl XRayTrainer {
             step_count: 0,
             collect_pred: false,
             collect_grads: false,
+            collect_loss: true,
+            last_loss: f32::NAN,
             lpips: Some(lpips::load_vgg_lpips(device)),
         }
     }
@@ -239,6 +301,13 @@ impl XRayTrainer {
     /// GPU→CPU readback per step).
     pub fn set_collect_grads(&mut self, collect: bool) {
         self.collect_grads = collect;
+    }
+
+    /// Enable / disable the per-step loss readback. Turn it off when the loss
+    /// scalar is only needed at eval steps — the readback is a GPU→CPU sync
+    /// that prevents CPU submission from overlapping GPU execution.
+    pub fn set_collect_loss(&mut self, collect: bool) {
+        self.collect_loss = collect;
     }
 
     pub fn config(&self) -> &XRayTrainConfig {
@@ -388,10 +457,10 @@ impl XRayTrainer {
                 let progress =
                     ((self.step_count as f32 - self.config.warm_up as f32) / 100.0)
                         .clamp(0.0, 1.0);
-                let noise =
-                    Tensor::<2>::random([1, 1], Distribution::Normal(0.0, 1.0), &device_ad);
-                let n = noise.into_data_async().await.unwrap().to_vec::<f32>().unwrap()[0];
-                let delta = n * interval * progress;
+                // CPU-side standard normal (Box-Muller): the old code sampled
+                // a `[1,1]` GPU tensor and read it back **every step**, which
+                // forces a GPU→CPU sync that serializes the pipeline.
+                let delta = randn_f32() * interval * progress;
                 phase += delta;
             }
 
@@ -670,10 +739,19 @@ impl XRayTrainer {
 
         self.step_count += 1;
 
-        let loss_val = loss_inner
-            .into_scalar_async::<f32>()
-            .await
-            .expect("loss readback");
+        // Loss readback only when requested: it is a GPU→CPU sync, and with
+        // it disabled the CPU can keep submitting the next step while the GPU
+        // is still executing the current one.
+        let loss_val = if self.collect_loss {
+            let v = loss_inner
+                .into_scalar_async::<f32>()
+                .await
+                .expect("loss readback");
+            self.last_loss = v;
+            v
+        } else {
+            self.last_loss
+        };
 
         XRayTrainStats {
             loss: loss_val,
@@ -912,12 +990,28 @@ pub fn create_xray_trainer(
     let canonical = XRaySplats::from_raw(means, rots, raw_scales, raw_opac, device);
 
     // Deform network only in deform mode; static mode omits it entirely.
+    // The backend is selected by `config.deform_backend` (HexPlane default).
     let deform = if config.enable_deform {
-        let deform_cfg = DeformModelConfig {
-            coord_scale: scene_extent.max(1.0),
-            ..DeformModelConfig::default()
-        };
-        Some(DeformModel::new(deform_cfg, &device.clone().autodiff()))
+        let device_ad = device.clone().autodiff();
+        match config.deform_backend {
+            DeformBackend::HashGrid => {
+                let deform_cfg = DeformModelConfig {
+                    coord_scale: scene_extent.max(1.0),
+                    predict_scaling: config.predict_scaling,
+                    ..DeformModelConfig::default()
+                };
+                Some(DeformNetwork::HashGrid(DeformModel::new(deform_cfg, &device_ad)))
+            }
+            DeformBackend::HexPlane => {
+                let mut hex_cfg = config.hex_plane.clone();
+                hex_cfg.hex_plane.coord_scale = scene_extent.max(1.0);
+                hex_cfg.predict_scaling = config.predict_scaling;
+                Some(DeformNetwork::HexPlane(HexPlaneDeformModel::new(
+                    hex_cfg,
+                    &device_ad,
+                )))
+            }
+        }
     } else {
         None
     };
