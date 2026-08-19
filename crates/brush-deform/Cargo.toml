@@ -9,8 +9,13 @@ description = "Cardiac-phase-guided deformation network for dynamic X-ray Gaussi
 [dependencies]
 brush-render.path = "../brush-render"
 brush-xray.path = "../brush-xray"
+brush-cube.path = "../brush-cube"
 
-burn.workspace = true
+burn = { workspace = true, features = ["wgpu", "autodiff"] }
+burn-cubecl.workspace = true
+burn-wgpu.workspace = true
+burn-fusion.workspace = true
+burn-ir.workspace = true
 glam.workspace = true
 serde.workspace = true
 thiserror.workspace = true

@@ -36,6 +36,10 @@ pub struct HexPlaneConfig {
     pub init_scale: f32,
     /// RNG seed for the plane initialization.
     pub seed: u64,
+    /// Use the fused cubecl kernels (Stage 2: one forward + one backward
+    /// kernel) instead of the pure-burn reference implementation. Disable
+    /// for the reference path / non-wgpu backends.
+    pub fused: bool,
 }
 
 impl Default for HexPlaneConfig {
@@ -49,6 +53,7 @@ impl Default for HexPlaneConfig {
             phase_max: 1.0,
             init_scale: 0.1,
             seed: 0,
+            fused: true,
         }
     }
 }
@@ -102,8 +107,33 @@ impl HexPlane {
     }
 
     /// Encode canonical positions `xyz` (`[N, 3]`, world mm) + cardiac phase
-    /// (`[N, 1]`) into `[N, C]` plane-summed features.
+    /// (`[N, 1]`) into `[N, C]` plane-summed features. Uses the fused cubecl
+    /// kernels by default; `HexPlaneConfig::fused = false` falls back to the
+    /// pure-burn reference.
     pub fn forward(&self, xyz: Tensor<2>, phase: Tensor<2>) -> Tensor<2> {
+        if self.cfg.fused {
+            self.forward_fused(xyz, phase)
+        } else {
+            self.forward_pure(xyz, phase)
+        }
+    }
+
+    /// Fused path: one forward kernel + one backward kernel (see
+    /// [`crate::fused`]).
+    fn forward_fused(&self, xyz: Tensor<2>, phase: Tensor<2>) -> Tensor<2> {
+        let planes = [
+            self.xy.val(),
+            self.xz.val(),
+            self.yz.val(),
+            self.xt.val(),
+            self.yt.val(),
+            self.zt.val(),
+        ];
+        crate::fused::burn_glue::hex_plane_query_ad(xyz, phase, planes, &self.cfg)
+    }
+
+    /// Pure-burn reference implementation.
+    fn forward_pure(&self, xyz: Tensor<2>, phase: Tensor<2>) -> Tensor<2> {
         let cfg = &self.cfg;
         let rs = cfg.spatial_resolution;
         let rt = cfg.time_resolution;
@@ -204,6 +234,7 @@ fn axis_indices(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn::tensor::TensorData;
 
     #[test]
     fn default_config_has_16_features() {
@@ -213,6 +244,7 @@ mod tests {
     #[tokio::test]
     async fn forward_produces_finite_features() {
         let device: burn::tensor::Device = brush_cube::test_helpers::test_device().await.into();
+        let device = device.autodiff();
         let cfg = HexPlaneConfig::default();
         let model = HexPlane::new(cfg.clone(), &device);
 
@@ -236,6 +268,7 @@ mod tests {
     #[tokio::test]
     async fn phase_zero_and_one_are_identical() {
         let device: burn::tensor::Device = brush_cube::test_helpers::test_device().await.into();
+        let device = device.autodiff();
         let cfg = HexPlaneConfig {
             n_feature_dim: 4,
             spatial_resolution: 8,
@@ -272,5 +305,130 @@ mod tests {
             .await
             .unwrap();
         assert!(diff > 1e-6, "phase 0.5 should query different cells");
+    }
+
+    /// Pure-burn reference path: outputs finite, wrap semantics hold.
+    #[tokio::test]
+    async fn pure_path_forward_is_valid() {
+        let device: burn::tensor::Device = brush_cube::test_helpers::test_device().await.into();
+        let cfg = HexPlaneConfig {
+            fused: false,
+            ..HexPlaneConfig::default()
+        };
+        let model = HexPlane::new(cfg.clone(), &device);
+
+        let n = 32;
+        let xyz = Tensor::<2>::from_data(TensorData::new(vec![0.2f32; n * 3], [n, 3]), &device);
+        let p0 = Tensor::<2>::from_data(TensorData::new(vec![0.0f32; n], [n, 1]), &device);
+        let p1 = Tensor::<2>::from_data(TensorData::new(vec![1.0f32; n], [n, 1]), &device);
+        let f0 = model.forward(xyz.clone(), p0);
+        let f1 = model.forward(xyz, p1);
+        let diff = (f0 - f1)
+            .abs()
+            .sum()
+            .into_scalar_async::<f32>()
+            .await
+            .unwrap();
+        assert_eq!(diff, 0.0, "pure path: phase 0 and 1 must match");
+    }
+
+    /// The fused kernel must reproduce the pure-burn reference both in the
+    /// forward output and in the gradients w.r.t. `xyz` and the planes.
+    #[tokio::test]
+    async fn fused_matches_pure_reference() {
+        let device: burn::tensor::Device = brush_cube::test_helpers::test_device().await.into();
+        let device = device.autodiff();
+
+        let cfg = |fused| HexPlaneConfig {
+            n_feature_dim: 4,
+            spatial_resolution: 8,
+            time_resolution: 16,
+            fused,
+            seed: 7,
+            ..HexPlaneConfig::default()
+        };
+        let fused_model = HexPlane::new(cfg(true), &device);
+        let pure_model = HexPlane::new(cfg(false), &device);
+
+        let n = 48;
+        let xyz_data = TensorData::new(
+            (0..n * 3)
+                .map(|k| {
+                    let v = (k as f32 * 0.137) % 1.0; // spread across [0, 1)
+                    -1.0 + v * 2.0 // world space around the isocenter
+                })
+                .collect(),
+            [n, 3],
+        );
+        let xyz = Tensor::<2>::from_data(xyz_data, &device).require_grad();
+        let phase = Tensor::<2>::from_data(TensorData::new(vec![0.61f32; n], [n, 1]), &device);
+        // Non-uniform upstream weights: a flat `sum()` would give every
+        // (splat, feature) thread the same g=1 and mask xyz-VJP scaling bugs.
+        let w_data: Vec<f32> = (0..n * 4).map(|k| 0.5 + ((k as f32 * 0.17) % 1.0)).collect();
+        let weights = Tensor::<2>::from_data(TensorData::new(w_data, [n, 4]), &device);
+
+        let f_fused = fused_model.forward(xyz.clone(), phase.clone());
+        let f_pure = pure_model.forward(xyz.clone(), phase);
+
+        let loss_fused = (f_fused.clone() * weights.clone()).sum();
+        let loss_pure = (f_pure.clone() * weights).sum();
+        let g_fused = loss_fused.backward();
+        let g_pure = loss_pure.backward();
+
+        // Forward outputs match.
+        let d_fwd = (f_fused - f_pure)
+            .abs()
+            .sum()
+            .into_scalar_async::<f32>()
+            .await
+            .unwrap();
+        assert!(
+            d_fwd < 1e-4,
+            "fused vs pure forward mismatch: {d_fwd}"
+        );
+
+        // xyz gradients match.
+        let xyz_g_fused = xyz.grad(&g_fused).expect("fused xyz grad");
+        let xyz_g_pure = xyz.grad(&g_pure).expect("pure xyz grad");
+        let d_g = (xyz_g_fused - xyz_g_pure)
+            .abs()
+            .sum()
+            .into_scalar_async::<f32>()
+            .await
+            .unwrap();
+        assert!(
+            d_g < 1e-4,
+            "fused vs pure xyz-gradient mismatch: {d_g}"
+        );
+
+        // Plane gradients match. Note: the fused path's grads come back as
+        // inner (non-AD) tensors while the pure path's are AD-wrapped, so
+        // read each sum back to a scalar separately instead of mixing them
+        // in one arithmetic graph.
+        let plane_grads = |model: &HexPlane, g: &burn::tensor::Gradients| {
+            [
+                model.xy.val().grad(g),
+                model.xz.val().grad(g),
+                model.yz.val().grad(g),
+                model.xt.val().grad(g),
+                model.yt.val().grad(g),
+                model.zt.val().grad(g),
+            ]
+            .into_iter()
+            .map(|p| p.expect("plane grad"))
+            .collect::<Vec<_>>()
+        };
+        let mut fused_sum = 0.0f32;
+        for t in plane_grads(&fused_model, &g_fused) {
+            fused_sum += t.sum().into_scalar_async::<f32>().await.unwrap();
+        }
+        let mut pure_sum = 0.0f32;
+        for t in plane_grads(&pure_model, &g_pure) {
+            pure_sum += t.sum().into_scalar_async::<f32>().await.unwrap();
+        }
+        assert!(
+            (fused_sum - pure_sum).abs() < 1e-4,
+            "fused vs pure plane-gradient mismatch: {fused_sum} vs {pure_sum}"
+        );
     }
 }

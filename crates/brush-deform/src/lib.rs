@@ -20,6 +20,8 @@
 //! autodiff.
 
 pub mod deform_model;
+#[doc(hidden)]
+pub mod fused;
 pub mod hash_grid;
 pub mod hex_plane;
 pub mod hexplane_model;

@@ -159,7 +159,9 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut dcm: Option<PathBuf> = None;
     let mut iters = 10_000u32;
-    let mut points = 30_000u32;
+    // 初始化点数: 15k 起步 (原 30k), 配合更慢的 densify 控制总 splat 数,
+    // 避免中后期 splat 爆炸拖慢每步 (渲染 + deform 都是 per-splat 成本)。
+    let mut points = 15_000u32;
     // None → 从相机几何自动计算(等中心 FOV 半径), 保证点云覆盖整个视野。
     let mut scene_extent: Option<f32> = None;
     // 自动 gamma: 让全局强度中位数映射到该目标灰度(0.5 = 中灰)。
@@ -187,8 +189,11 @@ async fn main() -> anyhow::Result<()> {
     let mut hex_mlp_layers = 2usize;
     // 保质量形变 (默认): 不预测 d_scaling, 局部密度变化由位移/旋转产生。
     let mut predict_scaling = false;
-    let mut growth_frac = 0.25f32;
+    // 每次 refine 只 densify 15% 的过阈值 splat (原 25%) → 增长速度放缓。
+    let mut growth_frac = 0.15f32;
     let mut refine_every = 400u32;
+    // 硬性 splat 数上限: 到顶后只 prune 不再增 (原 1M, 10k 步中期就可能顶到)。
+    let mut max_splats = 300_000u32;
     let mut eval_every = 100u32;
     // 验证集: `--eval-split-every=N` 每 N 帧扣一个 held-out 视图;
     // `--eval-views=M` 每次 eval 采 M 个验证视图(均匀)。
@@ -281,6 +286,8 @@ async fn main() -> anyhow::Result<()> {
             growth_frac = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--refine-every=") {
             refine_every = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--max-splats=") {
+            max_splats = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--eval-every=") {
             eval_every = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--eval-split-every=") {
@@ -332,7 +339,8 @@ async fn main() -> anyhow::Result<()> {
          [--deform-backend=hexplane|hashgrid] [--hex-res=N] \
          [--hex-time-res=N] [--hex-features=N] [--hex-mlp-width=N] \
          [--hex-mlp-layers=N] [--predict-scaling|--no-predict-scaling] \
-         [--growth-frac=F] [--refine-every=N] [--eval-split-every=N] \
+         [--growth-frac=F] [--refine-every=N] [--max-splats=N] \
+         [--eval-split-every=N] \
          [--eval-views=M] [--fixed-grad-thr=F] [--split] [--proj-weight=W] \
          [--proj-ssim-weight=S] [--cosine-lr] [--percent-dense=F] \
          [--split-scale=F] [--bound-factor=F] [--cull-density=MU] \
@@ -474,10 +482,13 @@ async fn main() -> anyhow::Result<()> {
         fixed_grad_threshold: fixed_grad_thr,
         enable_split,
         density_reset_interval,
-        percent_dense: percent_dense.unwrap_or(0.0005),
+        percent_dense: percent_dense.unwrap_or(0.0003),
         split_scale_factor: split_scale.unwrap_or(std::f32::consts::FRAC_1_SQRT_2),
         max_bound_factor: bound_factor.unwrap_or(3.0),
-        cull_density_threshold: cull_density.unwrap_or(5e-5),
+        // prune 阈值从 5e-5 (2.5% 水密度) 提高到 2e-4 (10% 水密度):
+        // 更激进地清掉衰减到接近零的 splat, 净增长更慢。
+        cull_density_threshold: cull_density.unwrap_or(2e-4),
+        max_splats,
         max_screen_size: max_screen_size.unwrap_or(0.0),
         ..XRayRefineConfig::default()
     };
