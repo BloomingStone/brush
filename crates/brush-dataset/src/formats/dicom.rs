@@ -57,7 +57,9 @@ async fn load_dataset_inner(
     })?;
 
     let orientation = load_args.dicom_orientation;
-    let cameras = build_cameras(&meta, orientation);
+    // Resolve the ROI spec (no / inset / rect) against the full image size.
+    let roi_rect = load_args.roi.resolve(pixels.width, pixels.height);
+    let cameras = build_cameras(&meta, orientation, roi_rect);
 
     // Normalize all frames with one shared transform so relative intensity is
     // preserved across frames. Min-max matches the Python project's
@@ -98,6 +100,38 @@ async fn load_dataset_inner(
     }
     let frame_len = pixels.frame_len();
 
+    // ROI crop (pixels): trim FOV edge artifacts (dark vignetting) or focus a
+    // local region. Both the pixels and the camera intrinsics (fov / principal
+    // point) are adjusted so the projection stays exact.
+    let (crop_w, crop_h, crop_x0, crop_y0) = match roi_rect {
+        Some([x0, y0, w, h]) => {
+            println!(
+                "ROI crop: full {}x{} -> ({x0},{y0}) {}x{}",
+                pixels.width,
+                pixels.height,
+                w,
+                h
+            );
+            (w as usize, h as usize, x0 as usize, y0 as usize)
+        }
+        None => (pixels.width as usize, pixels.height as usize, 0, 0),
+    };
+    if crop_w != pixels.width as usize || crop_h != pixels.height as usize {
+        // Row-major [nf, H, W] → [nf, h, w]: copy the sub-rectangle per row.
+        let n_frames = pixels.num_frames as usize;
+        let full_w = pixels.width as usize;
+        let cropped = Vec::with_capacity(n_frames * crop_w * crop_h);
+        let mut cropped = cropped;
+        for f in 0..n_frames {
+            let start = f * frame_len;
+            for r in crop_y0..crop_y0 + crop_h {
+                let row_start = start + r * full_w + crop_x0;
+                cropped.extend_from_slice(&normalized[row_start..row_start + crop_w]);
+            }
+        }
+        normalized = cropped;
+    }
+
     // The RGB `LoadImage` is unused for X-ray views (the scene loader skips
     // decoding it); point it at the source file so the path stays meaningful.
     let image = LoadImage::new(
@@ -114,11 +148,11 @@ async fn load_dataset_inner(
     let mut views = Vec::new();
     for i in (0..pixels.num_frames as usize).step_by(step).take(max_frames) {
         let frame = &meta.frames[i];
-        let start = i * frame_len;
+        let start = i * crop_w * crop_h;
         let gray = GrayImage::new(
-            normalized[start..start + frame_len].to_vec(),
-            pixels.width,
-            pixels.height,
+            normalized[start..start + crop_w * crop_h].to_vec(),
+            crop_w as u32,
+            crop_h as u32,
         );
         views.push(SceneView::xray(
             cameras[i],
@@ -225,6 +259,23 @@ pub fn build_camera(
     orientation: XRayOrientation,
     geom: &CArmGeometry,
 ) -> Camera {
+    build_camera_roi(alpha_rad, beta_rad, sod, orientation, geom, None)
+}
+
+/// [`build_camera`] with an optional ROI crop `[x0, y0, w, h]` (pixels).
+///
+/// Cropping the detector keeps the focal length (`fx = sdd / delx`) intact and
+/// re-derives the field of view from the cropped dimensions, and shifts the
+/// normalized principal point so the isocenter stays at the same physical
+/// detector location: `center_uv = ((W/2 - x0)/w, (H/2 - y0)/h)`.
+pub fn build_camera_roi(
+    alpha_rad: f64,
+    beta_rad: f64,
+    sod: f64,
+    orientation: XRayOrientation,
+    geom: &CArmGeometry,
+    roi: Option<[u32; 4]>,
+) -> Camera {
     let m_c2w = camera_to_world(alpha_rad, beta_rad, sod, orientation);
     let (_, rotation, position) = m_c2w.to_scale_rotation_translation();
     let position = Vec3::new(position.x as f32, position.y as f32, position.z as f32);
@@ -235,33 +286,61 @@ pub fn build_camera(
         rotation.w as f32,
     );
 
+    let (w, h, x0, y0) = match roi {
+        Some([x0, y0, w, h]) => {
+            let x0 = x0.min(geom.width);
+            let y0 = y0.min(geom.height);
+            let w = w.clamp(1, geom.width - x0);
+            let h = h.clamp(1, geom.height - y0);
+            (w as f64, h as f64, x0 as f64, y0 as f64)
+        }
+        None => (
+            geom.width as f64,
+            geom.height as f64,
+            0.0,
+            0.0,
+        ),
+    };
+
     let fx = geom.sdd / geom.delx; // pixels
     let fy = geom.sdd / geom.dely;
-    let fov_x = 2.0 * ((geom.width as f64 * 0.5) / fx).atan();
-    let fov_y = 2.0 * ((geom.height as f64 * 0.5) / fy).atan();
+    // Same focal length as the full detector → the cropped FOV only covers
+    // the sub-rectangle of the detector.
+    let fov_x = 2.0 * ((w * 0.5) / fx).atan();
+    let fov_y = 2.0 * ((h * 0.5) / fy).atan();
+    // Isocenter principal point in cropped (normalized) coordinates.
+    let center_uv = Vec2::new(
+        ((geom.width as f64 * 0.5 - x0) / w) as f32,
+        ((geom.height as f64 * 0.5 - y0) / h) as f32,
+    );
 
     Camera::new(
         position,
         rotation,
         fov_x,
         fov_y,
-        Vec2::splat(0.5),
+        center_uv,
         CameraModel::Pinhole,
     )
 }
 
 /// Build cameras for every frame of the DICOM sequence.
-fn build_cameras(meta: &DicomMeta, orientation: XRayOrientation) -> Vec<Camera> {
+fn build_cameras(
+    meta: &DicomMeta,
+    orientation: XRayOrientation,
+    roi: Option<[u32; 4]>,
+) -> Vec<Camera> {
     let alphas = meta.alphas_radians();
     let betas = meta.betas_radians();
     (0..meta.num_frames as usize)
         .map(|i| {
-            build_camera(
+            build_camera_roi(
                 alphas[i],
                 betas[i],
                 meta.geometry.sod,
                 orientation,
                 &meta.geometry,
+                roi,
             )
         })
         .collect()
@@ -429,6 +508,7 @@ mod tests {
             dicom_normalization: crate::config::DicomNormalization::Minmax,
             dicom_gamma: None,
             dicom_gamma_target: None,
+            roi: crate::config::RoiSpec::None,
             max_scene_batch_cache_size: 1 << 30,
         };
 
@@ -514,7 +594,7 @@ mod tests {
         let Some((meta, _)) = example_meta() else {
             return;
         };
-        let cams = build_cameras(&meta, XRayOrientation::Ap);
+        let cams = build_cameras(&meta, XRayOrientation::Ap, None);
         assert_eq!(cams.len(), 402);
 
         // Every camera must be valid and the same distance from isocenter.
@@ -525,6 +605,56 @@ mod tests {
 
         // First and last frames differ in alpha → different rotation.
         assert!((cams[0].rotation - cams[401].rotation).length() > 1e-3);
+    }
+
+    /// ROI crop must keep the projection exact: the isocenter lands on the
+    /// same *physical* detector pixel, and the focal length is preserved
+    /// (only fov / principal point change).
+    #[test]
+    fn roi_crop_keeps_projection_exact() {
+        let geom = CArmGeometry {
+            sdd: 1200.0,
+            sod: 760.0,
+            height: 474,
+            width: 648,
+            delx: 0.616,
+            dely: 0.616,
+            x0: 0.0,
+            y0: 0.0,
+        };
+        let roi = [20u32, 30, 300, 200];
+        let cam = build_camera(0.0, 0.0, 760.0, XRayOrientation::Ap, &geom);
+        let cam_c = build_camera_roi(0.0, 0.0, 760.0, XRayOrientation::Ap, &geom, Some(roi));
+        let [x0, y0, w, h] = roi;
+
+        // Focal length (px) preserved: fov_to_focal(fov, cropped_px) == sdd/delx.
+        use brush_render::camera::fov_to_focal;
+        let fx = geom.sdd / geom.delx;
+        assert!(
+            (fov_to_focal(cam_c.fov_x, w, &CameraModel::Pinhole) - fx).abs() < 1e-6,
+            "focal x not preserved: {} vs {}",
+            fov_to_focal(cam_c.fov_x, w, &CameraModel::Pinhole),
+            fx
+        );
+        assert!(
+            (fov_to_focal(cam_c.fov_y, h, &CameraModel::Pinhole) - fx).abs() < 1e-6,
+            "focal y not preserved"
+        );
+
+        // Isocenter projects to the same physical detector pixel: full camera
+        // → (W/2, H/2); cropped camera → (W/2 - x0, H/2 - y0) in cropped px.
+        let w2l = cam_c.world_to_local();
+        let p_c = w2l.transform_point3(glam::Vec3::ZERO);
+        let focal = cam_c.focal(glam::uvec2(w, h));
+        let u = focal.x * p_c.x / p_c.z + cam_c.center_uv.x * w as f32;
+        let v = focal.y * p_c.y / p_c.z + cam_c.center_uv.y * h as f32;
+        assert!(
+            (u - (geom.width as f32 / 2.0 - x0 as f32)).abs() < 0.5
+                && (v - (geom.height as f32 / 2.0 - y0 as f32)).abs() < 0.5,
+            "isocenter uv = ({u:.1},{v:.1}), expected ({},{})",
+            geom.width as f32 / 2.0 - x0 as f32,
+            geom.height as f32 / 2.0 - y0 as f32
+        );
     }
 }
 

@@ -239,6 +239,9 @@ async fn main() -> anyhow::Result<()> {
     // 密度软重置间隔 (0 = 关闭; 参考项目用 2000)。
     let mut density_reset_interval = 0u32;
     let mut out = PathBuf::from("target/fit_deform");
+    // ROI 截取 (默认四边各裁 20px 去 FOV 暗边; `--roi=no` 关闭, `--roi=N`
+    // 四边各裁 N, `--roi=x0,y0,w,h` 显式矩形)。像素与相机内参同步调整。
+    let mut roi: brush_dataset::config::RoiSpec = brush_dataset::config::RoiSpec::Inset(20);
     // 指标 CSV 记录器: 默认 <out>/metrics.csv, `--log-csv=FILE` 覆盖,
     // `--log-csv=off` 关闭。每次 eval 追加一行(含时间戳 + 各指标)。
     let mut log_csv: Option<PathBuf> = None;
@@ -347,6 +350,10 @@ async fn main() -> anyhow::Result<()> {
             log_csv = Some(PathBuf::from(v));
         } else if let Some(v) = a.strip_prefix("--out=") {
             out = PathBuf::from(v);
+        } else if let Some(v) = a.strip_prefix("--roi=") {
+            // --roi=no | N | x0,y0,w,h (像素): 截取图像 ROI 并同步调整相机内参
+            // (fov/主点), 用于去除 FOV 暗边或局部区域重建。默认四边各裁 20。
+            roi = brush_dataset::config::parse_roi(v).map_err(anyhow::Error::msg)?;
         } else if dcm.is_none() {
             dcm = Some(PathBuf::from(a));
         }
@@ -367,7 +374,7 @@ async fn main() -> anyhow::Result<()> {
          [--split-scale=F] [--bound-factor=F] [--cull-density=MU] \
          [--max-screen-size=PX] [--multiscale-weight=W] [--window-weight=W] \
          [--grad-weight=W] [--density-reset=N] [--eval-every=N] \
-         [--log-csv=FILE] [--out=DIR]",
+         [--roi=no|N|x0,y0,w,h] [--log-csv=FILE] [--out=DIR]",
     );
 
     // ---- 后端 + 数据集 ---------------------------------------------------
@@ -399,6 +406,7 @@ async fn main() -> anyhow::Result<()> {
         dicom_normalization: DicomNormalization::Minmax,
         dicom_gamma: None,
         dicom_gamma_target: gamma_target,
+        roi,
         max_scene_batch_cache_size: 1 << 30,
     };
     let result = brush_dataset::load_dataset(vfs, &load_config).await?;

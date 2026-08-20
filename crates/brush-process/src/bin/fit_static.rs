@@ -304,6 +304,7 @@ async fn main() -> anyhow::Result<()> {
         dicom_normalization: DicomNormalization::Minmax,
         dicom_gamma: None,
         dicom_gamma_target: gamma_target,
+        roi: brush_dataset::config::RoiSpec::None,
         max_scene_batch_cache_size: 1 << 30,
     };
     let result = brush_dataset::load_dataset(vfs, &load_config).await?;
