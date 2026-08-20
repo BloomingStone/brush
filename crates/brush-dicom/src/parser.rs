@@ -206,10 +206,15 @@ fn read_frames(
     };
 
     // Per-frame times: `FrameTimeVector` holds per-frame intervals in ms; the
-    // time of frame i is the cumulative sum of intervals [0, i). When absent,
-    // fall back to a uniform `i / fps`.
+    // time of frame i is the cumulative sum of intervals [0, i). When absent —
+    // or degenerate (too few entries / all zero, e.g. some Neusoft XA files
+    // store a single "0") — fall back to uniform `i / fps` (the acquisition
+    // is uniformly sampled, so real time = frame_index / fps).
     let frame_times_ms = read_f64_multi(obj, tags::FRAME_TIME_VECTOR).ok();
-    let times_s: Vec<f64> = if let Some(times) = frame_times_ms {
+    let valid_ftv = frame_times_ms.as_ref().is_some_and(|t| {
+        t.len() >= n.saturating_sub(1) && t.iter().any(|v| v.abs() > 1e-9)
+    });
+    let times_s: Vec<f64> = if let Some(times) = frame_times_ms.filter(|_| valid_ftv) {
         let mut cum = Vec::with_capacity(n);
         let mut acc = 0.0;
         for &iv in times.iter().take(n) {

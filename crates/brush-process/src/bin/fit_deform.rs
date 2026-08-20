@@ -18,6 +18,10 @@
 //!      高斯噪声 (参考项目 `get_linear_noise_func`), 增强相位泛化。
 //!   4. **warm-up**: 前 `warm_up` 步不施加形变 (dummy 梯度), 让 canonical
 //!      splats 先收敛到静态结构。
+//!   5. **可学习时间条件化** (`--enable-time`, 默认关): 形变网络额外以真实
+//!      物理时间 `t = f/fps` (FrameTimeVector 缺失/退化时) 为条件, 通过一个
+//!      **可学习频率的傅里叶编码** 自动拟合数据中的呼吸 (及其它非周期)
+//!      运动频率 —— 无需预知呼吸频率范围。心脏 phase 保持已知圆环轴。
 //!
 //! 每 `eval_every` 步对 held-out 视图做 eval (每个视图用其真实 phase),
 //! 打印 PSNR/SSIM/LPIPS 并保存 GT|pred 拼接 NRRD stack; 训练结束导出
@@ -189,6 +193,13 @@ async fn main() -> anyhow::Result<()> {
     let mut hex_mlp_layers = 2usize;
     // 保质量形变 (默认): 不预测 d_scaling, 局部密度变化由位移/旋转产生。
     let mut predict_scaling = false;
+    // 可学习时间条件化 (默认关): 形变网络用可学习傅里叶频率拟合呼吸等
+    // 非周期运动 (无需预知呼吸频率), 与心脏 phase 圆环轴互补。
+    let mut enable_time = false;
+    // 时间编码参数: 频率个数 / 初始化范围 (Hz, 对数间隔)。
+    let mut time_freqs = 10usize;
+    let mut time_min_freq = 0.15f32;
+    let mut time_max_freq = 3.0f32;
     // 每次 refine 只 densify 15% 的过阈值 splat (原 25%) → 增长速度放缓。
     let mut growth_frac = 0.15f32;
     let mut refine_every = 400u32;
@@ -282,6 +293,16 @@ async fn main() -> anyhow::Result<()> {
             predict_scaling = true;
         } else if a == "--no-predict-scaling" {
             predict_scaling = false;
+        } else if a == "--enable-time" {
+            enable_time = true;
+        } else if a == "--no-time" {
+            enable_time = false;
+        } else if let Some(v) = a.strip_prefix("--time-freqs=") {
+            time_freqs = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--time-min-freq=") {
+            time_min_freq = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--time-max-freq=") {
+            time_max_freq = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--growth-frac=") {
             growth_frac = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--refine-every=") {
@@ -422,6 +443,23 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // 物理时间诊断: 帧时间应随帧号递增 (t = f/fps 或 FrameTimeVector)。
+    {
+        let t0 = dataset.train.views[0].time;
+        let t1 = dataset.train.views.last().map(|v| v.time).unwrap_or(t0);
+        println!(
+            "{} real time: [{:.3}, {:.3}] s ({} frames, {} s total)",
+            ts(),
+            t0,
+            t1,
+            dataset.train.views.len(),
+            t1 - t0
+        );
+        if t1 - t0 <= 1e-6 {
+            log::warn!("time is constant — check FrameTimeVector / fps fallback");
+        }
+    }
+
     // 球半径: 显式 `--scene-extent` 优先, 否则按相机几何自动计算等中心 FOV
     // 半径 (半 FOV = (W/2)·SOD/fx), 乘 1.05 留边距 —— 保证点云覆盖整个视野。
     let scene_extent = match scene_extent {
@@ -451,6 +489,13 @@ async fn main() -> anyhow::Result<()> {
     cfg.warm_up = warm_up; // 前 N 步不施加形变
     cfg.deform_backend = deform_backend;
     cfg.predict_scaling = predict_scaling; // 保质量形变 (默认关缩放)
+    cfg.enable_time = enable_time; // 可学习时间条件化 (默认关)
+    cfg.time_enc = brush_deform::TimeEncodingConfig {
+        n_freqs: time_freqs,
+        min_freq: time_min_freq,
+        max_freq: time_max_freq,
+        ..brush_deform::TimeEncodingConfig::default()
+    };
     cfg.hex_plane = HexPlaneDeformConfig {
         hex_plane: HexPlaneConfig {
             n_feature_dim: hex_features,
@@ -461,6 +506,13 @@ async fn main() -> anyhow::Result<()> {
         mlp_hidden: hex_mlp_width,
         mlp_layers: hex_mlp_layers,
         predict_scaling,
+        enable_time,
+        time_enc: brush_deform::TimeEncodingConfig {
+            n_freqs: time_freqs,
+            min_freq: time_min_freq,
+            max_freq: time_max_freq,
+            ..brush_deform::TimeEncodingConfig::default()
+        },
     };
     cfg.init_density = init_density;
     cfg.lr_mean = lr_mean;
@@ -513,7 +565,7 @@ async fn main() -> anyhow::Result<()> {
         DeformBackend::HashGrid => "hashgrid".to_owned(),
     };
     println!(
-        "{} init splats: {} (random ball r={}mm, init μ={} mm⁻¹, lr_mean={}->{}, lr_deform={}->{}), deform={} (predict_scaling={}), refine every {}",
+        "{} init splats: {} (random ball r={}mm, init μ={} mm⁻¹, lr_mean={}->{}, lr_deform={}->{}), deform={} (predict_scaling={}, enable_time={}, time_freqs={}[{}-{}Hz]), refine every {}",
         ts(),
         trainer.num_splats(),
         scene_extent,
@@ -524,6 +576,10 @@ async fn main() -> anyhow::Result<()> {
         lr_deform_end,
         backend_name,
         predict_scaling,
+        enable_time,
+        time_freqs,
+        time_min_freq,
+        time_max_freq,
         refine_every
     );
 
@@ -581,7 +637,7 @@ async fn main() -> anyhow::Result<()> {
         for view in eval_views.iter() {
             let gray = view.gray_image.as_ref().expect("gray GT");
             let gt = TensorData::new(gray.data.as_ref().to_vec(), [gray.height, gray.width]);
-            let sample = trainer.eval_view(&view.camera, &gt, view.phase).await;
+            let sample = trainer.eval_view(&view.camera, &gt, view.phase, view.time).await;
             p += sample.psnr;
             s += sample.ssim;
             l += sample.lpips;
@@ -650,7 +706,7 @@ async fn main() -> anyhow::Result<()> {
             for view in eval_views.iter() {
                 let gray = view.gray_image.as_ref().expect("gray GT");
                 let vgt = TensorData::new(gray.data.as_ref().to_vec(), [gray.height, gray.width]);
-                let sample = trainer.eval_view(&view.camera, &vgt, view.phase).await;
+                let sample = trainer.eval_view(&view.camera, &vgt, view.phase, view.time).await;
                 avg_psnr += sample.psnr;
                 avg_ssim += sample.ssim;
                 avg_lpips += sample.lpips;
@@ -716,6 +772,27 @@ async fn main() -> anyhow::Result<()> {
     let ply_path = out.join("canonical_final.ply");
     std::fs::write(&ply_path, ply)?;
     println!("{} exported {}", ts(), ply_path.display());
+
+    // 可学习时间频率诊断: 训练后网络把频率收敛到数据中的真实运动频率
+    // (如 ~0.8Hz 呼吸)。对照人工统计核验。
+    if enable_time
+        && let Some(freqs) = trainer.learned_time_freqs().await
+    {
+        let sorted = {
+            let mut s = freqs.clone();
+            s.sort_by(|a, b| a.total_cmp(b));
+            s
+        };
+        println!(
+            "{} learned time freqs (Hz): {}",
+            ts(),
+            sorted
+                .iter()
+                .map(|f| format!("{f:.3}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
 
     println!("{} done -> {}", ts(), out.display());
     Ok(())

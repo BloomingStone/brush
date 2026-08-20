@@ -197,7 +197,7 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&out)?;
 
     // 初始(iter 0)。
-    let s0 = trainer.eval_view(&eval_view.camera, &gt_data, eval_view.phase).await;
+    let s0 = trainer.eval_view(&eval_view.camera, &gt_data, eval_view.phase, eval_view.time).await;
     println!(
         "iter {:4} psnr={:6.2} ssim={:5.3}",
         "init", s0.psnr, s0.ssim
@@ -212,7 +212,7 @@ async fn main() -> anyhow::Result<()> {
 
         if step % 100 == 0 {
             let sample = trainer
-                .eval_view(&eval_view.camera, &gt_data, eval_view.phase)
+                .eval_view(&eval_view.camera, &gt_data, eval_view.phase, eval_view.time)
                 .await;
             save_pair(&out, step, &sample.pred, &sample.gt);
             println!(

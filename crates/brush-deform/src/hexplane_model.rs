@@ -21,6 +21,7 @@ use burn::tensor::Tensor;
 use crate::deform_model::{Deforms, axial_angle_to_quat};
 use crate::hex_plane::{HexPlane, HexPlaneConfig};
 use crate::mlp::Mlp;
+use crate::time_encoding::{TimeEncoding, TimeEncodingConfig};
 
 /// Configuration for [`HexPlaneDeformModel`].
 #[derive(Debug, Clone)]
@@ -33,6 +34,11 @@ pub struct HexPlaneDeformConfig {
     /// Predict a per-splat scaling offset? Default `false` (mass-conserving
     /// deform field — displacement + rotation only).
     pub predict_scaling: bool,
+    /// Condition the deform field on real time via a learnable Fourier bank
+    /// (lets the network fit the respiratory frequency during training).
+    pub enable_time: bool,
+    /// Learnable temporal encoding configuration (used when `enable_time`).
+    pub time_enc: TimeEncodingConfig,
 }
 
 impl Default for HexPlaneDeformConfig {
@@ -42,11 +48,13 @@ impl Default for HexPlaneDeformConfig {
             mlp_hidden: 128,
             mlp_layers: 2,
             predict_scaling: false,
+            enable_time: false,
+            time_enc: TimeEncodingConfig::default(),
         }
     }
 }
 
-/// Cardiac-phase-guided HexPlane deformation network.
+/// Cardiac-phase (+ optional learned-time) HexPlane deformation network.
 #[derive(Module, Debug)]
 pub struct HexPlaneDeformModel {
     hex_plane: HexPlane,
@@ -54,6 +62,9 @@ pub struct HexPlaneDeformModel {
     xyz_warp: Linear,
     scaling_warp: Option<Linear>,
     axial_warp: Linear,
+    /// Learnable temporal Fourier bank (`None` when `enable_time = false`).
+    #[module(skip)]
+    time_enc: Option<TimeEncoding>,
     #[module(skip)]
     cfg: HexPlaneDeformConfig,
 }
@@ -61,9 +72,23 @@ pub struct HexPlaneDeformModel {
 impl HexPlaneDeformModel {
     pub fn new(cfg: HexPlaneDeformConfig, device: &burn::tensor::Device) -> Self {
         let hex_plane = HexPlane::new(cfg.hex_plane.clone(), device);
-        // Plane features + periodic phase pair [sin(2πt), cos(2πt)].
-        let decoder = Mlp::new(hex_plane.output_channels() + 2, cfg.mlp_hidden, cfg.mlp_layers, device);
+        // Plane features + periodic phase pair [sin(2πt), cos(2πt)] + (optional)
+        // learned time Fourier bank.
+        let time_dim = if cfg.enable_time {
+            TimeEncoding::new(cfg.time_enc.clone(), device).output_channels()
+        } else {
+            0
+        };
+        let decoder = Mlp::new(
+            hex_plane.output_channels() + 2 + time_dim,
+            cfg.mlp_hidden,
+            cfg.mlp_layers,
+            device,
+        );
         let width = cfg.mlp_hidden;
+        let time_enc = cfg
+            .enable_time
+            .then(|| TimeEncoding::new(cfg.time_enc.clone(), device));
         Self {
             hex_plane,
             decoder,
@@ -72,6 +97,7 @@ impl HexPlaneDeformModel {
                 .predict_scaling
                 .then(|| LinearConfig::new(width, 3).init(device)),
             axial_warp: LinearConfig::new(width, 3).init(device),
+            time_enc,
             cfg,
         }
     }
@@ -80,9 +106,15 @@ impl HexPlaneDeformModel {
         &self.cfg
     }
 
+    /// The learned temporal encoding (when `enable_time`), for diagnostics.
+    pub fn time_encoding(&self) -> Option<&TimeEncoding> {
+        self.time_enc.as_ref()
+    }
+
     /// Predict deformations for canonical positions `xyz` (`[N, 3]`, world
-    /// mm) at a scalar `phase` (`[N, 1]`).
-    pub fn forward(&self, xyz: Tensor<2>, phase: Tensor<2>) -> Deforms {
+    /// mm) at a scalar `phase` (`[N, 1]`) and (optionally) real `time`
+    /// (`[N, 1]`, seconds).
+    pub fn forward(&self, xyz: Tensor<2>, phase: Tensor<2>, time: Tensor<2>) -> Deforms {
         let cfg = &self.cfg;
         let feat = self.hex_plane.forward(xyz.clone(), phase.clone()); // [N, C]
 
@@ -91,7 +123,12 @@ impl HexPlaneDeformModel {
         let ang = t * std::f32::consts::TAU;
         let phase_enc = Tensor::cat(vec![ang.clone().sin(), ang.cos()], 1); // [N, 2]
 
-        let h = self.decoder.forward(Tensor::cat(vec![feat, phase_enc], 1)); // [N, hidden]
+        // Learned time conditioning (zero-width when disabled → no effect).
+        let mut inputs = vec![feat, phase_enc];
+        if let Some(enc) = &self.time_enc {
+            inputs.push(enc.forward(time));
+        }
+        let h = self.decoder.forward(Tensor::cat(inputs, 1)); // [N, hidden]
 
         let d_xyz = self.xyz_warp.forward(h.clone());
         let d_scaling = match &self.scaling_warp {
@@ -125,7 +162,8 @@ mod tests {
         let n = 32;
         let xyz = Tensor::<2>::from_data(TensorData::new(vec![0.1f32; n * 3], [n, 3]), &device);
         let phase = Tensor::<2>::from_data(TensorData::new(vec![0.5f32; n], [n, 1]), &device);
-        let deforms = model.forward(xyz, phase);
+        let time = Tensor::<2>::from_data(TensorData::new(vec![1.2f32; n], [n, 1]), &device);
+        let deforms = model.forward(xyz, phase, time);
 
         assert_eq!(deforms.d_xyz.dims(), [n, 3]);
         assert_eq!(deforms.d_scaling.dims(), [n, 3]);
@@ -194,7 +232,8 @@ mod tests {
         let n = 16;
         let xyz = Tensor::<2>::from_data(TensorData::new(vec![0.2f32; n * 3], [n, 3]), &device);
         let phase = Tensor::<2>::from_data(TensorData::new(vec![0.3f32; n], [n, 1]), &device);
-        let deforms = model.forward(xyz, phase);
+        let time = Tensor::<2>::from_data(TensorData::new(vec![2.0f32; n], [n, 1]), &device);
+        let deforms = model.forward(xyz, phase, time);
         let ds = deforms
             .d_scaling
             .clone()
@@ -223,7 +262,8 @@ mod tests {
         let xyz = Tensor::<2>::from_data(TensorData::new(vec![0.1f32; n * 3], [n, 3]), &device)
             .require_grad();
         let phase = Tensor::<2>::from_data(TensorData::new(vec![0.5f32; n], [n, 1]), &device);
-        let deforms = model.forward(xyz.clone(), phase);
+        let time = Tensor::<2>::from_data(TensorData::new(vec![3.0f32; n], [n, 1]), &device);
+        let deforms = model.forward(xyz.clone(), phase, time);
 
         let loss = deforms.d_xyz.sum() + deforms.d_scaling.sum() + deforms.d_rotation.sum();
         let grads = loss.backward();

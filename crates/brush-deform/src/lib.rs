@@ -27,7 +27,9 @@ pub mod hex_plane;
 pub mod hexplane_model;
 pub mod mlp;
 pub mod positional;
+pub mod time_encoding;
 
 pub use deform_model::{DeformModel, DeformModelConfig, Deforms, deform_splats};
 pub use hex_plane::{HexPlane, HexPlaneConfig};
 pub use hexplane_model::{HexPlaneDeformConfig, HexPlaneDeformModel};
+pub use time_encoding::{TimeEncoding, TimeEncodingConfig};

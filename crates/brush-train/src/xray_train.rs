@@ -17,7 +17,7 @@
 use brush_dataset::scene::SceneBatch;
 use brush_deform::{
     DeformModel, DeformModelConfig, Deforms, HexPlaneDeformConfig, HexPlaneDeformModel,
-    deform_splats,
+    TimeEncodingConfig, deform_splats,
 };
 use brush_loss::gray::{GrayLossConfig, gray_loss};
 use brush_render::burn_glue::detach_autodiff;
@@ -59,11 +59,12 @@ pub enum DeformNetwork {
 
 impl DeformNetwork {
     /// Predict deformations for canonical positions `xyz` (`[N, 3]`) at a
-    /// scalar `phase` (`[N, 1]`).
-    pub fn forward(&self, xyz: Tensor<2>, phase: Tensor<2>) -> Deforms {
+    /// scalar `phase` (`[N, 1]`) and real `time` (`[N, 1]`, seconds; used by
+    /// the learned time conditioning when enabled).
+    pub fn forward(&self, xyz: Tensor<2>, phase: Tensor<2>, time: Tensor<2>) -> Deforms {
         match self {
-            Self::HexPlane(model) => model.forward(xyz, phase),
-            Self::HashGrid(model) => model.forward(xyz, phase),
+            Self::HexPlane(model) => model.forward(xyz, phase, time),
+            Self::HashGrid(model) => model.forward(xyz, phase, time),
         }
     }
 }
@@ -99,6 +100,12 @@ pub struct XRayTrainConfig {
     /// a splat's integrated absorption is `∝ scale`, so scaling would alter
     /// the scene's total absorption.
     pub predict_scaling: bool,
+    /// Condition the deform field on real time via a learnable Fourier bank:
+    /// the network fits the respiratory (and other) temporal frequencies
+    /// during training — no breathing-frequency prior needed.
+    pub enable_time: bool,
+    /// Learnable temporal encoding configuration (used when `enable_time`).
+    pub time_enc: TimeEncodingConfig,
     /// Density-control configuration.
     pub refine: XRayRefineConfig,
     /// Initial activated density (mm⁻¹) for the random splats. Defaults to
@@ -148,6 +155,8 @@ impl Default for XRayTrainConfig {
             deform_backend: DeformBackend::HexPlane,
             hex_plane: HexPlaneDeformConfig::default(),
             predict_scaling: false,
+            enable_time: false,
+            time_enc: TimeEncodingConfig::default(),
             refine: XRayRefineConfig::default(),
             init_density: brush_cube::MU_WATER,
             l1_weight: 1.0,
@@ -322,6 +331,18 @@ impl XRayTrainer {
         &self.canonical
     }
 
+    /// Read back the learned temporal frequencies (Hz) of the deform network,
+    /// when time conditioning is enabled. `None` otherwise / on read failure.
+    pub async fn learned_time_freqs(&self) -> Option<Vec<f32>> {
+        let enc = match &self.deform {
+            Some(DeformNetwork::HexPlane(m)) => m.time_encoding()?,
+            Some(DeformNetwork::HashGrid(m)) => m.time_encoding()?,
+            None => return None,
+        };
+        let f = enc.frequencies();
+        Some(f.into_data_async().await.ok()?.to_vec::<f32>().ok()?)
+    }
+
     /// Render the current model (canonical splats, deformed at `phase` when in
     /// deform mode) against a GT frame and compute grayscale PSNR / SSIM.
     /// Forward-only — no gradients are accumulated.
@@ -330,6 +351,7 @@ impl XRayTrainer {
         camera: &brush_render::camera::Camera,
         gt: &TensorData,
         phase: f32,
+        time: f32,
     ) -> crate::xray_eval::XRayEvalSample {
         use crate::xray_eval::XRayEvalSample;
         use brush_loss::gray::{gray_psnr, gray_ssim};
@@ -342,8 +364,10 @@ impl XRayTrainer {
             let n = canonical_ad.num_splats() as usize;
             let phase_t =
                 Tensor::<2>::from_data(TensorData::new(vec![phase; n], [n, 1]), &device_ad);
+            let time_t =
+                Tensor::<2>::from_data(TensorData::new(vec![time; n], [n, 1]), &device_ad);
             let xyz = canonical_ad.means();
-            let deforms = deform.forward(xyz, phase_t);
+            let deforms = deform.forward(xyz, phase_t, time_t);
             deform_splats(&canonical_ad, &deforms)
         } else {
             canonical_ad
@@ -467,8 +491,10 @@ impl XRayTrainer {
             let n = canonical_ad.num_splats() as usize;
             let phase_t =
                 Tensor::<2>::from_data(TensorData::new(vec![phase; n], [n, 1]), &device_ad);
+            let time_t =
+                Tensor::<2>::from_data(TensorData::new(vec![batch.time; n], [n, 1]), &device_ad);
             let xyz = canonical_ad.means();
-            let deforms = deform.forward(xyz, phase_t);
+            let deforms = deform.forward(xyz, phase_t, time_t);
             deform_splats(&canonical_ad, &deforms)
         } else {
             // Static reconstruction: no deform field, render the canonical
@@ -998,6 +1024,8 @@ pub fn create_xray_trainer(
                 let deform_cfg = DeformModelConfig {
                     coord_scale: scene_extent.max(1.0),
                     predict_scaling: config.predict_scaling,
+                    enable_time: config.enable_time,
+                    time_enc: config.time_enc.clone(),
                     ..DeformModelConfig::default()
                 };
                 Some(DeformNetwork::HashGrid(DeformModel::new(deform_cfg, &device_ad)))
@@ -1006,6 +1034,8 @@ pub fn create_xray_trainer(
                 let mut hex_cfg = config.hex_plane.clone();
                 hex_cfg.hex_plane.coord_scale = scene_extent.max(1.0);
                 hex_cfg.predict_scaling = config.predict_scaling;
+                hex_cfg.enable_time = config.enable_time;
+                hex_cfg.time_enc = config.time_enc.clone();
                 Some(DeformNetwork::HexPlane(HexPlaneDeformModel::new(
                     hex_cfg,
                     &device_ad,

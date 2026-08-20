@@ -6,6 +6,7 @@ target/
 # reference models/images
 brush_data/
 images/
+images
 
 # Trunk outputs
 **/trunk_dist/**

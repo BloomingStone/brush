@@ -16,6 +16,7 @@ use brush_xray::XRaySplats;
 use crate::hash_grid::{HashGrid, HashGridConfig};
 use crate::mlp::SkipMlp;
 use crate::positional::PositionalEncoding;
+use crate::time_encoding::{TimeEncoding, TimeEncodingConfig};
 
 /// Per-splat deformation outputs (matching the Python `Deforms`).
 #[derive(Debug, Clone)]
@@ -59,6 +60,11 @@ pub struct DeformModelConfig {
     /// deform field — displacement + rotation only; a scale change would
     /// alter a splat's integrated absorption).
     pub predict_scaling: bool,
+    /// Condition the deform field on real time via a learnable Fourier bank
+    /// (lets the network fit the respiratory frequency during training).
+    pub enable_time: bool,
+    /// Learnable temporal encoding configuration (used when `enable_time`).
+    pub time_enc: TimeEncodingConfig,
 }
 
 impl Default for DeformModelConfig {
@@ -75,11 +81,13 @@ impl Default for DeformModelConfig {
             block_depth: 2,
             coord_scale: 760.0,
             predict_scaling: false,
+            enable_time: false,
+            time_enc: TimeEncodingConfig::default(),
         }
     }
 }
 
-/// Cardiac-phase-guided deformation network.
+/// Cardiac-phase (+ optional learned-time) deformation network.
 #[derive(Module, Debug)]
 pub struct DeformModel {
     hash_grid: HashGrid,
@@ -89,6 +97,9 @@ pub struct DeformModel {
     xyz_warp: Linear,
     scaling_warp: Option<Linear>,
     axial_warp: Linear,
+    /// Learnable temporal Fourier bank (`None` when `enable_time = false`).
+    #[module(skip)]
+    time_enc: Option<TimeEncoding>,
     #[module(skip)]
     cfg: DeformModelConfig,
 }
@@ -109,16 +120,25 @@ impl DeformModel {
 
         let emb_x = hash_grid.output_channels() as usize;
         let emb_t = phase_enc.output_channels() as usize;
+        let time_dim = if cfg.enable_time {
+            TimeEncoding::new(cfg.time_enc.clone(), device).output_channels()
+        } else {
+            0
+        };
         let width = cfg.combine_width as usize;
 
         let combine_mlp = SkipMlp::new(
-            emb_x + emb_t,
+            emb_x + emb_t + time_dim,
             width,
             cfg.combine_layers as usize,
             cfg.block_depth as usize,
             width,
             device,
         );
+
+        let time_enc = cfg
+            .enable_time
+            .then(|| TimeEncoding::new(cfg.time_enc.clone(), device));
 
         Self {
             hash_grid,
@@ -129,6 +149,7 @@ impl DeformModel {
                 .predict_scaling
                 .then(|| LinearConfig::new(width, 3).init(device)),
             axial_warp: LinearConfig::new(width, 3).init(device),
+            time_enc,
             cfg,
         }
     }
@@ -137,16 +158,26 @@ impl DeformModel {
         &self.cfg
     }
 
+    /// The learned temporal encoding (when `enable_time`), for diagnostics.
+    pub fn time_encoding(&self) -> Option<&TimeEncoding> {
+        self.time_enc.as_ref()
+    }
+
     /// Predict deformations for canonical positions `xyz` (`[N, 3]`, world
-    /// mm) at a scalar `phase` (`[N, 1]`).
-    pub fn forward(&self, xyz: Tensor<2>, phase: Tensor<2>) -> Deforms {
+    /// mm) at a scalar `phase` (`[N, 1]`) and (optionally) real `time`
+    /// (`[N, 1]`, seconds).
+    pub fn forward(&self, xyz: Tensor<2>, phase: Tensor<2>, time: Tensor<2>) -> Deforms {
         // Normalize world mm coords to [0, 1] for the hash grid.
         let xyz_norm = (xyz.clone() / self.cfg.coord_scale + 1.0) * 0.5;
 
         let x_emb = self.hash_grid.forward(xyz_norm); // [N, emb_x]
         let t_emb = self.phase_enc.forward(phase); // [N, emb_t]
 
-        let h = self.combine_mlp.forward(Tensor::cat(vec![x_emb, t_emb], 1)); // [N, W]
+        let mut inputs = vec![x_emb, t_emb];
+        if let Some(enc) = &self.time_enc {
+            inputs.push(enc.forward(time));
+        }
+        let h = self.combine_mlp.forward(Tensor::cat(inputs, 1)); // [N, W]
 
         let d_xyz = self.xyz_warp.forward(h.clone());
         let d_scaling = match &self.scaling_warp {
@@ -250,7 +281,9 @@ mod tests {
         let xyz = Tensor::<2>::from_data(TensorData::new(vec![0.1f32; n * 3], [n, 3]), &device);
         let phase =
             Tensor::<2>::from_data(TensorData::new(vec![0.5f32; n], [n, 1]), &device);
-        let deforms = model.forward(xyz, phase);
+        let time =
+            Tensor::<2>::from_data(TensorData::new(vec![1.1f32; n], [n, 1]), &device);
+        let deforms = model.forward(xyz, phase, time);
 
         assert_eq!(deforms.d_xyz.dims(), [n, 3]);
         assert_eq!(deforms.d_scaling.dims(), [n, 3]);
@@ -313,7 +346,9 @@ mod tests {
         let xyz = Tensor::<2>::from_data(TensorData::new(vec![0.1f32; n * 3], [n, 3]), &device);
         let phase =
             Tensor::<2>::from_data(TensorData::new(vec![0.5f32; n], [n, 1]), &device);
-        let deforms = model.forward(xyz, phase);
+        let time =
+            Tensor::<2>::from_data(TensorData::new(vec![1.1f32; n], [n, 1]), &device);
+        let deforms = model.forward(xyz, phase, time);
         let ds = deforms
             .d_scaling
             .into_data_async()
@@ -338,7 +373,9 @@ mod tests {
             .require_grad();
         let phase =
             Tensor::<2>::from_data(TensorData::new(vec![0.5f32; n], [n, 1]), &device);
-        let deforms = model.forward(xyz.clone(), phase);
+        let time =
+            Tensor::<2>::from_data(TensorData::new(vec![3.0f32; n], [n, 1]), &device);
+        let deforms = model.forward(xyz.clone(), phase, time);
 
         let loss = deforms.d_xyz.sum() + deforms.d_scaling.sum() + deforms.d_rotation.sum();
         let grads = loss.backward();
