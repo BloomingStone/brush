@@ -40,6 +40,7 @@ tokio-stream.workspace = true
 brush-async.path = "../brush-async"
 
 brush-train = { path = "../brush-train" }
+brush-loss = { path = "../brush-loss" }
 brush-dataset = { path = "../brush-dataset"}
 brush-deform = { path = "../brush-deform" }
 brush-rerun = { path = "../brush-rerun" }

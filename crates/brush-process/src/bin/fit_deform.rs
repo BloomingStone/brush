@@ -218,6 +218,10 @@ async fn main() -> anyhow::Result<()> {
     let mut proj_weight = 1.0f32;
     // proj 域 SSIM 权重 (0 = 关闭, proj 损失保持纯 L1)。
     let mut proj_ssim_weight = 0.0f32;
+    // 像素级损失类型: l1 | charbonnier | huber | l2 (X-ray 噪声多, robust 更稳)。
+    let mut loss_type = brush_loss::gray::GrayLossType::L1;
+    let mut loss_eps = 1e-3f32; // Charbonnier ε
+    let mut loss_delta = 0.1f32; // Huber δ
     // 使用 cosine LR (默认指数衰减)。
     let mut cosine_lr = false;
     // clone/split 分界阈值系数 (默认 0.0005)。
@@ -326,6 +330,18 @@ async fn main() -> anyhow::Result<()> {
             proj_weight = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--proj-ssim-weight=") {
             proj_ssim_weight = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--loss=") {
+            loss_type = match v {
+                "l1" => brush_loss::gray::GrayLossType::L1,
+                "charbonnier" => brush_loss::gray::GrayLossType::Charbonnier,
+                "huber" => brush_loss::gray::GrayLossType::Huber,
+                "l2" => brush_loss::gray::GrayLossType::L2,
+                _ => anyhow::bail!("invalid --loss '{v}' (l1|charbonnier|huber|l2)"),
+            };
+        } else if let Some(v) = a.strip_prefix("--loss-eps=") {
+            loss_eps = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--loss-delta=") {
+            loss_delta = v.parse()?;
         } else if a == "--cosine-lr" {
             cosine_lr = true;
         } else if let Some(v) = a.strip_prefix("--percent-dense=") {
@@ -531,6 +547,9 @@ async fn main() -> anyhow::Result<()> {
     cfg.lr_deform_end = lr_deform_end;
     cfg.proj_weight = proj_weight;
     cfg.proj_ssim_weight = proj_ssim_weight;
+    cfg.loss_type = loss_type;
+    cfg.loss_eps = loss_eps;
+    cfg.loss_delta = loss_delta;
     cfg.cosine_lr = cosine_lr;
     cfg.multiscale_weight = multiscale_weight;
     cfg.window_weight = window_weight;

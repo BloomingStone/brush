@@ -19,7 +19,7 @@ use brush_deform::{
     DeformModel, DeformModelConfig, Deforms, HexPlaneDeformConfig, HexPlaneDeformModel,
     TimeEncodingConfig, deform_splats,
 };
-use brush_loss::gray::{GrayLossConfig, gray_loss};
+use brush_loss::gray::{GrayLossConfig, GrayLossType, gray_loss};
 use brush_render::burn_glue::detach_autodiff;
 use brush_xray::XRaySplats;
 use brush_xray_bwd::{lift_xray_splats_to_autodiff, render_xray};
@@ -116,6 +116,13 @@ pub struct XRayTrainConfig {
     /// L1 / SSIM weights for the gray loss.
     pub l1_weight: f32,
     pub ssim_weight: f32,
+    /// Pixel-wise penalty for the gray (and proj) loss — L1 / Charbonnier /
+    /// Huber / L2. Robust penalties tolerate X-ray noise better than L1.
+    pub loss_type: GrayLossType,
+    /// Charbonnier `ε` (smoothing floor), default 1e-3.
+    pub loss_eps: f32,
+    /// Huber threshold `δ`, default 0.1.
+    pub loss_delta: f32,
     /// Weight of the optional **projection-domain** L1 loss: compares
     /// `proj = -ln(intensity)` (the raw attenuation path integral) instead of
     /// the Beer-Lambert-compressed intensity. 0 disables it. Default 1.0
@@ -161,6 +168,9 @@ impl Default for XRayTrainConfig {
             init_density: brush_cube::MU_WATER,
             l1_weight: 1.0,
             ssim_weight: 1.0,
+            loss_type: GrayLossType::L1,
+            loss_eps: 1e-3,
+            loss_delta: 0.1,
             // Proj 域损失为默认开启 (w=1.0): 2026-08-17 实验 RXA_chest
             // 34.82dB vs 33.75 (+1.07), LPIPS 0.574 vs 0.594。
             proj_weight: 1.0,
@@ -521,6 +531,9 @@ impl XRayTrainer {
         let loss_cfg = GrayLossConfig {
             l1_weight: self.config.l1_weight,
             ssim_weight: self.config.ssim_weight,
+            loss_type: self.config.loss_type,
+            charbonnier_eps: self.config.loss_eps,
+            huber_delta: self.config.loss_delta,
         };
         let mut loss = gray_loss(intensity.clone(), gt.clone(), &loss_cfg);
         // Proj 域损失: 在 `proj = -ln(intensity)`（Beer-Lambert 衰减积分）域比较,
@@ -529,12 +542,15 @@ impl XRayTrainer {
             let proj_pred = out.img.clone().clamp(1e-3, 14.0); // = -ln(intensity)
             let proj_gt = gt.clone().clamp(1e-4, 1.0).log().neg(); // = -ln(gt)
             if self.config.proj_weight > 0.0 {
-                loss = loss.add(
-                    (proj_pred.clone() - proj_gt.clone())
-                        .abs()
-                        .mean()
-                        .mul_scalar(self.config.proj_weight),
-                );
+                // 同样使用配置的 robust 惩罚 (L1/Charbonnier/Huber/L2)。
+                let proj_loss = if self.config.loss_type == GrayLossType::L1 {
+                    (proj_pred.clone() - proj_gt.clone()).abs().mean()
+                } else {
+                    let mut proj_cfg = loss_cfg;
+                    proj_cfg.ssim_weight = 0.0;
+                    gray_loss(proj_pred.clone(), proj_gt.clone(), &proj_cfg)
+                };
+                loss = loss.add(proj_loss.mul_scalar(self.config.proj_weight));
             }
             if self.config.proj_ssim_weight > 0.0 {
                 // Proj 域 SSIM: 结构感知项 (L1 只敏感绝对差)。值域非 [0,1],

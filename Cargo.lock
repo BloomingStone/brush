@@ -1096,6 +1096,7 @@ dependencies = [
  "brush-cube",
  "brush-dataset",
  "brush-deform",
+ "brush-loss",
  "brush-render",
  "brush-render-bwd",
  "brush-rerun",
