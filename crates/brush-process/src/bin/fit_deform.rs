@@ -163,14 +163,18 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut dcm: Option<PathBuf> = None;
     let mut iters = 10_000u32;
-    // 初始化点数: 15k 起步 (原 30k), 配合更慢的 densify 控制总 splat 数,
-    // 避免中后期 splat 爆炸拖慢每步 (渲染 + deform 都是 per-splat 成本)。
-    let mut points = 15_000u32;
+    // 初始化点数: 5000 (2026-08-21 扫描最优: 比 30000 少, PSNR 反而更高
+    // 41.12 vs 40.63, 且快 ~1.5×)。densify 会按梯度阈值补足, 初始种子少
+    // → 空气区噪声少、放置更高效。
+    let mut points = 5_000u32;
     // None → 从相机几何自动计算(等中心 FOV 半径), 保证点云覆盖整个视野。
     let mut scene_extent: Option<f32> = None;
     // 自动 gamma: 让全局强度中位数映射到该目标灰度(0.5 = 中灰)。
     let mut gamma_target: Option<f32> = Some(0.5);
-    let mut init_density = 0.02f32;
+    // 初始密度 = 0.01 mm⁻¹ (5×水): 2026-08-21 扫描 points=5000 下甜点
+    // (PSNR 41.32)。之前 0.02 (10×水) 让初始球成高密度雾, 空气 splat 密度
+    // 饱和永不衰减 → pruned≈0; 降到 0.01 后空气点可衰减并被密度裁剪。
+    let mut init_density = 0.01f32;
     let mut lr_mean = 2e-5f64;
     // 末期不冻结: 默认 2e-6 (cosine min / 指数末段)。
     let mut lr_mean_end = 2e-6f64;
@@ -193,15 +197,17 @@ async fn main() -> anyhow::Result<()> {
     let mut hex_mlp_layers = 2usize;
     // 保质量形变 (默认): 不预测 d_scaling, 局部密度变化由位移/旋转产生。
     let mut predict_scaling = false;
-    // 可学习时间条件化 (默认关): 形变网络用可学习傅里叶频率拟合呼吸等
-    // 非周期运动 (无需预知呼吸频率), 与心脏 phase 圆环轴互补。
-    let mut enable_time = false;
-    // 时间编码参数: 频率个数 / 初始化范围 (Hz, 对数间隔)。
+    // 可学习时间条件化 (默认开): 形变网络用可学习傅里叶频率拟合呼吸等
+    // 非周期运动 (无需预知呼吸频率), 与心脏 phase 圆环轴互补。呼吸明显
+    // 数据 +4~5dB, 呼吸弱数据中性 (+0.04dB), 无害。
+    let mut enable_time = true;
+    // 时间编码参数: 频率个数 / 初始化范围 (Hz, 对数间隔)。紧生理带
+    // [0.2,1.5] 最优 (2026-08-20 扫描: 39.22 vs 默认 38.90)。
     let mut time_freqs = 10usize;
-    let mut time_min_freq = 0.15f32;
-    let mut time_max_freq = 3.0f32;
-    // 每次 refine 只 densify 15% 的过阈值 splat (原 25%) → 增长速度放缓。
-    let mut growth_frac = 0.15f32;
+    let mut time_min_freq = 0.2f32;
+    let mut time_max_freq = 1.5f32;
+    // 每次 refine 只 densify 25% 的过阈值 splat → 平衡增长与速度。
+    let mut growth_frac = 0.25f32;
     let mut refine_every = 400u32;
     // 硬性 splat 数上限: 到顶后只 prune 不再增 (原 1M, 10k 步中期就可能顶到)。
     let mut max_splats = 300_000u32;
@@ -210,16 +216,18 @@ async fn main() -> anyhow::Result<()> {
     // `--eval-views=M` 每次 eval 采 M 个验证视图(均匀)。
     let mut eval_split_every: Option<usize> = None;
     let mut eval_views_count = 8usize;
-    // 固定 densify 梯度阈值(替代动态百分位); None = 用 densify_grad_percentile。
-    let mut fixed_grad_thr: Option<f32> = None;
+    // 固定 densify 梯度阈值 (默认 1e-5 = 2026-08-21 扫描甜点, ~73k splats,
+    // PSNR ≈600k 的 43.17 但快 ~4x); None = 动态百分位 (0.98pct 仅 ~16k)。
+    let mut fixed_grad_thr: Option<f32> = Some(1e-5);
     // 启用 oversized 高梯度点拆分(clone-only → clone+split, 参考 RGB refine_splats)。
     let mut enable_split = false;
     // proj 域损失权重 (在 -ln(intensity) 域比较; 默认 1.0 已作为最优默认)。
     let mut proj_weight = 1.0f32;
     // proj 域 SSIM 权重 (0 = 关闭, proj 损失保持纯 L1)。
     let mut proj_ssim_weight = 0.0f32;
-    // 像素级损失类型: l1 | charbonnier | huber | l2 (X-ray 噪声多, robust 更稳)。
-    let mut loss_type = brush_loss::gray::GrayLossType::L1;
+    // 像素级损失类型: l1 | charbonnier | huber | l2。Charbonnier 最优
+    // (2026-08-21: PSNR +0.20dB, LPIPS -0.007 vs L1), X-ray 噪声更稳。
+    let mut loss_type = brush_loss::gray::GrayLossType::Charbonnier;
     let mut loss_eps = 1e-3f32; // Charbonnier ε
     let mut loss_delta = 0.1f32; // Huber δ
     // 使用 cosine LR (默认指数衰减)。
@@ -234,6 +242,12 @@ async fn main() -> anyhow::Result<()> {
     let mut cull_density: Option<f32> = None;
     // screen-size prune 阈值 (px, 0 = 关闭)。
     let mut max_screen_size: Option<f32> = None;
+    // 贡献裁剪 (默认关): 剪掉 density×屏幕面积×可见性 都低且处于最低百分位
+    // 的 splat (微小/永不可见废点, 密度裁剪剪不掉)。
+    let mut cull_contribution = false;
+    let mut cull_percentile = 0.05f32;
+    let mut cull_floor = 1e-3f32;
+    let mut min_splats = 0u32;
     // 多尺度(金字塔)损失权重 (默认 0.5, 最强项)。
     let mut multiscale_weight = 0.5f32;
     // 多窗宽窗位损失权重 (默认 0.5, LPIPS 感知增强)。
@@ -354,6 +368,16 @@ async fn main() -> anyhow::Result<()> {
             cull_density = Some(v.parse()?);
         } else if let Some(v) = a.strip_prefix("--max-screen-size=") {
             max_screen_size = Some(v.parse()?);
+        } else if a == "--cull-contribution" {
+            cull_contribution = true;
+        } else if a == "--no-cull-contribution" {
+            cull_contribution = false;
+        } else if let Some(v) = a.strip_prefix("--cull-percentile=") {
+            cull_percentile = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--cull-floor=") {
+            cull_floor = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--min-splats=") {
+            min_splats = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--multiscale-weight=") {
             multiscale_weight = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--window-weight=") {
@@ -564,11 +588,15 @@ async fn main() -> anyhow::Result<()> {
         percent_dense: percent_dense.unwrap_or(0.0003),
         split_scale_factor: split_scale.unwrap_or(std::f32::consts::FRAC_1_SQRT_2),
         max_bound_factor: bound_factor.unwrap_or(3.0),
-        // prune 阈值从 5e-5 (2.5% 水密度) 提高到 2e-4 (10% 水密度):
-        // 更激进地清掉衰减到接近零的 splat, 净增长更慢。
-        cull_density_threshold: cull_density.unwrap_or(2e-4),
+        // prune 阈值 5e-4 (25% 水密度): 2026-08-21 高阈值扫描 LPIPS 最优
+        // (0.4658 vs 2e-4 的 0.4719), PSNR 持平, 且剪掉更多空气废点。
+        cull_density_threshold: cull_density.unwrap_or(5e-4),
         max_splats,
         max_screen_size: max_screen_size.unwrap_or(0.0),
+        cull_contribution,
+        cull_contribution_percentile: cull_percentile,
+        cull_contribution_floor: cull_floor,
+        min_splats,
         ..XRayRefineConfig::default()
     };
     // FOV 过滤初始化: 只保留至少在一个视角内投影的点, 消除 FOV 外的高

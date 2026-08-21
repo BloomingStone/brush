@@ -80,6 +80,21 @@ pub struct XRayRefineConfig {
     pub max_screen_size: f32,
     /// Fraction of above-threshold splats actually densified per refine.
     pub growth_select_fraction: f32,
+    /// **Contribution culling**: prune splats whose contribution
+    /// (`density × max-screen-radius² × visible`) is below
+    /// `cull_contribution_floor` **and** in the bottom
+    /// `cull_contribution_percentile` each refine. Removes tiny / never-visible
+    /// splats that the density prune can't (their density is saturated).
+    pub cull_contribution: bool,
+    /// Bottom fraction of contribution-scores eligible for culling (bounds the
+    /// cull count, e.g. 0.05 → at most 5% per refine).
+    pub cull_contribution_percentile: f32,
+    /// Absolute contribution floor: only splats with
+    /// `score < floor` are eligible (protects faint but real detail).
+    pub cull_contribution_floor: f32,
+    /// Never cull below this many splats (0 = no hard floor; the percentile
+    /// already bounds the cull count).
+    pub min_splats: u32,
     /// Split oversized high-gradient splats (`max_scale > scene_extent *
     /// percent_dense`) in two instead of only cloning them. Disabled keeps
     /// the historical clone-only behavior.
@@ -119,6 +134,10 @@ impl Default for XRayRefineConfig {
             max_bound_factor: 3.0,
             max_screen_size: 0.0,
             growth_select_fraction: 0.25,
+            cull_contribution: false,
+            cull_contribution_percentile: 0.05,
+            cull_contribution_floor: 1e-3,
+            min_splats: 0,
             enable_split: false,
             split_scale_factor: std::f32::consts::FRAC_1_SQRT_2,
             seed: 0,
@@ -209,8 +228,7 @@ impl XRayRefiner {
     }
 
     /// Fixed or dynamic (recent-5 max percentile) grad threshold.
-    async fn compute_threshold(&mut self, grads: &Tensor<1>) -> Option<f32> {
-        if let Some(t) = self.config.fixed_grad_threshold {
+    async fn compute_threshold(&mut self, grads: &Tensor<1>) -> Option<f32> {        if let Some(t) = self.config.fixed_grad_threshold {
             return Some(t);
         }
         let values = grads
@@ -241,6 +259,27 @@ impl XRayRefiner {
         Some(threshold)
     }
 
+    /// Value at `cull_contribution_percentile` of the contribution scores
+    /// (GPU→CPU readback, once per refine like the grad threshold).
+    async fn contribution_percentile(&self, score: &Tensor<1>) -> f32 {
+        let values = score
+            .clone()
+            .into_data_async()
+            .await
+            .expect("read contribution scores")
+            .into_vec::<f32>()
+            .expect("contribution f32");
+        let mut finite: Vec<f32> = values.into_iter().filter(|v| v.is_finite()).collect();
+        if finite.is_empty() {
+            return f32::NEG_INFINITY;
+        }
+        finite.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let n = finite.len();
+        let p = self.config.cull_contribution_percentile.clamp(0.0, 1.0);
+        let idx = (p * (n - 1) as f32).round() as usize;
+        finite[idx.min(n - 1)]
+    }
+
     /// Densify + prune one step. `iter` is the current training step.
     pub async fn refine(
         &mut self,
@@ -248,7 +287,6 @@ impl XRayRefiner {
         mut splats: XRaySplats,
     ) -> (XRaySplats, XRayRefineUpdate, XRayRefineStats) {
         let device = splats.device();
-
         let progress = iter as f32 / self.config.total_iters.max(1) as f32;
         // Reset 步跳过 densify (对齐参考项目 `%reset>=interval` 规避):
         // reset 与 densify 同时发生时, 刚 densify 的新点会被 reset 立即压帽。
@@ -272,7 +310,7 @@ impl XRayRefiner {
         let raw = splats.raw_opacities.val().clamp(-20.0, 20.0);
         let sig = raw.clone().neg().exp().add_scalar(1.0).recip();
         let density = raw.mul(sig).mul_scalar(MU_WATER);
-        let prune_density = density.lower_elem(self.config.cull_density_threshold);
+        let prune_density = density.clone().lower_elem(self.config.cull_density_threshold);
 
         let transforms_bad = row_non_finite(&splats.transforms.val());
         let opac_bad = row_non_finite(&splats.raw_opacities.val().unsqueeze_dim(1));
@@ -293,6 +331,29 @@ impl XRayRefiner {
                 .clone()
                 .greater_elem(self.config.max_screen_size);
             prune_mask = prune_mask.bool_or(screen_big);
+        }
+        // ---- Contribution culling ----------------------------------------
+        // score = density × max-screen-radius² (never-visible splats have
+        // radius 0 → score 0 → culled). Cull only splats below BOTH the
+        // absolute floor AND the bottom percentile (bounds the count).
+        if self.config.cull_contribution && !reset_step {
+            let r2 = self.max_radii2D.clone().powi_scalar(2);
+            let score = density.clone() * r2;
+            let pct = self.contribution_percentile(&score).await;
+            let thr = pct.min(self.config.cull_contribution_floor);
+            let below = score.lower_elem(thr);
+            let n = splats.num_splats();
+            let cand = below
+                .clone()
+                .int()
+                .sum()
+                .into_scalar_async::<i32>()
+                .await
+                .expect("count contribution candidates") as u32;
+            // Hard floor: never cull below min_splats.
+            if self.config.min_splats == 0 || n.saturating_sub(cand) >= self.config.min_splats {
+                prune_mask = prune_mask.bool_or(below);
+            }
         }
         let num_pruned = prune_mask
             .clone()
