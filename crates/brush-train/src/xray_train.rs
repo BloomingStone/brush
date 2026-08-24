@@ -32,7 +32,7 @@ use burn::{
     },
     module::{AutodiffModule, Module},
     optim::{GradientsParams, Optimizer, adaptor::OptimizerAdaptor},
-    tensor::{Device, IndexingUpdateOp, Tensor, TensorData, s},
+    tensor::{Device, IndexingUpdateOp, Int, Tensor, TensorData, s},
 };
 
 use crate::adam_scaled::{AdamScaled, AdamScaledConfig};
@@ -104,6 +104,24 @@ pub struct XRayTrainConfig {
     /// the network fits the respiratory (and other) temporal frequencies
     /// during training — no breathing-frequency prior needed.
     pub enable_time: bool,
+    /// Time jitter (seconds, Gaussian std) added to the time conditioning
+    /// each step — analogous to AST phase noise. Enforces that the deform
+    /// field is locally smooth in time (nearby frames give nearby motion).
+    /// 0 disables. 2026-08-21: pig data is a continuous-video-like sequence,
+    /// adjacent frames move little; jitter teaches time-invariant smoothness.
+    pub time_jitter: f32,
+    /// Weight of a temporal smoothness (TV) regularizer on the deform field:
+    /// `mean(|d_xyz(phase+dp, time+dt) - d_xyz(phase, time)|^2)` on a random
+    /// subset of splats. Encodes "adjacent frames deform little", helping
+    /// held-out time generalization. 0 disables.
+    pub time_tv_weight: f32,
+    /// Phase delta for the TV regularizer (per-frame cardiac advance).
+    pub time_tv_dp: f32,
+    /// Time delta (s) for the TV regularizer (one frame step). Default
+    /// 0.0125 = 1 frame at 80 fps.
+    pub time_tv_dt: f32,
+    /// Splat count sampled per step for the TV term (keeps it cheap).
+    pub time_tv_sample: usize,
     /// Learnable temporal encoding configuration (used when `enable_time`).
     pub time_enc: TimeEncodingConfig,
     /// Density-control configuration.
@@ -163,6 +181,11 @@ impl Default for XRayTrainConfig {
             hex_plane: HexPlaneDeformConfig::default(),
             predict_scaling: false,
             enable_time: false,
+            time_jitter: 0.0,   // 时间抖动 (秒, 高斯std), 0 = 关
+            time_tv_weight: 0.0, // 时间 TV 正则权重, 0 = 关
+            time_tv_dp: 0.0,    // TV 相位步长 (每帧心搏推进)
+            time_tv_dt: 0.0125, // TV 时间步长 = 1 帧 @80fps
+            time_tv_sample: 1024,
             time_enc: TimeEncodingConfig::default(),
             refine: XRayRefineConfig::default(),
             init_density: brush_cube::MU_WATER,
@@ -481,7 +504,7 @@ impl XRayTrainer {
         let canonical_ad = lift_xray_splats_to_autodiff(self.canonical.clone());
 
         // ---- Phase + deform (static mode skips both) --------------------
-        let deformed = if let Some(deform) = &self.deform {
+        let (deformed, tv_term) = if let Some(deform) = &self.deform {
             let mut phase = batch.phase;
             if self.config.enable_ast && self.step_count >= self.config.warm_up {
                 // Python `get_linear_noise_func`: noise = randn · 1/(step+1) ·
@@ -501,15 +524,44 @@ impl XRayTrainer {
             let n = canonical_ad.num_splats() as usize;
             let phase_t =
                 Tensor::<2>::from_data(TensorData::new(vec![phase; n], [n, 1]), &device_ad);
+            // D: 时间抖动 — 对 time 条件加高斯噪声, 强制形变场时间局部平滑
+            // (类似 AST 相位噪声)。time 单调 = 帧号/fps (连续视频)。
+            let mut time = batch.time;
+            if self.config.time_jitter > 0.0 {
+                time += randn_f32() * self.config.time_jitter;
+            }
             let time_t =
-                Tensor::<2>::from_data(TensorData::new(vec![batch.time; n], [n, 1]), &device_ad);
+                Tensor::<2>::from_data(TensorData::new(vec![time; n], [n, 1]), &device_ad);
             let xyz = canonical_ad.means();
-            let deforms = deform.forward(xyz, phase_t, time_t);
-            deform_splats(&canonical_ad, &deforms)
+            let deforms = deform.forward(xyz.clone(), phase_t, time_t.clone());
+            let deformed = deform_splats(&canonical_ad, &deforms);
+            // A: 时间 TV 正则 — 惩罚 deform 场在 (phase+dp, time+dt) 与
+            // (phase, time) 的位移差 (随机子集), 编码"相邻帧形变小"。
+            // 位置 detach: 只正则化 deform 网络参数, 不扰动 splat 放置。
+            let tv_term = if self.config.time_tv_weight > 0.0 {
+                use rand::seq::IteratorRandom;
+                let sample = self.config.time_tv_sample.min(n);
+                let idx: Vec<u32> = (0..n as u32)
+                    .choose_multiple(&mut rand::rng(), sample);
+                let idx_t = Tensor::<1, Int>::from_data(TensorData::new(idx, [sample]), &device_ad);
+                let xyz_sub = xyz.select(0, idx_t).detach();
+                let phase_next = (phase + self.config.time_tv_dp).clamp(0.0, 1.0);
+                let time_next = time + self.config.time_tv_dt;
+                let p0 = Tensor::<2>::from_data(TensorData::new(vec![phase; sample], [sample, 1]), &device_ad);
+                let t0 = Tensor::<2>::from_data(TensorData::new(vec![time; sample], [sample, 1]), &device_ad);
+                let p1 = Tensor::<2>::from_data(TensorData::new(vec![phase_next; sample], [sample, 1]), &device_ad);
+                let t1 = Tensor::<2>::from_data(TensorData::new(vec![time_next; sample], [sample, 1]), &device_ad);
+                let d0 = deform.forward(xyz_sub.clone(), p0, t0).d_xyz;
+                let d1 = deform.forward(xyz_sub, p1, t1).d_xyz;
+                Some((d1.sub(d0)).powi_scalar(2).mean())
+            } else {
+                None
+            };
+            (deformed, tv_term)
         } else {
             // Static reconstruction: no deform field, render the canonical
             // splats directly (shallow clone — tensors are Arc-backed).
-            canonical_ad.clone()
+            (canonical_ad.clone(), None)
         };
 
         // ---- Render + loss ----------------------------------------------
@@ -536,6 +588,10 @@ impl XRayTrainer {
             huber_delta: self.config.loss_delta,
         };
         let mut loss = gray_loss(intensity.clone(), gt.clone(), &loss_cfg);
+        // 时间 TV 正则项 (deform 块算好, 这里加入总损失)。
+        if let Some(tv) = tv_term {
+            loss = loss.add(tv.mul_scalar(self.config.time_tv_weight));
+        }
         // Proj 域损失: 在 `proj = -ln(intensity)`（Beer-Lambert 衰减积分）域比较,
         // 避开 exp 压缩导致暗部/高 proj 区梯度衰减的问题。
         if self.config.proj_weight > 0.0 || self.config.proj_ssim_weight > 0.0 {

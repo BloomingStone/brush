@@ -206,6 +206,15 @@ async fn main() -> anyhow::Result<()> {
     let mut time_freqs = 10usize;
     let mut time_min_freq = 0.2f32;
     let mut time_max_freq = 1.5f32;
+    // 时间抖动 (秒, 高斯std; 0=关): 对 time 条件加噪, 强制形变场时间局部平滑
+    // (连续视频式序列, 相邻帧形变小)。类似 AST 相位噪声。
+    let mut time_jitter = 0.0f32;
+    // 时间 TV 正则权重 (0=关): 惩罚 deform 在 (phase+dp,time+dt) 与
+    // (phase,time) 的位移差 → 编码"相邻帧形变小", 提升 held-out 泛化。
+    let mut time_tv_weight = 0.0f32;
+    let mut time_tv_dp = 0.0f32;       // 相位步长 (每帧心搏推进)
+    let mut time_tv_dt = 0.0125f32;    // 时间步长 = 1帧 @80fps
+    let mut time_tv_sample = 1024usize; // TV 子集 splat 数
     // 每次 refine 只 densify 25% 的过阈值 splat → 平衡增长与速度。
     let mut growth_frac = 0.25f32;
     let mut refine_every = 400u32;
@@ -324,6 +333,16 @@ async fn main() -> anyhow::Result<()> {
             time_min_freq = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--time-max-freq=") {
             time_max_freq = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--time-jitter=") {
+            time_jitter = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--time-tv-weight=") {
+            time_tv_weight = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--time-tv-dp=") {
+            time_tv_dp = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--time-tv-dt=") {
+            time_tv_dt = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--time-tv-sample=") {
+            time_tv_sample = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--growth-frac=") {
             growth_frac = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--refine-every=") {
@@ -413,7 +432,8 @@ async fn main() -> anyhow::Result<()> {
          [--proj-ssim-weight=S] [--cosine-lr] [--percent-dense=F] \
          [--split-scale=F] [--bound-factor=F] [--cull-density=MU] \
          [--max-screen-size=PX] [--multiscale-weight=W] [--window-weight=W] \
-         [--grad-weight=W] [--density-reset=N] [--eval-every=N] \
+         [--grad-weight=W] [--time-jitter=S] [--time-tv-weight=W] \
+         [--time-tv-dp=S] [--time-tv-dt=S] [--time-tv-sample=N] [--density-reset=N] [--eval-every=N] \
          [--roi=no|N|x0,y0,w,h] [--log-csv=FILE] [--out=DIR]",
     );
 
@@ -538,6 +558,11 @@ async fn main() -> anyhow::Result<()> {
     cfg.deform_backend = deform_backend;
     cfg.predict_scaling = predict_scaling; // 保质量形变 (默认关缩放)
     cfg.enable_time = enable_time; // 可学习时间条件化 (默认关)
+    cfg.time_jitter = time_jitter; // 时间抖动 (连续视频平滑)
+    cfg.time_tv_weight = time_tv_weight; // 时间 TV 正则 (相邻帧形变小)
+    cfg.time_tv_dp = time_tv_dp;
+    cfg.time_tv_dt = time_tv_dt;
+    cfg.time_tv_sample = time_tv_sample;
     cfg.time_enc = brush_deform::TimeEncodingConfig {
         n_freqs: time_freqs,
         min_freq: time_min_freq,

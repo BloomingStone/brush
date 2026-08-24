@@ -46,3 +46,13 @@ systemd-run --user --scope -p CPUWeight=100 -p MemoryMax=12G \
 - `predict_scaling` 默认关(保质量形变: 不预测 d_scaling, 积分吸收守恒)。
 - 减缓 splat 增长: 默认 15k 初始点 / growth_frac 0.15 / percent_dense 0.0003 /
   cull_density 2e-4 / max_splats 300k。
+
+## 评估口径 (2026-08-21 起)
+
+- **LPIPS 是主要指标**(最符合人眼观感; PSNR/SSIM 在边缘处饱和失真,
+  SSIM 早期就 0.999+ 不动)。对比实验看 LPIPS 为主, PSNR/SSIM 为辅。
+- 边缘清晰度辅助指标 (`tools/edge_blur_analysis.py`): `blur_ratio` =
+  pred/GT 梯度幅度比 (<1 越糊), `edge/bg_l1` = 边缘像素误差 vs 背景。
+- 数据诊断: `tools/roi_metric_dist.py`(ROI 分布), `tools/gt_gradmap.py`
+  (GT 梯度/噪声), `tools/data_consistency.py`(帧统计/相位调制), 
+  `tools/edge_blur_map.py`(空间模糊热图)。
