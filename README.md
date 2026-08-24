@@ -46,9 +46,9 @@ flowchart LR
 flowchart TD
     S[随机球 5000 splat<br/>KNN scale + init μ=0.01] --> L[lift to autodiff]
     L --> P[phase + AST 相位噪声<br/>time = 帧号/fps + jitter]
-    P --> HX[HexPlane 形变场<br/>d_xyz / d_rotation / d_opacity]
+    P --> HX[HexPlane 形变场<br/>d_xyz / d_rotation / d_scaling]
     HX --> DEF[deformed splats]
-    DEF --> R[X-ray 渲染 exp(-proj)]
+    DEF --> R["X-ray 渲染 exp(-proj)"]
     R --> LOSS[损失组合]
     LOSS --> BW[backward]
     BW --> OPT[Adam 优化<br/>splat + deform 网络]
@@ -60,7 +60,7 @@ flowchart TD
 ```mermaid
 flowchart LR
     A[DICOM 16-bit 帧<br/>MONOCHROME2] --> B[ROI 裁剪<br/>默认四边各 20px]
-    B --> C[归一化 min-max 或<br/>1-99% percentile → [0,1]]
+    B --> C["归一化 min-max 或<br/>1-99% percentile → [0,1]"]
     C --> D[自动 gamma<br/>中位数→目标灰度 0.5]
     D --> E[共享同一变换<br/>保持帧间相对强度]
 ```
@@ -92,9 +92,9 @@ flowchart LR
     S --> MLP
     SP --> MLP
     F --> MLP
-    MLP["decoder MLP 128x2"] --> O1[d_xyz [N,3]]
-    MLP --> O2[d_rotation (四元数)]
-    MLP --> O3[d_scaling (可选, 默认关)]
+    MLP["decoder MLP 128x2"] --> O1["d_xyz [N,3]"]
+    MLP --> O2[d_rotation 四元数]
+    MLP --> O3["d_scaling 可选 (默认关)"]
 ```
 
 - **编码**（`hex_plane.rs`）：4D 点 `(x,y,z,phase)` 投影到 6 张 2D 特征平面
