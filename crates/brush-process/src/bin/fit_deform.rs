@@ -263,6 +263,17 @@ async fn main() -> anyhow::Result<()> {
     let mut window_weight = 0.5f32;
     // 梯度(Sobel 差分)损失权重 (0 = 关闭)。
     let mut grad_weight = 0.0f32;
+    // 边缘加权梯度损失 ramp: [from,to] 内权重 0→grad_weight (smoothstep)。
+    // 默认 3000 起步、到训练末全权 → 前期 L1/SSIM 主导, 后期集中推边缘。
+    let mut grad_ramp_from = 3_000u32;
+    let mut grad_ramp_to = 0u32; // 0 = total_iters
+    // GT 边缘幅度加权: clamp(|∇gt|/scale, 0, 1); 0 = 纯梯度损失。
+    // 默认 0.03: 高于平坦区噪声底(~0.002) ~10x, 强边缘(p99 0.02-0.05)满权。
+    let mut grad_edge_scale = 0.03f32;
+    // 分阶段双场训练: N 步后开训时间条件呼吸场 (学残差运动), 心电场纯相位。
+    // 0 = 单场训练 (当前行为)。默认冻结心电场 (--no-respi-freeze 改为联合训练)。
+    let mut respi_after = 0u32;
+    let mut respi_freeze = true;
     // 密度软重置间隔 (0 = 关闭; 参考项目用 2000)。
     let mut density_reset_interval = 0u32;
     let mut out = PathBuf::from("target/fit_deform");
@@ -403,6 +414,16 @@ async fn main() -> anyhow::Result<()> {
             window_weight = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--grad-weight=") {
             grad_weight = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--grad-ramp-from=") {
+            grad_ramp_from = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--grad-ramp-to=") {
+            grad_ramp_to = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--grad-edge-scale=") {
+            grad_edge_scale = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--respi-after=") {
+            respi_after = v.parse()?;
+        } else if a == "--no-respi-freeze" {
+            respi_freeze = false;
         } else if let Some(v) = a.strip_prefix("--density-reset=") {
             density_reset_interval = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--log-csv=") {
@@ -432,8 +453,10 @@ async fn main() -> anyhow::Result<()> {
          [--proj-ssim-weight=S] [--cosine-lr] [--percent-dense=F] \
          [--split-scale=F] [--bound-factor=F] [--cull-density=MU] \
          [--max-screen-size=PX] [--multiscale-weight=W] [--window-weight=W] \
-         [--grad-weight=W] [--time-jitter=S] [--time-tv-weight=W] \
-         [--time-tv-dp=S] [--time-tv-dt=S] [--time-tv-sample=N] [--density-reset=N] [--eval-every=N] \
+         [--grad-weight=W] [--grad-ramp-from=N] [--grad-ramp-to=N] \
+         [--grad-edge-scale=S] [--respi-after=N] [--no-respi-freeze] \
+         [--time-jitter=S] [--time-tv-weight=W] [--time-tv-dp=S] \
+         [--time-tv-dt=S] [--time-tv-sample=N] [--density-reset=N] [--eval-every=N] \
          [--roi=no|N|x0,y0,w,h] [--log-csv=FILE] [--out=DIR]",
     );
 
@@ -603,6 +626,16 @@ async fn main() -> anyhow::Result<()> {
     cfg.multiscale_weight = multiscale_weight;
     cfg.window_weight = window_weight;
     cfg.grad_weight = grad_weight;
+    cfg.grad_ramp_from = grad_ramp_from;
+    cfg.grad_ramp_to = grad_ramp_to;
+    cfg.grad_edge_scale = grad_edge_scale;
+    cfg.respi_after = respi_after;
+    cfg.respi_freeze = respi_freeze;
+    cfg.time_jitter = time_jitter;
+    cfg.time_tv_weight = time_tv_weight;
+    cfg.time_tv_dp = time_tv_dp;
+    cfg.time_tv_dt = time_tv_dt;
+    cfg.time_tv_sample = time_tv_sample;
     cfg.refine = XRayRefineConfig {
         refine_every,
         scene_extent,
@@ -645,7 +678,7 @@ async fn main() -> anyhow::Result<()> {
         DeformBackend::HashGrid => "hashgrid".to_owned(),
     };
     println!(
-        "{} init splats: {} (random ball r={}mm, init μ={} mm⁻¹, lr_mean={}->{}, lr_deform={}->{}), deform={} (predict_scaling={}, enable_time={}, time_freqs={}[{}-{}Hz]), refine every {}",
+        "{} init splats: {} (random ball r={}mm, init μ={} mm⁻¹, lr_mean={}->{}, lr_deform={}->{}), deform={} (predict_scaling={}, enable_time={}, time_freqs={}[{}-{}Hz]), refine every {}{}",
         ts(),
         trainer.num_splats(),
         scene_extent,
@@ -660,7 +693,12 @@ async fn main() -> anyhow::Result<()> {
         time_freqs,
         time_min_freq,
         time_max_freq,
-        refine_every
+        refine_every,
+        if respi_after > 0 {
+            format!(", respi staged @ {respi_after} (cardiac phase-only, respi time-only)")
+        } else {
+            String::new()
+        }
     );
 
     let mut dataloader = SceneLoader::new(&dataset.train, 42, &load_config);
@@ -865,6 +903,25 @@ async fn main() -> anyhow::Result<()> {
         };
         println!(
             "{} learned time freqs (Hz): {}",
+            ts(),
+            sorted
+                .iter()
+                .map(|f| format!("{f:.3}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+    // 分阶段模式: 打印呼吸场学习到的频率 (诊断呼吸收敛)。
+    if respi_after > 0
+        && let Some(freqs) = trainer.respi_learned_time_freqs().await
+    {
+        let sorted = {
+            let mut s = freqs.clone();
+            s.sort_by(|a, b| a.total_cmp(b));
+            s
+        };
+        println!(
+            "{} respi learned time freqs (Hz): {}",
             ts(),
             sorted
                 .iter()

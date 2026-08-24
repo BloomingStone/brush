@@ -122,6 +122,19 @@ pub struct XRayTrainConfig {
     pub time_tv_dt: f32,
     /// Splat count sampled per step for the TV term (keeps it cheap).
     pub time_tv_sample: usize,
+    /// Staged two-field training: after this step, the (phase-conditioned)
+    /// cardiac deform field is **frozen** (detached) and a second,
+    /// time-conditioned respiratory field starts training. 0 disables staged
+    /// training (single field, current behaviour). When > 0 the cardiac field
+    /// is built phase-only (`enable_time = false`) so the two fields don't
+    /// couple, letting the respiratory field learn motion the cardiac phase
+    /// can't explain.
+    pub respi_after: u32,
+    /// Freeze the cardiac field once the respiratory field activates
+    /// (`respi_after`)? `false` trains both fields jointly (architecturally
+    /// decoupled — separate networks, phase-only vs time-only — but both keep
+    /// updating). Default `true` (the staged decoupling the field is for).
+    pub respi_freeze: bool,
     /// Learnable temporal encoding configuration (used when `enable_time`).
     pub time_enc: TimeEncodingConfig,
     /// Density-control configuration.
@@ -154,7 +167,17 @@ pub struct XRayTrainConfig {
     pub window_weight: f32,
     /// Weight of an optional gradient (Sobel-style finite-difference) loss
     /// that sharpens edges. 0 disables.
-    pub grad_weight: f32,    /// Use cosine-annealing for the mean LR (reference-project style) instead
+    pub grad_weight: f32,
+    /// Edge-weighted gradient loss ramp start step. Before this step the
+    /// gradient term is 0 (L1/SSIM dominate the early/coarse phase), then its
+    /// weight ramps (smoothstep) to `grad_weight` over
+    /// `[grad_ramp_from, grad_ramp_to]`.
+    pub grad_ramp_from: u32,
+    /// Ramp end step (full `grad_weight`). 0 = `total_iters`.
+    pub grad_ramp_to: u32,
+    /// Per-pixel weight `clamp(|∇gt| / scale, 0, 1)` so the gradient loss
+    /// concentrates on strong GT edges. 0 = plain (unweighted) gradient loss.
+    pub grad_edge_scale: f32,    /// Use cosine-annealing for the mean LR (reference-project style) instead
     /// of exponential decay.
     pub cosine_lr: bool,
     /// Weight of an optional multi-scale (pyramid) loss: the gray L1+SSIM loss
@@ -186,6 +209,8 @@ impl Default for XRayTrainConfig {
             time_tv_dp: 0.0,    // TV 相位步长 (每帧心搏推进)
             time_tv_dt: 0.0125, // TV 时间步长 = 1 帧 @80fps
             time_tv_sample: 1024,
+            respi_after: 0, // 0 = 单场训练 (当前行为); >0 = 分阶段双场
+            respi_freeze: true,
             time_enc: TimeEncodingConfig::default(),
             refine: XRayRefineConfig::default(),
             init_density: brush_cube::MU_WATER,
@@ -201,6 +226,9 @@ impl Default for XRayTrainConfig {
             // 多窗宽窗位损失默认开启 (w=0.5): LPIPS 0.5455 (vs 0.5570), 结构感知增强。
             window_weight: 0.5,
             grad_weight: 0.0,
+            grad_ramp_from: 3_000,
+            grad_ramp_to: 0, // 0 = total_iters
+            grad_edge_scale: 0.03,
             cosine_lr: false,
             // 多尺度金字塔损失默认开启 (w=0.5): 2026-08-17 最强项 34.13dB/LPIPS 0.529。
             multiscale_weight: 0.5,
@@ -256,9 +284,13 @@ pub struct XRayTrainer {
     config: XRayTrainConfig,
     canonical: XRaySplats,
     deform: Option<DeformNetwork>,
+    /// Stage-2 respiratory field (time-conditioned, hash-grid). `None` unless
+    /// `config.respi_after > 0`.
+    respi: Option<DeformNetwork>,
     refiner: XRayRefiner,
     optim_splats: Option<OptimType>,
     optim_deform: Option<DeformOptimType>,
+    optim_respi: Option<DeformOptimType>,
     sched_mean: ComposedLrScheduler,
     step_count: u32,
     /// Read back the predicted intensity image every step (for visualization).
@@ -281,6 +313,7 @@ impl XRayTrainer {
         config: XRayTrainConfig,
         canonical: XRaySplats,
         deform: Option<DeformNetwork>,
+        respi: Option<DeformNetwork>,
         device: &Device,
     ) -> Self {
         let mut refine_cfg = config.refine.clone();
@@ -318,9 +351,11 @@ impl XRayTrainer {
         Self {
             canonical,
             deform,
+            respi,
             refiner,
             optim_splats: None,
             optim_deform: None,
+            optim_respi: None,
             sched_mean,
             config,
             step_count: 0,
@@ -368,6 +403,19 @@ impl XRayTrainer {
     /// when time conditioning is enabled. `None` otherwise / on read failure.
     pub async fn learned_time_freqs(&self) -> Option<Vec<f32>> {
         let enc = match &self.deform {
+            Some(DeformNetwork::HexPlane(m)) => m.time_encoding()?,
+            Some(DeformNetwork::HashGrid(m)) => m.time_encoding()?,
+            None => return None,
+        };
+        let f = enc.frequencies();
+        Some(f.into_data_async().await.ok()?.to_vec::<f32>().ok()?)
+    }
+
+    /// Read back the learned temporal frequencies (Hz) of the stage-2
+    /// respiratory field (hash-grid + time encoding), when staged training is
+    /// active. `None` otherwise.
+    pub async fn respi_learned_time_freqs(&self) -> Option<Vec<f32>> {
+        let enc = match &self.respi {
             Some(DeformNetwork::HexPlane(m)) => m.time_encoding()?,
             Some(DeformNetwork::HashGrid(m)) => m.time_encoding()?,
             None => return None,
@@ -533,7 +581,26 @@ impl XRayTrainer {
             let time_t =
                 Tensor::<2>::from_data(TensorData::new(vec![time; n], [n, 1]), &device_ad);
             let xyz = canonical_ad.means();
-            let deforms = deform.forward(xyz.clone(), phase_t, time_t.clone());
+            // 分阶段双场形变:
+            // - 阶段1 (step < respi_after): 仅心电场 (相位条件), 呼吸场不用不训。
+            // - 阶段2 (step >= respi_after): 心电场冻结 (detach), 呼吸场开训。
+            let respi_active = self.config.respi_after > 0
+                && self.step_count >= self.config.respi_after
+                && self.respi.is_some();
+            let mut deforms = deform.forward(xyz.clone(), phase_t, time_t.clone());
+            if respi_active {
+                let respi = self.respi.as_ref().expect("respi active requires field");
+                // 呼吸场纯时间条件: phase 输入置 0 (不与其耦合)。零头初始化 →
+                // identity 起步, 不注入随机位移。
+                let phase0 =
+                    Tensor::<2>::from_data(TensorData::new(vec![0.0f32; n], [n, 1]), &device_ad);
+                let r = respi.forward(xyz.clone(), phase0, time_t.clone());
+                deforms = if self.config.respi_freeze {
+                    deforms.detach().compose(&r)
+                } else {
+                    deforms.compose(&r)
+                };
+            }
             let deformed = deform_splats(&canonical_ad, &deforms);
             // A: 时间 TV 正则 — 惩罚 deform 场在 (phase+dp, time+dt) 与
             // (phase, time) 的位移差 (随机子集), 编码"相邻帧形变小"。
@@ -651,13 +718,40 @@ impl XRayTrainer {
             }
         }
         // 梯度(Sobel 差分)损失: 增强边缘结构。
+        // 后期 ramp: 权重从 0 平滑升到 grad_weight (3000 步前 L1/SSIM 主导),
+        // 且按 GT 边缘幅度加权 → 集中推强边缘 (高频细节), 直击后期边缘模糊。
         if self.config.grad_weight > 0.0 {
+            let ramp_to = if self.config.grad_ramp_to == 0 {
+                self.config.total_iters
+            } else {
+                self.config.grad_ramp_to
+            };
+            let ramp = if self.step_count <= self.config.grad_ramp_from {
+                0.0f32
+            } else {
+                let span = ramp_to.saturating_sub(self.config.grad_ramp_from).max(1) as f32;
+                let u = ((self.step_count - self.config.grad_ramp_from) as f32 / span).clamp(0.0, 1.0);
+                u * u * (3.0 - 2.0 * u) // smoothstep: 平滑进入后期强化
+            };
             let pgx = intensity.clone().slice(s![.., 1..]) - intensity.clone().slice(s![.., ..-1]);
             let pgy = intensity.clone().slice(s![1.., ..]) - intensity.clone().slice(s![..-1, ..]);
             let ggx = gt.clone().slice(s![.., 1..]) - gt.clone().slice(s![.., ..-1]);
             let ggy = gt.clone().slice(s![1.., ..]) - gt.clone().slice(s![..-1, ..]);
-            let gl = (pgx - ggx).abs().mean().add((pgy - ggy).abs().mean());
-            loss = loss.add(gl.mul_scalar(self.config.grad_weight));
+            // gx 形状 [h, w-1], gy 形状 [h-1, w] → 对齐到公共内部 [h-1, w-1]。
+            let pgx = pgx.slice(s![..-1, ..]);
+            let pgy = pgy.slice(s![.., ..-1]);
+            let ggx = ggx.slice(s![..-1, ..]);
+            let ggy = ggy.slice(s![.., ..-1]);
+            let grad_diff = (pgx.clone() - ggx.clone()).abs().add((pgy.clone() - ggy.clone()).abs());
+            let gl = if self.config.grad_edge_scale > 0.0 {
+                // GT 边缘幅度加权: 强边缘像素权重更高, 弱/平坦区权重低。
+                let emag = ggx.powf_scalar(2.0).add(ggy.powf_scalar(2.0)).sqrt();
+                let w = emag.div_scalar(self.config.grad_edge_scale).clamp(0.0, 1.0);
+                grad_diff.mul(w).mean()
+            } else {
+                grad_diff.mean()
+            };
+            loss = loss.add(gl.mul_scalar(self.config.grad_weight * ramp));
         }
         let loss_inner = loss.clone().inner();
         let mut grads = loss.backward();
@@ -827,9 +921,25 @@ impl XRayTrainer {
                 (self.step_count as f64 / self.config.total_iters.max(1) as f64).clamp(0.0, 1.0);
             let lr_deform = self.config.lr_deform * (1.0 - deform_progress)
                 + self.config.lr_deform_end * deform_progress;
-            let deform_grads = GradientsParams::from_grads(grads, deform);
+            let deform_grads = GradientsParams::from_module(&mut grads, deform);
             let deform_updated = deform_optim.step(lr_deform, deform.clone(), deform_grads);
             self.deform = Some(deform_updated);
+        }
+        // 阶段2: 呼吸场 optimizer (阶段1 其无梯度, 不步进)。
+        if let Some(respi) = &self.respi {
+            if self.config.respi_after > 0 && self.step_count >= self.config.respi_after {
+                let respi_optim = self.optim_respi.get_or_insert_with(|| {
+                    burn::optim::AdamConfig::new().init()
+                });
+                let deform_progress = (self.step_count as f64
+                    / self.config.total_iters.max(1) as f64)
+                    .clamp(0.0, 1.0);
+                let lr_deform = self.config.lr_deform * (1.0 - deform_progress)
+                    + self.config.lr_deform_end * deform_progress;
+                let respi_grads = GradientsParams::from_module(&mut grads, respi);
+                let respi_updated = respi_optim.step(lr_deform, respi.clone(), respi_grads);
+                self.respi = Some(respi_updated);
+            }
         }
 
         // ---- Strip canonical back to inner backend ----------------------
@@ -980,6 +1090,11 @@ pub fn create_xray_trainer(
     device: &Device,
     fov: Option<(&[brush_render::camera::Camera], glam::UVec2)>,
 ) -> XRayTrainer {
+    let mut config = config;
+    // 分阶段双场模式: 心电场必须纯相位 (关 time), 避免两场耦合。
+    if config.respi_after > 0 {
+        config.enable_time = false;
+    }
     let mut rng = rand::rngs::StdRng::seed_from_u64(config.refine.seed);
     use rand::{RngExt, SeedableRng};
 
@@ -1119,7 +1234,24 @@ pub fn create_xray_trainer(
     };
 
     // Push the scene extent into the density controller (scale cap).
-    let mut config = config;
     config.refine.scene_extent = scene_extent;
-    XRayTrainer::new(config, canonical, deform, device)
+
+    // 分阶段双场模式: 另建时间条件呼吸场 (融合 HexPlane + 时间 Fourier 基,
+    // phase 输入恒定 0 → 时间条件化走 time_enc)。输出头零初始化 →
+    // identity 起步, 切换时不注入随机位移噪声。
+    let respi = if config.respi_after > 0 && config.enable_deform {
+        let device_ad = device.clone().autodiff();
+        let mut rcfg = config.hex_plane.clone();
+        rcfg.hex_plane.coord_scale = scene_extent.max(1.0);
+        rcfg.predict_scaling = false;
+        rcfg.enable_time = true;
+        rcfg.time_enc = config.time_enc.clone();
+        Some(DeformNetwork::HexPlane(
+            HexPlaneDeformModel::new(rcfg, &device_ad).zero_warp_heads(),
+        ))
+    } else {
+        None
+    };
+
+    XRayTrainer::new(config, canonical, deform, respi, device)
 }

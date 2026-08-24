@@ -106,6 +106,30 @@ impl HexPlaneDeformModel {
         &self.cfg
     }
 
+    /// Zero the deformation output heads (`d_xyz`, `d_rotation`, `d_scaling`)
+    /// so the field starts as the **identity** (zero displacement). Used for
+    /// the stage-2 respiratory field: it begins with no effect and learns the
+    /// residual motion from there — no random-motion noise injected at switch.
+    pub fn zero_warp_heads(mut self) -> Self {
+        let zero_w = |p: burn::module::Param<Tensor<2>>| p.map(|t| t.mul_scalar(0.0));
+        let zero_b = |p: burn::module::Param<Tensor<1>>| p.map(|t| t.mul_scalar(0.0));
+        self.xyz_warp = Linear {
+            weight: zero_w(self.xyz_warp.weight),
+            bias: self.xyz_warp.bias.map(zero_b),
+        };
+        self.axial_warp = Linear {
+            weight: zero_w(self.axial_warp.weight),
+            bias: self.axial_warp.bias.map(zero_b),
+        };
+        if let Some(s) = self.scaling_warp {
+            self.scaling_warp = Some(Linear {
+                weight: zero_w(s.weight),
+                bias: s.bias.map(zero_b),
+            });
+        }
+        self
+    }
+
     /// The learned temporal encoding (when `enable_time`), for diagnostics.
     pub fn time_encoding(&self) -> Option<&TimeEncoding> {
         self.time_enc.as_ref()

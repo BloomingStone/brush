@@ -31,6 +31,31 @@ pub struct Deforms {
     pub d_rotation: Tensor<2>,
 }
 
+impl Deforms {
+    /// Compose two deformation fields: `self` applied first, then `other`
+    /// (`d_xyz = a + b`, `q = a·b`, `(1+s) = (1+sa)(1+sb)`). Used by staged
+    /// training to sum a frozen cardiac field and a learned respiratory field.
+    pub fn compose(&self, other: &Deforms) -> Deforms {
+        let sa = self.d_scaling.clone();
+        let sb = other.d_scaling.clone();
+        Deforms {
+            d_xyz: self.d_xyz.clone() + other.d_xyz.clone(),
+            d_scaling: sa.clone() * sb.clone() + sa + sb,
+            d_rotation: quat_multiply(self.d_rotation.clone(), other.d_rotation.clone()),
+        }
+    }
+
+    /// Detach from autodiff — gradients no longer flow to this field's
+    /// parameters (used to freeze the cardiac field in stage 2).
+    pub fn detach(&self) -> Deforms {
+        Deforms {
+            d_xyz: self.d_xyz.clone().detach(),
+            d_scaling: self.d_scaling.clone().detach(),
+            d_rotation: self.d_rotation.clone().detach(),
+        }
+    }
+}
+
 /// Configuration for [`DeformModel`].
 #[derive(Debug, Clone)]
 pub struct DeformModelConfig {
