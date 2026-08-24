@@ -53,3 +53,6 @@ local.properties
 
 xray_smoke
 dataset_exports
+
+__pycache__/
+*.pyc
