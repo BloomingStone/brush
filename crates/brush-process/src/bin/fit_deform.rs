@@ -896,8 +896,9 @@ async fn main() -> anyhow::Result<()> {
     println!("{} exported {}", ts(), ply_path.display());
 
     // ---- 导出形变场 (诊断) ---------------------------------------------
-    // deform 网络 ckpt (.bin) + 4D 形变场 NIfTI: d_xyz 在 [x,y,z,phase,3]
-    // 网格上采样 (固定 time=0, 沿心动相位变化)。检查形变场是否合理建模运动。
+    // deform 网络 ckpt (.bin) + 每个相位一个 4D 形变场 NIfTI
+    // [nx,ny,nz,3] 向量场 (位移 = 世界坐标 mm), affine 随 nii 保存。
+    // 检查形变场是否合理建模运动 (参考 GS-dev-contrast-flow x_ray_saver.py)。
     if save_deform
         && let Some(deform) = trainer.deform()
     {
@@ -921,55 +922,56 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         let pad = 0.05;
-        let grid = [40usize, 40, 32];
+        let grid = [64usize, 64, 48];
         for d in 0..3 {
             let span = (mx[d] - mn[d]).max(1e-3);
             mn[d] -= span * pad;
             mx[d] += span * pad;
         }
-        // 采样 16 个相位 × 固定 time=0, 每点输出 d_xyz [3]。
-        let n_phase = 16usize;
-        let vol_len = grid[0] * grid[1] * grid[2] * n_phase * 3;
-        let mut vol: Vec<f32> = vec![0.0f32; vol_len];
+        // affine: 由 bbox 构造 (origin=mn, 间距=(mx-mn)/(n-1)), 随 nii 保存。
+        let spacing = [
+            (mx[0] - mn[0]) / (grid[0] - 1) as f32,
+            (mx[1] - mn[1]) / (grid[1] - 1) as f32,
+            (mx[2] - mn[2]) / (grid[2] - 1) as f32,
+        ];
+        // 采样 8 个相位 × 固定 time=0, 每相位单独存 4D [nx,ny,nz,3]。
+        let n_phase = 8usize;
+        let per_xyz = grid[0] * grid[1] * grid[2];
         let deform_dev = trainer.canonical().device().clone();
         let deform_ad = deform_dev.autodiff();
         let time = 0.0f32;
-        for p in 0..n_phase {
-            let phase = p as f32 / n_phase as f32;
-            let mut pts: Vec<f32> = Vec::with_capacity(grid[0] * grid[1] * grid[2] * 3);
-            for iz in 0..grid[2] {
-                let z = mn[2] + (mx[2] - mn[2]) * iz as f32 / (grid[2] - 1) as f32;
-                for iy in 0..grid[1] {
-                    let y = mn[1] + (mx[1] - mn[1]) * iy as f32 / (grid[1] - 1) as f32;
-                    for ix in 0..grid[0] {
-                        let x = mn[0] + (mx[0] - mn[0]) * ix as f32 / (grid[0] - 1) as f32;
-                        pts.extend_from_slice(&[x, y, z]);
-                    }
+        use burn::tensor::Tensor;
+        // 预构建网格点 (固定)。
+        let mut pts: Vec<f32> = Vec::with_capacity(per_xyz * 3);
+        for iz in 0..grid[2] {
+            let z = mn[2] + (mx[2] - mn[2]) * iz as f32 / (grid[2] - 1) as f32;
+            for iy in 0..grid[1] {
+                let y = mn[1] + (mx[1] - mn[1]) * iy as f32 / (grid[1] - 1) as f32;
+                for ix in 0..grid[0] {
+                    let x = mn[0] + (mx[0] - mn[0]) * ix as f32 / (grid[0] - 1) as f32;
+                    pts.extend_from_slice(&[x, y, z]);
                 }
             }
-            let n_pts = pts.len() / 3;
-            let per_xyz = grid[0] * grid[1] * grid[2];
-            use burn::tensor::Tensor;
-            let xyz_t = Tensor::<2>::from_data(TensorData::new(pts, [n_pts, 3]), &deform_ad);
-            let phase_t =
-                Tensor::<2>::from_data(TensorData::new(vec![phase; n_pts], [n_pts, 1]), &deform_ad);
-            let time_t =
-                Tensor::<2>::from_data(TensorData::new(vec![time; n_pts], [n_pts, 1]), &deform_ad);
-            let d = deform.forward(xyz_t, phase_t, time_t).d_xyz;
+        }
+        let n_pts = pts.len() / 3;
+        let xyz_t = Tensor::<2>::from_data(TensorData::new(pts, [n_pts, 3]), &deform_ad);
+        for p in 0..n_phase {
+            let phase = p as f32 / n_phase as f32;
+            let phase_t = Tensor::<2>::from_data(
+                TensorData::new(vec![phase; n_pts], [n_pts, 1]),
+                &deform_ad,
+            );
+            let time_t = Tensor::<2>::from_data(
+                TensorData::new(vec![time; n_pts], [n_pts, 1]),
+                &deform_ad,
+            );
+            let d = deform.forward(xyz_t.clone(), phase_t, time_t).d_xyz;
             let dv: Vec<f32> = d.into_data_async().await?.to_vec()?;
             debug_assert_eq!(dv.len(), per_xyz * 3, "deform field size mismatch");
-            let base = p * per_xyz * 3;
-            for (i, v) in dv.into_iter().enumerate() {
-                let g = i / 3; // 网格点索引
-                let c = i % 3;
-                vol[base + g * 3 + c] = v;
-            }
+            let nii = out.join(format!("deform_field_phase{p:02}.nii"));
+            write_nifti_vec4d(&nii, &dv, grid, spacing, mn)?;
+            println!("{} saved deform field (phase={phase:.3}) -> {}", ts(), nii.display());
         }
-        let nii = out.join("deform_field_phase.nii");
-        write_nifti_5d(&nii, &vol, [grid[0], grid[1], grid[2], n_phase, 3],
-            [(mx[0] - mn[0]) / grid[0] as f32, (mx[1] - mn[1]) / grid[1] as f32, (mx[2] - mn[2]) / grid[2] as f32],
-            mn)?;
-        println!("{} saved deform field -> {}", ts(), nii.display());
     }
 
     // 可学习时间频率诊断: 训练后网络把频率收敛到数据中的真实运动频率
@@ -1016,46 +1018,56 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 写一个 NIfTI-1 (little-endian) 5D float32 卷。`dims = [nx, ny, nz, nt, nc]`
-/// (组件数 nc 放最后一维), `vox` 体素尺寸, `origin` 世界原点。
-fn write_nifti_5d(
+/// 写一个 NIfTI-1 (little-endian) 4D float32 向量场 `[nx, ny, nz, 3]`
+/// (位移分量在最后一维, 世界坐标 mm)。`affine` 由 bbox 构造并随 nii 保存
+/// (qform + sform 均为该仿射)。
+fn write_nifti_vec4d(
     path: &Path,
     data: &[f32],
-    dims: [usize; 5],
-    vox: [f32; 3],
+    grid: [usize; 3],
+    spacing: [f32; 3],
     origin: [f32; 3],
 ) -> anyhow::Result<()> {
-    let [nx, ny, nz, nt, nc] = dims;
-    assert_eq!(data.len(), nx * ny * nz * nt * nc);
+    let [nx, ny, nz] = grid;
+    assert_eq!(data.len(), nx * ny * nz * 3);
     let mut hdr = [0u8; 348];
     hdr[0..4].copy_from_slice(&(348i32).to_le_bytes()); // sizeof_hdr
-    hdr[40..42].copy_from_slice(&(5i16).to_le_bytes()); // dim[0]
-    let dims5 = [nx as i16, ny as i16, nz as i16, nt as i16, nc as i16];
-    for (i, d) in dims5.iter().enumerate() {
-        hdr[42 + i * 2..44 + i * 2].copy_from_slice(&d.to_le_bytes()); // dim[1..5]
+    hdr[40..42].copy_from_slice(&(4i16).to_le_bytes()); // dim[0] = 4
+    let dims = [nx as i16, ny as i16, nz as i16, 3i16];
+    for (i, d) in dims.iter().enumerate() {
+        hdr[42 + i * 2..44 + i * 2].copy_from_slice(&d.to_le_bytes()); // dim[1..4]
     }
     hdr[70..72].copy_from_slice(&(16i16).to_le_bytes()); // datatype = float32
     hdr[72..74].copy_from_slice(&(32i16).to_le_bytes()); // bitpix
     hdr[76..80].copy_from_slice(&1.0f32.to_le_bytes()); // pixdim[0] = qfac 1
-    for (i, v) in vox.iter().enumerate() {
+    for (i, v) in spacing.iter().enumerate() {
         hdr[80 + i * 4..84 + i * 4].copy_from_slice(&v.to_le_bytes()); // pixdim[1..3]
     }
     hdr[108..112].copy_from_slice(&(352f32).to_le_bytes()); // vox_offset
     hdr[112..116].copy_from_slice(&1.0f32.to_le_bytes()); // scl_slope
-    for (i, o) in origin.iter().enumerate() {
-        hdr[268 + i * 4..272 + i * 4].copy_from_slice(&o.to_le_bytes()); // qoffset_x/y/z
-    }
+    // affine: qform + sform 都为 [diag(spacing) | origin] (identity 旋转)。
     hdr[252..254].copy_from_slice(&(1i16).to_le_bytes()); // qform_code = scanner
+    hdr[254..256].copy_from_slice(&(1i16).to_le_bytes()); // sform_code = scanner
+    // srow = [[sx,0,0,ox],[0,sy,0,oy],[0,0,sz,oz]]
+    let rows = [
+        [spacing[0], 0.0f32, 0.0f32, origin[0]],
+        [0.0f32, spacing[1], 0.0f32, origin[1]],
+        [0.0f32, 0.0f32, spacing[2], origin[2]],
+    ];
+    for (r, row) in rows.iter().enumerate() {
+        for (c, v) in row.iter().enumerate() {
+            hdr[280 + r * 16 + c * 4..284 + r * 16 + c * 4]
+                .copy_from_slice(&v.to_le_bytes());
+        }
+    }
+    hdr[268..272].copy_from_slice(&origin[0].to_le_bytes()); // qoffset_x
+    hdr[272..276].copy_from_slice(&origin[1].to_le_bytes()); // qoffset_y
+    hdr[276..280].copy_from_slice(&origin[2].to_le_bytes()); // qoffset_z
     hdr[344..348].copy_from_slice(b"n+1\0"); // magic
-    // qform identity: quatern_b/c/d 保持 0, pixdim[0]=qfac=1 (已设置)。
-    hdr[268..272].copy_from_slice(&origin[0].to_le_bytes());
-    hdr[272..276].copy_from_slice(&origin[1].to_le_bytes());
-    hdr[276..280].copy_from_slice(&origin[2].to_le_bytes());
     let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
     use std::io::Write;
     f.write_all(&hdr)?;
-    let pad = vec![0u8; 4];
-    f.write_all(&pad)?;
+    f.write_all(&[0u8; 4])?; // pad to vox_offset 352
     for v in data {
         f.write_all(&v.to_le_bytes())?;
     }
