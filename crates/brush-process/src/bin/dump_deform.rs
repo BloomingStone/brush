@@ -48,6 +48,75 @@ fn write_npy_f32(path: &std::path::Path, data: &[f32], shape: &[usize]) -> Resul
     Ok(())
 }
 
+/// nifti-rs: 写 3D float32 卷 `[a, b, c]` (特征平面: 前两维空间, 第三维通道)。
+fn write_nifti_3d_f32(path: &std::path::Path, data: &[f32], grid: [usize; 3]) -> Result<()> {
+    use nifti::writer::WriterOptions;
+    use nifti::NiftiHeader;
+    let [a, b, c] = grid;
+    let arr = ndarray::Array3::from_shape_vec((a, b, c), data.to_vec())
+        .map_err(|e| anyhow::anyhow!("ndarray shape: {e}"))?;
+    let mut hdr = NiftiHeader::default();
+    hdr.dim[0] = 3;
+    hdr.dim[1] = a as u16;
+    hdr.dim[2] = b as u16;
+    hdr.dim[3] = c as u16;
+    hdr.datatype = nifti::NiftiType::Float32 as i16;
+    hdr.bitpix = 32;
+    hdr.pixdim[0] = 1.0;
+    hdr.pixdim[1] = 1.0;
+    hdr.pixdim[2] = 1.0;
+    hdr.pixdim[3] = 1.0;
+    hdr.qform_code = 0;
+    hdr.sform_code = 0;
+    WriterOptions::new(path)
+        .reference_header(&hdr)
+        .write_nifti(&arr)
+        .map_err(|e| anyhow::anyhow!("write nifti: {e}"))?;
+    Ok(())
+}
+
+/// nifti-rs: 写位移场 5D `[nx, ny, nz, 1, 3]` (同 ASOCA dvf), affine 由
+/// spacing/origin 构造 (sform_code=2)。
+fn write_nifti_vec5d_f32(
+    path: &std::path::Path,
+    data: &[f32],
+    grid: [usize; 3],
+    spacing: [f32; 3],
+    origin: [f32; 3],
+) -> Result<()> {
+    use nifti::writer::WriterOptions;
+    use nifti::NiftiHeader;
+    let [nx, ny, nz] = grid;
+    assert_eq!(data.len(), nx * ny * nz * 3);
+    let arr = ndarray::Array5::from_shape_vec((nx, ny, nz, 1usize, 3usize), data.to_vec())
+        .map_err(|e| anyhow::anyhow!("ndarray shape: {e}"))?;
+    let mut hdr = NiftiHeader::default();
+    hdr.dim[0] = 5;
+    hdr.dim[1] = nx as u16;
+    hdr.dim[2] = ny as u16;
+    hdr.dim[3] = nz as u16;
+    hdr.dim[4] = 1;
+    hdr.dim[5] = 3;
+    hdr.datatype = nifti::NiftiType::Float32 as i16;
+    hdr.bitpix = 32;
+    hdr.pixdim[0] = 1.0;
+    hdr.pixdim[1] = spacing[0];
+    hdr.pixdim[2] = spacing[1];
+    hdr.pixdim[3] = spacing[2];
+    hdr.pixdim[4] = 1.0;
+    hdr.pixdim[5] = 1.0;
+    hdr.qform_code = 0;
+    hdr.sform_code = 2;
+    hdr.srow_x = [spacing[0], 0.0, 0.0, origin[0]];
+    hdr.srow_y = [0.0, spacing[1], 0.0, origin[1]];
+    hdr.srow_z = [0.0, 0.0, spacing[2], origin[2]];
+    WriterOptions::new(path)
+        .reference_header(&hdr)
+        .write_nifti(&arr)
+        .map_err(|e| anyhow::anyhow!("write nifti: {e}"))?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -182,10 +251,12 @@ async fn main() -> Result<()> {
             println!("plane {name} [{a}x{b}x{c}]: 相邻单元相关 轴0={:.3} 轴1={:.3} (平滑→+1, 棋盘格→-1), 幅度 std={:.4}",
                 pearson(&p0), pearson(&p1),
                 (data.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / data.len() as f64).sqrt());
-            // 保存为 .npy [a, b, C] (行主序: 数据本身即 C-order)
+            // 保存 .npy [a, b, C] (行主序) + .nii.gz (nifti-rs, [a,b,C] 3D 卷)。
             let path = dir.join(format!("plane_{name}.npy"));
             write_npy_f32(&path, &data, &[a, b, c])?;
-            println!("  saved -> {}", path.display());
+            let nii = dir.join(format!("plane_{name}.nii.gz"));
+            write_nifti_3d_f32(&nii, &data, [a, b, c])?;
+            println!("  saved -> {} / {}", path.display(), nii.display());
         }
         return Ok(());
     }
@@ -222,9 +293,12 @@ async fn main() -> Result<()> {
         let time_t = Tensor::<2>::from_data(TensorData::new(vec![time; n_pts], [n_pts, 1]), &device_ad);
         let d = model.forward(xyz_t.clone(), phase_t, time_t).d_xyz;
         let dv: Vec<f32> = d.into_data_async().await?.to_vec()?;
-        let npy = out.with_file_name(format!("{}_phase{p:02}.npy", out.file_name().unwrap().to_string_lossy()));
+        let stem = format!("{}_phase{p:02}", out.file_name().unwrap().to_string_lossy());
+        let npy = out.with_file_name(format!("{stem}.npy"));
         write_npy_f32(&npy, &dv, &[grid[0], grid[1], grid[2], 3])?;
-        println!("  saved deform field -> {}", npy.display());
+        let nii = out.with_file_name(format!("{stem}.nii.gz"));
+        write_nifti_vec5d_f32(&nii, &dv, grid, [spacing; 3], origin)?;
+        println!("  saved deform field -> {} / {}", npy.display(), nii.display());
         // 平滑度: 相邻体素位移差 / 平均位移, 及自相关
         let mut mag: Vec<f64> = dv.chunks_exact(3).map(|c| ((c[0] as f64).powi(2) + (c[1] as f64).powi(2) + (c[2] as f64).powi(2)).sqrt()).collect();
         let mean_mag = mag.iter().sum::<f64>() / mag.len() as f64;
