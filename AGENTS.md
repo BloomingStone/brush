@@ -35,17 +35,25 @@ systemd-run --user --scope -p CPUWeight=100 -p MemoryMax=12G \
 ### 4 卡并行实验惯例(2026-08-20)
 
 - 卡 0: hexplane 10k 基线
-- 卡 1: hashgrid 10k 对照
-- 卡 2/3: variants(如 `--predict-scaling`、动态 densify 阈值)
-- 每跑一次 eval 自动写 `metrics.csv` + `gt_pred_*.nrrd`;实验记录放 `experiments/`。
+
+### 实验组织规范 (2026-08-25 起, 强制)
+
+- **输出目录**: `experiments/output/<exp_name>/<config_name>/`
+  (不要用 `target/`, 会被 cargo clean 清掉)。
+- **日志**: `experiments/output/<exp_name>/<config_name>.log`。
+- **每个实验前必须先 git 提交** (提交信息以 `exp/` 开头), 并记录:
+  - 日期时间 / 目的 / commit hash / 运行命令
+  - 写入 `experiments/output/<exp_name>/readme.md`。
+- 形变场导出: `deform_final.bin` + `deform_field_phase{p:02}.nii.gz`
+  (5D `[x,y,z,1,3]` 位移场, affine 随 nii 保存; 参考 ASOCA dvf 格式)。
 
 ## fit_deform 训练要点
 
 - HexPlane 是默认 deform 后端(`--deform-backend=hashgrid` 切回),融合 cubecl
   内核 ~10x 加速。
 - `predict_scaling` 默认关(保质量形变: 不预测 d_scaling, 积分吸收守恒)。
-- 减缓 splat 增长: 默认 15k 初始点 / growth_frac 0.15 / percent_dense 0.0003 /
-  cull_density 2e-4 / max_splats 300k。
+- 减缓 splat 增长: 默认 5k 初始点 / growth_frac 0.25 / percent_dense 0.0003 /
+  cull_density 5e-4 / max_splats 300k / **fixed-grad-thr 5e-6** (~40k splats)。
 
 ## 评估口径 (2026-08-21 起)
 

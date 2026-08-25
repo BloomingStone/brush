@@ -227,9 +227,10 @@ async fn main() -> anyhow::Result<()> {
     // `--eval-views=M` 每次 eval 采 M 个验证视图(均匀)。
     let mut eval_split_every: Option<usize> = None;
     let mut eval_views_count = 8usize;
-    // 固定 densify 梯度阈值 (默认 1e-5 = 2026-08-21 扫描甜点, ~73k splats,
-    // PSNR ≈600k 的 43.17 但快 ~4x); None = 动态百分位 (0.98pct 仅 ~16k)。
-    let mut fixed_grad_thr: Option<f32> = Some(1e-5);
+    // 固定 densify 梯度阈值 (默认 5e-6 = 2026-08-24 修正: 1e-5 质量过差,
+    // 5e-6 ~40k splats, LPIPS 0.192 vs 1e-5 的 0.222, 性价比甜点);
+    // None = 动态百分位 (0.98pct 仅 ~16k)。
+    let mut fixed_grad_thr: Option<f32> = Some(5e-6);
     // 启用 oversized 高梯度点拆分(clone-only → clone+split, 参考 RGB refine_splats)。
     let mut enable_split = false;
     // proj 域损失权重 (在 -ln(intensity) 域比较; 默认 1.0 已作为最优默认)。
@@ -968,7 +969,7 @@ async fn main() -> anyhow::Result<()> {
             let d = deform.forward(xyz_t.clone(), phase_t, time_t).d_xyz;
             let dv: Vec<f32> = d.into_data_async().await?.to_vec()?;
             debug_assert_eq!(dv.len(), per_xyz * 3, "deform field size mismatch");
-            let nii = out.join(format!("deform_field_phase{p:02}.nii"));
+            let nii = out.join(format!("deform_field_phase{p:02}.nii.gz"));
             write_nifti_vec4d(&nii, &dv, grid, spacing, mn)?;
             println!("{} saved deform field (phase={phase:.3}) -> {}", ts(), nii.display());
         }
@@ -1018,9 +1019,10 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 写一个 NIfTI-1 (little-endian) 4D float32 向量场 `[nx, ny, nz, 3]`
-/// (位移分量在最后一维, 世界坐标 mm)。`affine` 由 bbox 构造并随 nii 保存
-/// (qform + sform 均为该仿射)。
+/// 写一个 NIfTI-1 (little-endian) 5D float32 位移场 `[nx, ny, nz, 1, 3]`
+/// (第4维 = 单例时间 1, 第5维 = 3 个位移分量)。此结构让工具识别为
+/// **向量/位移场** (参考 ASOCA dvf/phase_00.nii.gz: dims [x,y,z,1,3])。
+/// 位移为世界坐标 mm; affine 随 nii 保存 (sform)。
 fn write_nifti_vec4d(
     path: &Path,
     data: &[f32],
@@ -1032,23 +1034,29 @@ fn write_nifti_vec4d(
     assert_eq!(data.len(), nx * ny * nz * 3);
     let mut hdr = [0u8; 348];
     hdr[0..4].copy_from_slice(&(348i32).to_le_bytes()); // sizeof_hdr
-    hdr[40..42].copy_from_slice(&(4i16).to_le_bytes()); // dim[0] = 4
-    let dims = [nx as i16, ny as i16, nz as i16, 3i16];
+    hdr[40..42].copy_from_slice(&(5i16).to_le_bytes()); // dim[0] = 5
+    let dims = [nx as i16, ny as i16, nz as i16, 1i16, 3i16];
     for (i, d) in dims.iter().enumerate() {
-        hdr[42 + i * 2..44 + i * 2].copy_from_slice(&d.to_le_bytes()); // dim[1..4]
+        hdr[42 + i * 2..44 + i * 2].copy_from_slice(&d.to_le_bytes()); // dim[1..5]
     }
     hdr[70..72].copy_from_slice(&(16i16).to_le_bytes()); // datatype = float32
     hdr[72..74].copy_from_slice(&(32i16).to_le_bytes()); // bitpix
     hdr[76..80].copy_from_slice(&1.0f32.to_le_bytes()); // pixdim[0] = qfac 1
-    for (i, v) in spacing.iter().enumerate() {
-        hdr[80 + i * 4..84 + i * 4].copy_from_slice(&v.to_le_bytes()); // pixdim[1..3]
+    let pixdims = [
+        1.0f32, // pixdim[0]
+        spacing[0], spacing[1], spacing[2],
+        1.0f32, // 时间轴
+        1.0f32, // 分量轴
+        1.0f32, 1.0f32,
+    ];
+    for (i, v) in pixdims.iter().enumerate() {
+        hdr[76 + i * 4..80 + i * 4].copy_from_slice(&v.to_le_bytes());
     }
     hdr[108..112].copy_from_slice(&(352f32).to_le_bytes()); // vox_offset
     hdr[112..116].copy_from_slice(&1.0f32.to_le_bytes()); // scl_slope
-    // affine: qform + sform 都为 [diag(spacing) | origin] (identity 旋转)。
-    hdr[252..254].copy_from_slice(&(1i16).to_le_bytes()); // qform_code = scanner
-    hdr[254..256].copy_from_slice(&(1i16).to_le_bytes()); // sform_code = scanner
-    // srow = [[sx,0,0,ox],[0,sy,0,oy],[0,0,sz,oz]]
+    // 仿射随 nii 保存: sform_code=2 (aligned), qform_code=0 (与参考一致)。
+    hdr[252..254].copy_from_slice(&(0i16).to_le_bytes()); // qform_code
+    hdr[254..256].copy_from_slice(&(2i16).to_le_bytes()); // sform_code
     let rows = [
         [spacing[0], 0.0f32, 0.0f32, origin[0]],
         [0.0f32, spacing[1], 0.0f32, origin[1]],
@@ -1064,12 +1072,18 @@ fn write_nifti_vec4d(
     hdr[272..276].copy_from_slice(&origin[1].to_le_bytes()); // qoffset_y
     hdr[276..280].copy_from_slice(&origin[2].to_le_bytes()); // qoffset_z
     hdr[344..348].copy_from_slice(b"n+1\0"); // magic
-    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+
+    // 写 .nii.gz (gzip)
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
     use std::io::Write;
-    f.write_all(&hdr)?;
-    f.write_all(&[0u8; 4])?; // pad to vox_offset 352
+    let f = std::fs::File::create(path)?;
+    let mut gz = GzEncoder::new(f, Compression::default());
+    gz.write_all(&hdr)?;
+    gz.write_all(&[0u8; 4])?; // pad to vox_offset 352
     for v in data {
-        f.write_all(&v.to_le_bytes())?;
+        gz.write_all(&v.to_le_bytes())?;
     }
+    gz.finish()?;
     Ok(())
 }

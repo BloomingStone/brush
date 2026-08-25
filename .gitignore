@@ -56,3 +56,16 @@ dataset_exports
 
 __pycache__/
 *.pyc
+
+# 实验输出: 保留 readme.md 记录, 忽略数据/日志
+experiments/output/**/metrics.csv
+experiments/output/**/gt_pred_*.nrrd
+experiments/output/**/deform_*
+experiments/output/**/canonical_*
+experiments/output/**/*.log
+experiments/output/**/*.ply
+experiments/output/**/*.bin
+experiments/output/**/*.nii.gz
+experiments/output/**/*.nrrd
+# 边缘分析输出
+**/*.edge_analysis/

@@ -26,6 +26,7 @@ async-fn-stream.workspace = true
 clap.workspace = true
 rand.workspace = true
 log.workspace = true
+flate2.workspace = true
 glam.workspace = true
 web-time.workspace = true
 tracing.workspace = true
