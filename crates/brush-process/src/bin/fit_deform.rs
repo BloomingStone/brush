@@ -48,8 +48,7 @@ use brush_deform::{HexPlaneConfig, HexPlaneDeformConfig};
 use brush_render::gaussian_splats::{SplatRenderMode, Splats};
 use brush_train::xray_eval::save_gray_nrrd_f32_stack;
 use brush_train::xray_refine::XRayRefineConfig;
-use brush_train::xray_train::{DeformBackend, XRayTrainConfig, create_xray_trainer};
-use brush_vfs::BrushVfs;
+use brush_train::xray_train::{DeformBackend, XRayTrainConfig, create_xray_trainer};use brush_vfs::BrushVfs;
 use brush_xray::XRaySplats;
 use burn::tensor::{Device, TensorData};
 
@@ -221,6 +220,9 @@ async fn main() -> anyhow::Result<()> {
     // 硬性 splat 数上限: 到顶后只 prune 不再增 (原 1M, 10k 步中期就可能顶到)。
     let mut max_splats = 300_000u32;
     let mut eval_every = 100u32;
+    // 保存形变场: deform 网络 ckpt (.bin) + 4D 形变场 NIfTI (d_xyz over
+    // [x,y,z,phase,3])。0 = 不保存 (诊断用)。
+    let mut save_deform = true;
     // 验证集: `--eval-split-every=N` 每 N 帧扣一个 held-out 视图;
     // `--eval-views=M` 每次 eval 采 M 个验证视图(均匀)。
     let mut eval_split_every: Option<usize> = None;
@@ -362,6 +364,8 @@ async fn main() -> anyhow::Result<()> {
             max_splats = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--eval-every=") {
             eval_every = v.parse()?;
+        } else if a == "--no-save-deform" {
+            save_deform = false;
         } else if let Some(v) = a.strip_prefix("--eval-split-every=") {
             eval_split_every = Some(v.parse()?);
         } else if let Some(v) = a.strip_prefix("--eval-views=") {
@@ -891,6 +895,83 @@ async fn main() -> anyhow::Result<()> {
     std::fs::write(&ply_path, ply)?;
     println!("{} exported {}", ts(), ply_path.display());
 
+    // ---- 导出形变场 (诊断) ---------------------------------------------
+    // deform 网络 ckpt (.bin) + 4D 形变场 NIfTI: d_xyz 在 [x,y,z,phase,3]
+    // 网格上采样 (固定 time=0, 沿心动相位变化)。检查形变场是否合理建模运动。
+    if save_deform
+        && let Some(deform) = trainer.deform()
+    {
+        use burn::module::Module;
+        use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
+        let ckpt = out.join("deform_final.bin");
+        let record = deform.clone().into_record();
+        BinFileRecorder::<FullPrecisionSettings>::new()
+            .record(record, ckpt.clone())
+            .map_err(|e| anyhow::anyhow!("save deform ckpt: {e}"))?;
+        println!("{} saved deform ckpt -> {}", ts(), ckpt.display());
+
+        // 网格范围: canonical splat 均值包围盒 (+5% 边距)。
+        let means = trainer.canonical().means().into_data_async().await?;
+        let mv: Vec<f32> = means.to_vec()?;
+        let (mut mn, mut mx) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for c in mv.chunks_exact(3) {
+            for d in 0..3 {
+                mn[d] = mn[d].min(c[d]);
+                mx[d] = mx[d].max(c[d]);
+            }
+        }
+        let pad = 0.05;
+        let grid = [40usize, 40, 32];
+        for d in 0..3 {
+            let span = (mx[d] - mn[d]).max(1e-3);
+            mn[d] -= span * pad;
+            mx[d] += span * pad;
+        }
+        // 采样 16 个相位 × 固定 time=0, 每点输出 d_xyz [3]。
+        let n_phase = 16usize;
+        let vol_len = grid[0] * grid[1] * grid[2] * n_phase * 3;
+        let mut vol: Vec<f32> = vec![0.0f32; vol_len];
+        let deform_dev = trainer.canonical().device().clone();
+        let deform_ad = deform_dev.autodiff();
+        let time = 0.0f32;
+        for p in 0..n_phase {
+            let phase = p as f32 / n_phase as f32;
+            let mut pts: Vec<f32> = Vec::with_capacity(grid[0] * grid[1] * grid[2] * 3);
+            for iz in 0..grid[2] {
+                let z = mn[2] + (mx[2] - mn[2]) * iz as f32 / (grid[2] - 1) as f32;
+                for iy in 0..grid[1] {
+                    let y = mn[1] + (mx[1] - mn[1]) * iy as f32 / (grid[1] - 1) as f32;
+                    for ix in 0..grid[0] {
+                        let x = mn[0] + (mx[0] - mn[0]) * ix as f32 / (grid[0] - 1) as f32;
+                        pts.extend_from_slice(&[x, y, z]);
+                    }
+                }
+            }
+            let n_pts = pts.len() / 3;
+            let per_xyz = grid[0] * grid[1] * grid[2];
+            use burn::tensor::Tensor;
+            let xyz_t = Tensor::<2>::from_data(TensorData::new(pts, [n_pts, 3]), &deform_ad);
+            let phase_t =
+                Tensor::<2>::from_data(TensorData::new(vec![phase; n_pts], [n_pts, 1]), &deform_ad);
+            let time_t =
+                Tensor::<2>::from_data(TensorData::new(vec![time; n_pts], [n_pts, 1]), &deform_ad);
+            let d = deform.forward(xyz_t, phase_t, time_t).d_xyz;
+            let dv: Vec<f32> = d.into_data_async().await?.to_vec()?;
+            debug_assert_eq!(dv.len(), per_xyz * 3, "deform field size mismatch");
+            let base = p * per_xyz * 3;
+            for (i, v) in dv.into_iter().enumerate() {
+                let g = i / 3; // 网格点索引
+                let c = i % 3;
+                vol[base + g * 3 + c] = v;
+            }
+        }
+        let nii = out.join("deform_field_phase.nii");
+        write_nifti_5d(&nii, &vol, [grid[0], grid[1], grid[2], n_phase, 3],
+            [(mx[0] - mn[0]) / grid[0] as f32, (mx[1] - mn[1]) / grid[1] as f32, (mx[2] - mn[2]) / grid[2] as f32],
+            mn)?;
+        println!("{} saved deform field -> {}", ts(), nii.display());
+    }
+
     // 可学习时间频率诊断: 训练后网络把频率收敛到数据中的真实运动频率
     // (如 ~0.8Hz 呼吸)。对照人工统计核验。
     if enable_time
@@ -932,5 +1013,51 @@ async fn main() -> anyhow::Result<()> {
     }
 
     println!("{} done -> {}", ts(), out.display());
+    Ok(())
+}
+
+/// 写一个 NIfTI-1 (little-endian) 5D float32 卷。`dims = [nx, ny, nz, nt, nc]`
+/// (组件数 nc 放最后一维), `vox` 体素尺寸, `origin` 世界原点。
+fn write_nifti_5d(
+    path: &Path,
+    data: &[f32],
+    dims: [usize; 5],
+    vox: [f32; 3],
+    origin: [f32; 3],
+) -> anyhow::Result<()> {
+    let [nx, ny, nz, nt, nc] = dims;
+    assert_eq!(data.len(), nx * ny * nz * nt * nc);
+    let mut hdr = [0u8; 348];
+    hdr[0..4].copy_from_slice(&(348i32).to_le_bytes()); // sizeof_hdr
+    hdr[40..42].copy_from_slice(&(5i16).to_le_bytes()); // dim[0]
+    let dims5 = [nx as i16, ny as i16, nz as i16, nt as i16, nc as i16];
+    for (i, d) in dims5.iter().enumerate() {
+        hdr[42 + i * 2..44 + i * 2].copy_from_slice(&d.to_le_bytes()); // dim[1..5]
+    }
+    hdr[70..72].copy_from_slice(&(16i16).to_le_bytes()); // datatype = float32
+    hdr[72..74].copy_from_slice(&(32i16).to_le_bytes()); // bitpix
+    hdr[76..80].copy_from_slice(&1.0f32.to_le_bytes()); // pixdim[0] = qfac 1
+    for (i, v) in vox.iter().enumerate() {
+        hdr[80 + i * 4..84 + i * 4].copy_from_slice(&v.to_le_bytes()); // pixdim[1..3]
+    }
+    hdr[108..112].copy_from_slice(&(352f32).to_le_bytes()); // vox_offset
+    hdr[112..116].copy_from_slice(&1.0f32.to_le_bytes()); // scl_slope
+    for (i, o) in origin.iter().enumerate() {
+        hdr[268 + i * 4..272 + i * 4].copy_from_slice(&o.to_le_bytes()); // qoffset_x/y/z
+    }
+    hdr[252..254].copy_from_slice(&(1i16).to_le_bytes()); // qform_code = scanner
+    hdr[344..348].copy_from_slice(b"n+1\0"); // magic
+    // qform identity: quatern_b/c/d 保持 0, pixdim[0]=qfac=1 (已设置)。
+    hdr[268..272].copy_from_slice(&origin[0].to_le_bytes());
+    hdr[272..276].copy_from_slice(&origin[1].to_le_bytes());
+    hdr[276..280].copy_from_slice(&origin[2].to_le_bytes());
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    use std::io::Write;
+    f.write_all(&hdr)?;
+    let pad = vec![0u8; 4];
+    f.write_all(&pad)?;
+    for v in data {
+        f.write_all(&v.to_le_bytes())?;
+    }
     Ok(())
 }

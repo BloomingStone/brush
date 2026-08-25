@@ -399,6 +399,11 @@ impl XRayTrainer {
         &self.canonical
     }
 
+    /// The trained deform network (for checkpoint / deform-field export).
+    pub fn deform(&self) -> Option<&DeformNetwork> {
+        self.deform.as_ref()
+    }
+
     /// Read back the learned temporal frequencies (Hz) of the deform network,
     /// when time conditioning is enabled. `None` otherwise / on read failure.
     pub async fn learned_time_freqs(&self) -> Option<Vec<f32>> {
