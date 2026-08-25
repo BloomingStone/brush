@@ -44,8 +44,9 @@ systemd-run --user --scope -p CPUWeight=100 -p MemoryMax=12G \
 - **每个实验前必须先 git 提交** (提交信息以 `exp/` 开头), 并记录:
   - 日期时间 / 目的 / commit hash / 运行命令
   - 写入 `experiments/output/<exp_name>/readme.md`。
-- 形变场导出: `deform_final.bin` + `deform_field_phase{p:02}.nii.gz`
-  (5D `[x,y,z,1,3]` 位移场, affine 随 nii 保存; 参考 ASOCA dvf 格式)。
+- 形变场导出: `deform_final.bin` + `deform_field_phase{p:02}.npy`
+  (float32 行主序 `[nx,ny,nz,3]`) + `.nii.gz` (nifti-rs, 5D `[x,y,z,1,3]`
+  同 ASOCA dvf, affine 随 nii)。
 - 实验结束后，将前一个实验的结果（包括实验目的，运行命令，实验结果，结果分
   析，后续待做）记录在 experiments/ 中，并使用 amend 提交到此前提交过的实
   验 commit 中

@@ -226,6 +226,9 @@ async fn main() -> anyhow::Result<()> {
     // 保存形变场: deform 网络 ckpt (.bin) + 4D 形变场 NIfTI (d_xyz over
     // [x,y,z,phase,3])。0 = 不保存 (诊断用)。
     let mut save_deform = true;
+    // 形变场默认导出 .nii.gz (nifti-rs, ASOCA 格式); --export-npy 额外输出
+    // 行主序 .npy (便于 numpy 直接分析)。
+    let mut export_npy = false;
     // 验证集: `--eval-split-every=N` 每 N 帧扣一个 held-out 视图;
     // `--eval-views=M` 每次 eval 采 M 个验证视图(均匀)。
     let mut eval_split_every: Option<usize> = None;
@@ -372,6 +375,8 @@ async fn main() -> anyhow::Result<()> {
             eval_every = v.parse()?;
         } else if a == "--no-save-deform" {
             save_deform = false;
+        } else if a == "--export-npy" {
+            export_npy = true;
         } else if let Some(v) = a.strip_prefix("--eval-split-every=") {
             eval_split_every = Some(v.parse()?);
         } else if let Some(v) = a.strip_prefix("--eval-views=") {
@@ -467,7 +472,7 @@ async fn main() -> anyhow::Result<()> {
          [--grad-edge-scale=S] [--respi-after=N] [--no-respi-freeze] \
          [--time-jitter=S] [--time-tv-weight=W] [--time-tv-dp=S] \
          [--time-tv-dt=S] [--time-tv-sample=N] [--density-reset=N] [--eval-every=N] \
-         [--roi=no|N|x0,y0,w,h] [--log-csv=FILE] [--out=DIR]",
+         [--export-npy] [--no-save-deform] [--roi=no|N|x0,y0,w,h] [--log-csv=FILE] [--out=DIR]",
     );
 
     // ---- 后端 + 数据集 ---------------------------------------------------
@@ -991,10 +996,16 @@ async fn main() -> anyhow::Result<()> {
             let d = deform.forward(xyz_t.clone(), phase_t, time_t).d_xyz;
             let dv: Vec<f32> = d.into_data_async().await?.to_vec()?;
             debug_assert_eq!(dv.len(), per_xyz * 3, "deform field size mismatch");
-            // .npy (行主序, float32), 用户自行转 nii 可参考 ASOCA dvf 格式。
-            let npy = out.join(format!("deform_field_phase{p:02}.npy"));
-            write_npy_f32(&npy, &dv, &[grid[0], grid[1], grid[2], 3])?;
-            println!("{} saved deform field (phase={phase:.3}) -> {}", ts(), npy.display());
+            // 默认 .nii.gz (nifti-rs, 5D [x,y,z,1,3] 同 ASOCA); --export-npy 额外输出。
+            let nii = out.join(format!("deform_field_phase{p:02}.nii.gz"));
+            write_nifti_vec_f32(&nii, &dv, [grid[0], grid[1], grid[2]], spacing, mn)?;
+            let mut msg = nii.display().to_string();
+            if export_npy {
+                let npy = out.join(format!("deform_field_phase{p:02}.npy"));
+                write_npy_f32(&npy, &dv, &[grid[0], grid[1], grid[2], 3])?;
+                msg = format!("{msg} / {}", npy.display());
+            }
+            println!("{} saved deform field (phase={phase:.3}) -> {msg}", ts());
         }
     }
 
@@ -1075,5 +1086,54 @@ fn write_npy_f32(path: &Path, data: &[f32], shape: &[usize]) -> anyhow::Result<(
         out.write_all(&v.to_le_bytes())?;
     }
     out.flush()?;
+    Ok(())
+}
+
+/// 用 nifti-rs 写一个位移场 NIfTI (`[nx, ny, nz, 1, 3]`, 参考 ASOCA dvf),
+/// 数据为行主序 `[nx, ny, nz, 3]`, affine 由 spacing/origin 构造
+/// (sform_code=2, qform_code=0, 与 ASOCA 一致)。nifti-rs 内部处理
+/// NIfTI 的 F-order 布局, 避免之前手写 header 的轴序错误。
+fn write_nifti_vec_f32(
+    path: &Path,
+    data: &[f32],
+    grid: [usize; 3],
+    spacing: [f32; 3],
+    origin: [f32; 3],
+) -> anyhow::Result<()> {
+    use nifti::writer::WriterOptions;
+    use nifti::{NiftiHeader, NiftiType};
+    let [nx, ny, nz] = grid;
+    assert_eq!(data.len(), nx * ny * nz * 3);
+    // 行主序 [nx, ny, nz, 3] → ndarray 5D [nx, ny, nz, 1, 3] (ASOCA dvf 格式)
+    let arr = ndarray::Array5::from_shape_vec(
+        (nx, ny, nz, 1usize, 3usize),
+        data.to_vec(),
+    )
+    .map_err(|e| anyhow::anyhow!("ndarray shape: {e}"))?;
+    // 构造 header: dims [nx, ny, nz, 1, 3], affine → sform
+    let mut hdr = NiftiHeader::default();
+    hdr.dim[0] = 5;
+    hdr.dim[1] = nx as u16;
+    hdr.dim[2] = ny as u16;
+    hdr.dim[3] = nz as u16;
+    hdr.dim[4] = 1;
+    hdr.dim[5] = 3;
+    hdr.datatype = NiftiType::Float32 as i16;
+    hdr.bitpix = 32;
+    hdr.pixdim[0] = 1.0;
+    hdr.pixdim[1] = spacing[0];
+    hdr.pixdim[2] = spacing[1];
+    hdr.pixdim[3] = spacing[2];
+    hdr.pixdim[4] = 1.0;
+    hdr.pixdim[5] = 1.0;
+    hdr.qform_code = 0;
+    hdr.sform_code = 2;
+    hdr.srow_x = [spacing[0], 0.0, 0.0, origin[0]];
+    hdr.srow_y = [0.0, spacing[1], 0.0, origin[1]];
+    hdr.srow_z = [0.0, 0.0, spacing[2], origin[2]];
+    WriterOptions::new(path)
+        .reference_header(&hdr)
+        .write_nifti(&arr)
+        .map_err(|e| anyhow::anyhow!("write nifti: {e}"))?;
     Ok(())
 }

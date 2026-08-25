@@ -42,6 +42,8 @@ repository = "https://github.com/ArthurBrussee/brush"
 [workspace.dependencies]
 glam = { version = "0.30", features = ["serde"] }
 flate2 = "1.1"
+nifti = "0.17"
+ndarray = "0.16"
 bytemuck = "1.20"
 image = { version = "0.25", default-features = false, features = [
     'png',
