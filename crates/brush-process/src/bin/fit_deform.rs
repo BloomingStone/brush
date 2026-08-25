@@ -929,18 +929,34 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         let pad = 0.05;
-        let grid = [64usize, 64, 48];
+        // 采样间距 = 半单元 (对齐 HexPlane 单元, 避免混叠): 之前用 ~单元尺寸
+        // 采样导致形变场看似高频 (2026-08-25 诊断, 见 dump_deform)。
+        let cell = 2.0 * scene_extent / trainer.config().hex_plane.hex_plane.spatial_resolution as f32;
+        let spacing = (cell / 2.0).max(0.5);
         for d in 0..3 {
             let span = (mx[d] - mn[d]).max(1e-3);
             mn[d] -= span * pad;
             mx[d] += span * pad;
         }
-        // affine: 由 bbox 构造 (origin=mn, 间距=(mx-mn)/(n-1)), 随 nii 保存。
+        let grid = [
+            ((mx[0] - mn[0]) / spacing).ceil() as usize + 1,
+            ((mx[1] - mn[1]) / spacing).ceil() as usize + 1,
+            ((mx[2] - mn[2]) / spacing).ceil() as usize + 1,
+        ];
         let spacing = [
             (mx[0] - mn[0]) / (grid[0] - 1) as f32,
             (mx[1] - mn[1]) / (grid[1] - 1) as f32,
             (mx[2] - mn[2]) / (grid[2] - 1) as f32,
         ];
+        println!(
+            "{} deform field export: spacing {:.2}/{:.2}/{:.2} mm (cell {:.2}mm, 每单元 {:.1} 采样)",
+            ts(),
+            spacing[0],
+            spacing[1],
+            spacing[2],
+            cell,
+            cell / spacing[0]
+        );
         // 采样 8 个相位 × 固定 time=0, 每相位单独存 4D [nx,ny,nz,3]。
         let n_phase = 8usize;
         let per_xyz = grid[0] * grid[1] * grid[2];
