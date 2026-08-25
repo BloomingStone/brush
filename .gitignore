@@ -67,5 +67,7 @@ experiments/output/**/*.ply
 experiments/output/**/*.bin
 experiments/output/**/*.nii.gz
 experiments/output/**/*.nrrd
+experiments/output/**/*.npy
+experiments/output/**/*.png
 # 边缘分析输出
 **/*.edge_analysis/

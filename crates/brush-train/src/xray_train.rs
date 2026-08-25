@@ -566,7 +566,7 @@ impl XRayTrainer {
         let canonical_ad = lift_xray_splats_to_autodiff(self.canonical.clone());
 
         // ---- Phase + deform (static mode skips both) --------------------
-        let (deformed, tv_term) = if let Some(deform) = &self.deform {
+        let (deformed, tv_term, anchor_term) = if let Some(deform) = &self.deform {
             let mut phase = batch.phase;
             if self.config.enable_ast && self.step_count >= self.config.warm_up {
                 // Python `get_linear_noise_func`: noise = randn · 1/(step+1) ·
@@ -616,6 +616,14 @@ impl XRayTrainer {
                 };
             }
             let deformed = deform_splats(&canonical_ad, &deforms);
+            // 刚性锚定: |mean(d_xyz)|² 惩罚形变场全场平均位移 (规范自由度 —
+            // 整体平移应留在 canonical, 静态区域位移应为 0)。批次即全部
+            // splats (means()), 均值 = 全场均值。
+            let anchor_term = if self.config.hex_plane.rigid_anchor_weight > 0.0 {
+                Some(deforms.d_xyz.clone().mean_dim(0).powf_scalar(2.0).sum())
+            } else {
+                None
+            };
             // A: 时间 TV 正则 — 惩罚 deform 场在 (phase+dp, time+dt) 与
             // (phase, time) 的位移差 (随机子集), 编码"相邻帧形变小"。
             // 位置 detach: 只正则化 deform 网络参数, 不扰动 splat 放置。
@@ -638,11 +646,11 @@ impl XRayTrainer {
             } else {
                 None
             };
-            (deformed, tv_term)
+            (deformed, tv_term, anchor_term)
         } else {
             // Static reconstruction: no deform field, render the canonical
             // splats directly (shallow clone — tensors are Arc-backed).
-            (canonical_ad.clone(), None)
+            (canonical_ad.clone(), None, None)
         };
 
         // ---- Render + loss ----------------------------------------------
@@ -672,6 +680,10 @@ impl XRayTrainer {
         // 时间 TV 正则项 (deform 块算好, 这里加入总损失)。
         if let Some(tv) = tv_term {
             loss = loss.add(tv.mul_scalar(self.config.time_tv_weight));
+        }
+        // 刚性锚定正则: |mean(d_xyz)|² → 消除规范自由度 (形变场里的整体平移)。
+        if let Some(anchor) = anchor_term {
+            loss = loss.add(anchor.mul_scalar(self.config.hex_plane.rigid_anchor_weight));
         }
         // 空间 TV 正则: HexPlane 特征平面 TV → 强制形变场低频/平滑
         // (否则形变场退化为带限周期模式拟合投影噪声)。

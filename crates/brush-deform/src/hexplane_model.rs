@@ -44,6 +44,12 @@ pub struct HexPlaneDeformConfig {
     /// low-frequency — without it the field degenerates to a band-limited
     /// periodic pattern fitting projection noise. 0 disables.
     pub plane_tv_weight: f32,
+    /// Rigid-anchor regularizer weight: penalizes `|mean(d_xyz)|²` (the
+    /// full-field mean displacement of the deform field). Removes the gauge
+    /// freedom — a rigid translation of the canonical splat cloud absorbed
+    /// into the deform field — so static regions (bone/thorax) get ~0
+    /// displacement and only moving anatomy deforms. 0 disables.
+    pub rigid_anchor_weight: f32,
 }
 
 impl Default for HexPlaneDeformConfig {
@@ -56,6 +62,7 @@ impl Default for HexPlaneDeformConfig {
             enable_time: false,
             time_enc: TimeEncodingConfig::default(),
             plane_tv_weight: 0.0,
+            rigid_anchor_weight: 0.0,
         }
     }
 }
@@ -144,6 +151,11 @@ impl HexPlaneDeformModel {
     /// Spatial TV of the HexPlane feature planes (see [`HexPlane::tv`]).
     pub fn plane_tv(&self) -> Tensor<1> {
         self.hex_plane.tv()
+    }
+
+    /// Diagnostic: the six feature planes (see [`HexPlane::planes`]).
+    pub fn planes(&self) -> Vec<(&'static str, Tensor<3>)> {
+        self.hex_plane.planes()
     }
 
     /// Predict deformations for canonical positions `xyz` (`[N, 3]`, world

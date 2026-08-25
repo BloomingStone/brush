@@ -60,6 +60,7 @@ wasm-bindgen.workspace = true
 bytemuck = { version = "1.14", features = ["derive"] }
 
 image = { workspace = true }
+nifti = "0.17.0"
 
 # On desktop platforms
 [target.'cfg(any(target_family = "unix", target_family = "windows"))'.dependencies]

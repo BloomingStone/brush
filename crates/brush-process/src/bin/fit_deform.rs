@@ -197,6 +197,7 @@ async fn main() -> anyhow::Result<()> {
     // HexPlane 特征平面空间 TV 权重 (0=关): 强制形变场低频/平滑, 防止
     // 退化为带限周期模式拟合投影噪声 (2026-08-25 形变场诊断)。
     let mut plane_tv_weight = 0.0f32;
+    let mut rigid_anchor_weight = 0.0f32;
     // 保质量形变 (默认): 不预测 d_scaling, 局部密度变化由位移/旋转产生。
     let mut predict_scaling = false;
     // 可学习时间条件化 (默认开): 形变网络用可学习傅里叶频率拟合呼吸等
@@ -226,9 +227,6 @@ async fn main() -> anyhow::Result<()> {
     // 保存形变场: deform 网络 ckpt (.bin) + 4D 形变场 NIfTI (d_xyz over
     // [x,y,z,phase,3])。0 = 不保存 (诊断用)。
     let mut save_deform = true;
-    // 形变场默认导出 .nii.gz (nifti-rs, ASOCA 格式); --export-npy 额外输出
-    // 行主序 .npy (便于 numpy 直接分析)。
-    let mut export_npy = false;
     // 验证集: `--eval-split-every=N` 每 N 帧扣一个 held-out 视图;
     // `--eval-views=M` 每次 eval 采 M 个验证视图(均匀)。
     let mut eval_split_every: Option<usize> = None;
@@ -341,6 +339,8 @@ async fn main() -> anyhow::Result<()> {
             hex_mlp_layers = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--plane-tv-weight=") {
             plane_tv_weight = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--rigid-anchor-weight=") {
+            rigid_anchor_weight = v.parse()?;
         } else if a == "--predict-scaling" {
             predict_scaling = true;
         } else if a == "--no-predict-scaling" {
@@ -375,8 +375,6 @@ async fn main() -> anyhow::Result<()> {
             eval_every = v.parse()?;
         } else if a == "--no-save-deform" {
             save_deform = false;
-        } else if a == "--export-npy" {
-            export_npy = true;
         } else if let Some(v) = a.strip_prefix("--eval-split-every=") {
             eval_split_every = Some(v.parse()?);
         } else if let Some(v) = a.strip_prefix("--eval-views=") {
@@ -461,8 +459,8 @@ async fn main() -> anyhow::Result<()> {
          [--lr-deform=LR] [--lr-deform-end=LR] [--no-ast] [--warm-up=N] \
          [--deform-backend=hexplane|hashgrid] [--hex-res=N] \
          [--hex-time-res=N] [--hex-features=N] [--hex-mlp-width=N] \
-         [--hex-mlp-layers=N] [--plane-tv-weight=W] [--predict-scaling|--no-predict-scaling] \
-         [--growth-frac=F] [--refine-every=N] [--max-splats=N] \
+         [--hex-mlp-layers=N] [--plane-tv-weight=W] [--rigid-anchor-weight=W] \
+         [--predict-scaling|--no-predict-scaling] [--growth-frac=F] [--refine-every=N] [--max-splats=N] \
          [--eval-split-every=N] \
          [--eval-views=M] [--fixed-grad-thr=F] [--split] [--proj-weight=W] \
          [--proj-ssim-weight=S] [--cosine-lr] [--percent-dense=F] \
@@ -625,6 +623,7 @@ async fn main() -> anyhow::Result<()> {
             ..brush_deform::TimeEncodingConfig::default()
         },
         plane_tv_weight,
+        rigid_anchor_weight,
     };
     cfg.init_density = init_density;
     cfg.lr_mean = lr_mean;
@@ -923,89 +922,30 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("save deform ckpt: {e}"))?;
         println!("{} saved deform ckpt -> {}", ts(), ckpt.display());
 
-        // 网格范围: canonical splat 均值包围盒 (+5% 边距)。
-        let means = trainer.canonical().means().into_data_async().await?;
-        let mv: Vec<f32> = means.to_vec()?;
-        let (mut mn, mut mx) = ([f32::MAX; 3], [f32::MIN; 3]);
-        for c in mv.chunks_exact(3) {
-            for d in 0..3 {
-                mn[d] = mn[d].min(c[d]);
-                mx[d] = mx[d].max(c[d]);
-            }
-        }
-        let pad = 0.05;
         // 采样间距 = 半单元 (对齐 HexPlane 单元, 避免混叠): 之前用 ~单元尺寸
         // 采样导致形变场看似高频 (2026-08-25 诊断, 见 dump_deform)。
         let cell = 2.0 * scene_extent / trainer.config().hex_plane.hex_plane.spatial_resolution as f32;
         let spacing = (cell / 2.0).max(0.5);
-        for d in 0..3 {
-            let span = (mx[d] - mn[d]).max(1e-3);
-            mn[d] -= span * pad;
-            mx[d] += span * pad;
-        }
-        let grid = [
-            ((mx[0] - mn[0]) / spacing).ceil() as usize + 1,
-            ((mx[1] - mn[1]) / spacing).ceil() as usize + 1,
-            ((mx[2] - mn[2]) / spacing).ceil() as usize + 1,
-        ];
-        let spacing = [
-            (mx[0] - mn[0]) / (grid[0] - 1) as f32,
-            (mx[1] - mn[1]) / (grid[1] - 1) as f32,
-            (mx[2] - mn[2]) / (grid[2] - 1) as f32,
-        ];
+        // 形变场导出委托给独立进程 dump_deform: 训练 20k 后设备内存池状态
+        // 不稳定 (整网格 forward 的 matmul autotune 曾 OOM / 内存池损坏),
+        // 新进程设备干净, 稳定导出 npy + nii.gz (5D [x,y,z,1,3] 同 ASOCA)。
         println!(
-            "{} deform field export: spacing {:.2}/{:.2}/{:.2} mm (cell {:.2}mm, 每单元 {:.1} 采样)",
+            "{} deform field export via dump_deform (spacing {spacing:.2}mm, cell {cell:.2}mm, 每单元 {:.1} 采样)...",
             ts(),
-            spacing[0],
-            spacing[1],
-            spacing[2],
-            cell,
-            cell / spacing[0]
+            cell / spacing
         );
-        // 采样 8 个相位 × 固定 time=0, 每相位单独存 4D [nx,ny,nz,3]。
-        let n_phase = 8usize;
-        let per_xyz = grid[0] * grid[1] * grid[2];
-        let deform_dev = trainer.canonical().device().clone();
-        let deform_ad = deform_dev.autodiff();
-        let time = 0.0f32;
-        use burn::tensor::Tensor;
-        // 预构建网格点 (固定)。
-        let mut pts: Vec<f32> = Vec::with_capacity(per_xyz * 3);
-        for iz in 0..grid[2] {
-            let z = mn[2] + (mx[2] - mn[2]) * iz as f32 / (grid[2] - 1) as f32;
-            for iy in 0..grid[1] {
-                let y = mn[1] + (mx[1] - mn[1]) * iy as f32 / (grid[1] - 1) as f32;
-                for ix in 0..grid[0] {
-                    let x = mn[0] + (mx[0] - mn[0]) * ix as f32 / (grid[0] - 1) as f32;
-                    pts.extend_from_slice(&[x, y, z]);
-                }
-            }
-        }
-        let n_pts = pts.len() / 3;
-        let xyz_t = Tensor::<2>::from_data(TensorData::new(pts, [n_pts, 3]), &deform_ad);
-        for p in 0..n_phase {
-            let phase = p as f32 / n_phase as f32;
-            let phase_t = Tensor::<2>::from_data(
-                TensorData::new(vec![phase; n_pts], [n_pts, 1]),
-                &deform_ad,
-            );
-            let time_t = Tensor::<2>::from_data(
-                TensorData::new(vec![time; n_pts], [n_pts, 1]),
-                &deform_ad,
-            );
-            let d = deform.forward(xyz_t.clone(), phase_t, time_t).d_xyz;
-            let dv: Vec<f32> = d.into_data_async().await?.to_vec()?;
-            debug_assert_eq!(dv.len(), per_xyz * 3, "deform field size mismatch");
-            // 默认 .nii.gz (nifti-rs, 5D [x,y,z,1,3] 同 ASOCA); --export-npy 额外输出。
-            let nii = out.join(format!("deform_field_phase{p:02}.nii.gz"));
-            write_nifti_vec_f32(&nii, &dv, [grid[0], grid[1], grid[2]], spacing, mn)?;
-            let mut msg = nii.display().to_string();
-            if export_npy {
-                let npy = out.join(format!("deform_field_phase{p:02}.npy"));
-                write_npy_f32(&npy, &dv, &[grid[0], grid[1], grid[2], 3])?;
-                msg = format!("{msg} / {}", npy.display());
-            }
-            println!("{} saved deform field (phase={phase:.3}) -> {msg}", ts());
+        let exe = std::env::current_exe()?.with_file_name("dump_deform");
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg(format!("--ckpt={}", ckpt.display()))
+            .arg(format!("--scene-extent={scene_extent}"))
+            .arg(format!("--spacing={spacing}"))
+            .arg("--n-phase=8")
+            .arg(format!("--out={}", out.join("deform_field").display()));
+        let st = cmd
+            .status()
+            .map_err(|e| anyhow::anyhow!("spawn dump_deform: {e}"))?;
+        if !st.success() {
+            anyhow::bail!("dump_deform 导出失败 (status={st})");
         }
     }
 
@@ -1050,90 +990,5 @@ async fn main() -> anyhow::Result<()> {
     }
 
     println!("{} done -> {}", ts(), out.display());
-    Ok(())
-}
-
-/// 写一个 NumPy .npy (version 1.0) float32 数组, **行主序 (C-order)**。
-/// `shape` 为各维大小 (如 [nx, ny, nz, 3]); `data` 按行主序排列。
-/// 后续需要 NIfTI 时用 python 转换 (参考 ASOCA dvf 格式)。
-fn write_npy_f32(path: &Path, data: &[f32], shape: &[usize]) -> anyhow::Result<()> {
-    use std::io::Write;
-    let total: usize = shape.iter().product();
-    assert_eq!(data.len(), total, "npy data len mismatch");
-    let descr = "<f4".to_string();
-    let shape_str = format!(
-        "({}{})",
-        shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", "),
-        if shape.len() == 1 { "," } else { "" }
-    );
-    let mut header = format!(
-        "{{'descr': '{}', 'fortran_order': False, 'shape': {}, }}",
-        descr, shape_str
-    );
-    // 头部按 64 字节对齐 (npy 1.0 规范)。
-    let header_len = header.len() + 1;
-    let pad = (16 - (10 + header_len) % 16) % 16;
-    for _ in 0..pad {
-        header.push(' ');
-    }
-    header.push('\n');
-    let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
-    out.write_all(b"\x93NUMPY")?;
-    out.write_all(&[1u8, 0u8])?; // version 1.0
-    out.write_all(&(header.len() as u16).to_le_bytes())?;
-    out.write_all(header.as_bytes())?;
-    for v in data {
-        out.write_all(&v.to_le_bytes())?;
-    }
-    out.flush()?;
-    Ok(())
-}
-
-/// 用 nifti-rs 写一个位移场 NIfTI (`[nx, ny, nz, 1, 3]`, 参考 ASOCA dvf),
-/// 数据为行主序 `[nx, ny, nz, 3]`, affine 由 spacing/origin 构造
-/// (sform_code=2, qform_code=0, 与 ASOCA 一致)。nifti-rs 内部处理
-/// NIfTI 的 F-order 布局, 避免之前手写 header 的轴序错误。
-fn write_nifti_vec_f32(
-    path: &Path,
-    data: &[f32],
-    grid: [usize; 3],
-    spacing: [f32; 3],
-    origin: [f32; 3],
-) -> anyhow::Result<()> {
-    use nifti::writer::WriterOptions;
-    use nifti::{NiftiHeader, NiftiType};
-    let [nx, ny, nz] = grid;
-    assert_eq!(data.len(), nx * ny * nz * 3);
-    // 行主序 [nx, ny, nz, 3] → ndarray 5D [nx, ny, nz, 1, 3] (ASOCA dvf 格式)
-    let arr = ndarray::Array5::from_shape_vec(
-        (nx, ny, nz, 1usize, 3usize),
-        data.to_vec(),
-    )
-    .map_err(|e| anyhow::anyhow!("ndarray shape: {e}"))?;
-    // 构造 header: dims [nx, ny, nz, 1, 3], affine → sform
-    let mut hdr = NiftiHeader::default();
-    hdr.dim[0] = 5;
-    hdr.dim[1] = nx as u16;
-    hdr.dim[2] = ny as u16;
-    hdr.dim[3] = nz as u16;
-    hdr.dim[4] = 1;
-    hdr.dim[5] = 3;
-    hdr.datatype = NiftiType::Float32 as i16;
-    hdr.bitpix = 32;
-    hdr.pixdim[0] = 1.0;
-    hdr.pixdim[1] = spacing[0];
-    hdr.pixdim[2] = spacing[1];
-    hdr.pixdim[3] = spacing[2];
-    hdr.pixdim[4] = 1.0;
-    hdr.pixdim[5] = 1.0;
-    hdr.qform_code = 0;
-    hdr.sform_code = 2;
-    hdr.srow_x = [spacing[0], 0.0, 0.0, origin[0]];
-    hdr.srow_y = [0.0, spacing[1], 0.0, origin[1]];
-    hdr.srow_z = [0.0, 0.0, spacing[2], origin[2]];
-    WriterOptions::new(path)
-        .reference_header(&hdr)
-        .write_nifti(&arr)
-        .map_err(|e| anyhow::anyhow!("write nifti: {e}"))?;
     Ok(())
 }

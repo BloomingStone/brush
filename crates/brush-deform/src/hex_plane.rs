@@ -126,6 +126,19 @@ impl HexPlane {
             .add(plane_tv(&self.zt))
     }
 
+    /// Diagnostic: the six feature planes `[(name, tensor), ...]`
+    /// (`xy/xz/yz` are `[rs, rs, C]`, `xt/yt/zt` are `[rs, rt, C]`).
+    pub fn planes(&self) -> Vec<(&'static str, Tensor<3>)> {
+        vec![
+            ("xy", self.xy.val()),
+            ("xz", self.xz.val()),
+            ("yz", self.yz.val()),
+            ("xt", self.xt.val()),
+            ("yt", self.yt.val()),
+            ("zt", self.zt.val()),
+        ]
+    }
+
     /// Encode canonical positions `xyz` (`[N, 3]`, world mm) + cardiac phase
     /// (`[N, 1]`) into `[N, C]` plane-summed features. Uses the fused cubecl
     /// kernels by default; `HexPlaneConfig::fused = false` falls back to the
