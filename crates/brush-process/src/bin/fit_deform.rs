@@ -194,6 +194,9 @@ async fn main() -> anyhow::Result<()> {
     let mut hex_features = 16usize;
     let mut hex_mlp_width = 128usize;
     let mut hex_mlp_layers = 2usize;
+    // HexPlane 特征平面空间 TV 权重 (0=关): 强制形变场低频/平滑, 防止
+    // 退化为带限周期模式拟合投影噪声 (2026-08-25 形变场诊断)。
+    let mut plane_tv_weight = 0.0f32;
     // 保质量形变 (默认): 不预测 d_scaling, 局部密度变化由位移/旋转产生。
     let mut predict_scaling = false;
     // 可学习时间条件化 (默认开): 形变网络用可学习傅里叶频率拟合呼吸等
@@ -333,6 +336,8 @@ async fn main() -> anyhow::Result<()> {
             hex_mlp_width = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--hex-mlp-layers=") {
             hex_mlp_layers = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--plane-tv-weight=") {
+            plane_tv_weight = v.parse()?;
         } else if a == "--predict-scaling" {
             predict_scaling = true;
         } else if a == "--no-predict-scaling" {
@@ -451,7 +456,7 @@ async fn main() -> anyhow::Result<()> {
          [--lr-deform=LR] [--lr-deform-end=LR] [--no-ast] [--warm-up=N] \
          [--deform-backend=hexplane|hashgrid] [--hex-res=N] \
          [--hex-time-res=N] [--hex-features=N] [--hex-mlp-width=N] \
-         [--hex-mlp-layers=N] [--predict-scaling|--no-predict-scaling] \
+         [--hex-mlp-layers=N] [--plane-tv-weight=W] [--predict-scaling|--no-predict-scaling] \
          [--growth-frac=F] [--refine-every=N] [--max-splats=N] \
          [--eval-split-every=N] \
          [--eval-views=M] [--fixed-grad-thr=F] [--split] [--proj-weight=W] \
@@ -614,6 +619,7 @@ async fn main() -> anyhow::Result<()> {
             max_freq: time_max_freq,
             ..brush_deform::TimeEncodingConfig::default()
         },
+        plane_tv_weight,
     };
     cfg.init_density = init_density;
     cfg.lr_mean = lr_mean;

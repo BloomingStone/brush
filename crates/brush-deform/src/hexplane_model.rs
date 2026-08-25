@@ -39,6 +39,11 @@ pub struct HexPlaneDeformConfig {
     pub enable_time: bool,
     /// Learnable temporal encoding configuration (used when `enable_time`).
     pub time_enc: TimeEncodingConfig,
+    /// Weight of a spatial total-variation regularizer on the HexPlane feature
+    /// planes (see [`HexPlane::tv`]). Forces the deform field to be smooth /
+    /// low-frequency — without it the field degenerates to a band-limited
+    /// periodic pattern fitting projection noise. 0 disables.
+    pub plane_tv_weight: f32,
 }
 
 impl Default for HexPlaneDeformConfig {
@@ -50,6 +55,7 @@ impl Default for HexPlaneDeformConfig {
             predict_scaling: false,
             enable_time: false,
             time_enc: TimeEncodingConfig::default(),
+            plane_tv_weight: 0.0,
         }
     }
 }
@@ -133,6 +139,11 @@ impl HexPlaneDeformModel {
     /// The learned temporal encoding (when `enable_time`), for diagnostics.
     pub fn time_encoding(&self) -> Option<&TimeEncoding> {
         self.time_enc.as_ref()
+    }
+
+    /// Spatial TV of the HexPlane feature planes (see [`HexPlane::tv`]).
+    pub fn plane_tv(&self) -> Tensor<1> {
+        self.hex_plane.tv()
     }
 
     /// Predict deformations for canonical positions `xyz` (`[N, 3]`, world

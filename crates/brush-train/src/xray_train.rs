@@ -67,6 +67,15 @@ impl DeformNetwork {
             Self::HashGrid(model) => model.forward(xyz, phase, time),
         }
     }
+
+    /// Spatial TV of the deform field's feature planes (HexPlane backend);
+    /// `None` for HashGrid.
+    pub fn plane_tv(&self) -> Option<Tensor<1>> {
+        match self {
+            Self::HexPlane(model) => Some(model.plane_tv()),
+            Self::HashGrid(_) => None,
+        }
+    }
 }
 
 /// Hyperparameters for the X-ray deform-GS trainer.
@@ -663,6 +672,14 @@ impl XRayTrainer {
         // 时间 TV 正则项 (deform 块算好, 这里加入总损失)。
         if let Some(tv) = tv_term {
             loss = loss.add(tv.mul_scalar(self.config.time_tv_weight));
+        }
+        // 空间 TV 正则: HexPlane 特征平面 TV → 强制形变场低频/平滑
+        // (否则形变场退化为带限周期模式拟合投影噪声)。
+        if self.config.hex_plane.plane_tv_weight > 0.0
+            && let Some(deform) = &self.deform
+            && let Some(tv) = deform.plane_tv()
+        {
+            loss = loss.add(tv.mul_scalar(self.config.hex_plane.plane_tv_weight));
         }
         // Proj 域损失: 在 `proj = -ln(intensity)`（Beer-Lambert 衰减积分）域比较,
         // 避开 exp 压缩导致暗部/高 proj 区梯度衰减的问题。

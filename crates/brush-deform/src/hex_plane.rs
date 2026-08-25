@@ -106,6 +106,26 @@ impl HexPlane {
         self.cfg.n_feature_dim
     }
 
+    /// Spatial total-variation of the feature planes: mean |adjacent-cell
+    /// feature diff| along each plane axis. Penalizing it forces the plane
+    /// features (and hence the interpolated deform field) to be **smooth /
+    /// low-frequency** — the learned field otherwise degenerates to a
+    /// band-limited periodic pattern that fits projection noise.
+    pub fn tv(&self) -> Tensor<1> {
+        let plane_tv = |t: &Param<Tensor<3>>| {
+            let v = t.val();
+            let dx = v.clone().slice(s![1.., .., ..]) - v.clone().slice(s![..-1, .., ..]);
+            let dy = v.clone().slice(s![.., 1.., ..]) - v.clone().slice(s![.., ..-1, ..]);
+            dx.abs().mean().add(dy.abs().mean())
+        };
+        plane_tv(&self.xy)
+            .add(plane_tv(&self.xz))
+            .add(plane_tv(&self.yz))
+            .add(plane_tv(&self.xt))
+            .add(plane_tv(&self.yt))
+            .add(plane_tv(&self.zt))
+    }
+
     /// Encode canonical positions `xyz` (`[N, 3]`, world mm) + cardiac phase
     /// (`[N, 1]`) into `[N, C]` plane-summed features. Uses the fused cubecl
     /// kernels by default; `HexPlaneConfig::fused = false` falls back to the
