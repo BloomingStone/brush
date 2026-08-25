@@ -46,6 +46,9 @@ systemd-run --user --scope -p CPUWeight=100 -p MemoryMax=12G \
   - 写入 `experiments/output/<exp_name>/readme.md`。
 - 形变场导出: `deform_final.bin` + `deform_field_phase{p:02}.nii.gz`
   (5D `[x,y,z,1,3]` 位移场, affine 随 nii 保存; 参考 ASOCA dvf 格式)。
+- 实验结束后，将前一个实验的结果（包括实验目的，运行命令，实验结果，结果分
+  析，后续待做）记录在 experiments/ 中，并使用 amend 提交到此前提交过的实
+  验 commit 中
 
 ## fit_deform 训练要点
 

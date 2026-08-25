@@ -10,63 +10,41 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use brush_deform::{HexPlaneConfig, HexPlaneDeformConfig, HexPlaneDeformModel};
 use brush_train::xray_train::DeformNetwork;
-use burn::module::{Module, Param};
+use burn::module::Module;
 use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 use burn::tensor::{Device, Tensor, TensorData};
 
-fn write_nifti_vec4d_gz(
-    path: &std::path::Path,
-    data: &[f32],
-    grid: [usize; 3],
-    spacing: [f32; 3],
-    origin: [f32; 3],
-) -> Result<()> {
-    let [nx, ny, nz] = grid;
-    let mut hdr = [0u8; 348];
-    hdr[0..4].copy_from_slice(&(348i32).to_le_bytes());
-    hdr[40..42].copy_from_slice(&(5i16).to_le_bytes());
-    let dims = [nx as i16, ny as i16, nz as i16, 1i16, 3i16];
-    for (i, d) in dims.iter().enumerate() {
-        hdr[42 + i * 2..44 + i * 2].copy_from_slice(&d.to_le_bytes());
-    }
-    hdr[70..72].copy_from_slice(&(16i16).to_le_bytes());
-    hdr[72..74].copy_from_slice(&(32i16).to_le_bytes());
-    let pixdims = [1.0f32, spacing[0], spacing[1], spacing[2], 1.0, 1.0, 1.0, 1.0];
-    for (i, v) in pixdims.iter().enumerate() {
-        hdr[76 + i * 4..80 + i * 4].copy_from_slice(&v.to_le_bytes());
-    }
-    hdr[108..112].copy_from_slice(&(352f32).to_le_bytes());
-    hdr[112..116].copy_from_slice(&1.0f32.to_le_bytes());
-    hdr[252..254].copy_from_slice(&(0i16).to_le_bytes());
-    hdr[254..256].copy_from_slice(&(2i16).to_le_bytes());
-    let rows = [
-        [spacing[0], 0.0, 0.0, origin[0]],
-        [0.0, spacing[1], 0.0, origin[1]],
-        [0.0, 0.0, spacing[2], origin[2]],
-    ];
-    for (r, row) in rows.iter().enumerate() {
-        for (c, v) in row.iter().enumerate() {
-            hdr[280 + r * 16 + c * 4..284 + r * 16 + c * 4].copy_from_slice(&v.to_le_bytes());
-        }
-    }
-    hdr[268..272].copy_from_slice(&origin[0].to_le_bytes());
-    hdr[272..276].copy_from_slice(&origin[1].to_le_bytes());
-    hdr[276..280].copy_from_slice(&origin[2].to_le_bytes());
-    hdr[344..348].copy_from_slice(b"n+1\0");
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
+/// 写一个 NumPy .npy (version 1.0) float32 数组, **行主序 (C-order)**。
+fn write_npy_f32(path: &std::path::Path, data: &[f32], shape: &[usize]) -> Result<()> {
     use std::io::Write;
-    let f = std::fs::File::create(path)?;
-    let mut gz = GzEncoder::new(f, Compression::default());
-    gz.write_all(&hdr)?;
-    gz.write_all(&[0u8; 4])?;
-    for v in data {
-        gz.write_all(&v.to_le_bytes())?;
+    let total: usize = shape.iter().product();
+    assert_eq!(data.len(), total, "npy data len mismatch");
+    let shape_str = format!(
+        "({}{})",
+        shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", "),
+        if shape.len() == 1 { "," } else { "" }
+    );
+    let mut header = format!(
+        "{{'descr': '<f4', 'fortran_order': False, 'shape': {}, }}",
+        shape_str
+    );
+    let pad = (16 - (10 + header.len() + 1) % 16) % 16;
+    for _ in 0..pad {
+        header.push(' ');
     }
-    gz.finish()?;
+    header.push('\n');
+    let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+    out.write_all(b"\x93NUMPY")?;
+    out.write_all(&[1u8, 0u8])?;
+    out.write_all(&(header.len() as u16).to_le_bytes())?;
+    out.write_all(header.as_bytes())?;
+    for v in data {
+        out.write_all(&v.to_le_bytes())?;
+    }
+    out.flush()?;
     Ok(())
 }
 
@@ -85,6 +63,8 @@ async fn main() -> Result<()> {
     let mut phase = 0.0f32;
     let mut time = 0.0f32;
     let mut n_phase = 1usize;
+    let mut dump_planes: Option<PathBuf> = None;
+    let mut selftest: Option<PathBuf> = None;
     let mut i = 1;
     while i < args.len() {
         let a = &args[i];
@@ -100,6 +80,8 @@ async fn main() -> Result<()> {
         else if let Some(s) = a.strip_prefix("--phase=") { phase = s.parse()?; }
         else if let Some(s) = a.strip_prefix("--time=") { time = s.parse()?; }
         else if let Some(s) = a.strip_prefix("--n-phase=") { n_phase = s.parse()?; }
+        else if let Some(s) = a.strip_prefix("--dump-planes=") { dump_planes = Some(PathBuf::from(s)); }
+        else if let Some(s) = a.strip_prefix("--selftest=") { selftest = Some(PathBuf::from(s)); }
         i += 1;
     }
     anyhow::ensure!(!ckpt.as_os_str().is_empty(), "need --ckpt=...");
@@ -107,6 +89,26 @@ async fn main() -> Result<()> {
     let wgpu = brush_process::burn_init_setup().await;
     let device: Device = wgpu.into();
     let device_ad = device.clone().autodiff();
+
+    // ---- 布局自检: 已知值张量 [2,3,4] (值 = i*100+j*10+k) ----
+    if let Some(dir) = &selftest {
+        use burn::tensor::Tensor;
+        let h = 2usize; let w = 3usize; let c = 4usize;
+        let mut vals = Vec::with_capacity(h * w * c);
+        for i in 0..h { for j in 0..w { for k in 0..c {
+            vals.push((i * 100 + j * 10 + k) as f32);
+        }}}
+        let t = Tensor::<3>::from_data(TensorData::new(vals.clone(), [h, w, c]), &device_ad);
+        let back: Vec<f32> = t.clone().into_data_async().await?.to_vec()?;
+        println!("SELFTEST: 输入 values (生成顺序 i,j,k): {vals:?}");
+        println!("SELFTEST: to_vec() 输出:              {back:?}");
+        println!("SELFTEST: 期望 row-major [2,3,4] = 输入; 若输出不同说明 burn 布局非 row-major");
+        std::fs::create_dir_all(dir)?;
+        let p = dir.join("selftest.npy");
+        write_npy_f32(&p, &back, &[h, w, c])?;
+        println!("SELFTEST: saved {p:?}");
+        return Ok(());
+    }
 
     let cfg = HexPlaneDeformConfig {
         hex_plane: HexPlaneConfig {
@@ -142,6 +144,52 @@ async fn main() -> Result<()> {
     let model = model.load_record(hex_rec);
     println!("loaded ckpt {} (coord_scale={scene_extent}, rs={hex_res})", ckpt.display());
 
+    // ---- 可选: 输出 HexPlane 特征平面 (棋盘格诊断) ---------------------
+    if let Some(dir) = dump_planes {
+        std::fs::create_dir_all(&dir)?;
+        for (name, plane) in model.planes() {
+            let dims = plane.dims(); // [a, b, C]
+            let data: Vec<f32> = plane.clone().into_data_async().await?.to_vec()?;
+            let [a, b, c] = [dims[0], dims[1], dims[2]];
+            // 相邻单元相关 (轴0/轴1): 展平对计算 Pearson r
+            let pearson = |pairs: &[(f32, f32)]| -> f64 {
+                let n = pairs.len() as f64;
+                if n < 2.0 { return f64::NAN; }
+                let mx = pairs.iter().map(|p| p.0 as f64).sum::<f64>() / n;
+                let my = pairs.iter().map(|p| p.1 as f64).sum::<f64>() / n;
+                let cov = pairs.iter().map(|p| (p.0 as f64 - mx) * (p.1 as f64 - my)).sum::<f64>() / n;
+                let vx = pairs.iter().map(|p| (p.0 as f64 - mx).powi(2)).sum::<f64>() / n;
+                let vy = pairs.iter().map(|p| (p.1 as f64 - my).powi(2)).sum::<f64>() / n;
+                if vx <= 0.0 || vy <= 0.0 { f64::NAN } else { cov / (vx * vy).sqrt() }
+            };
+            let mut p0 = Vec::new(); let mut p1 = Vec::new();
+            for iy in 0..b {
+                for ix in 0..a.saturating_sub(1) {
+                    for ch in 0..c {
+                        let idx = (iy * a + ix) * c + ch;
+                        p0.push((data[idx], data[idx + c]));
+                    }
+                }
+            }
+            for ix in 0..a {
+                for iy in 0..b.saturating_sub(1) {
+                    for ch in 0..c {
+                        let idx = (iy * a + ix) * c + ch;
+                        p1.push((data[idx], data[idx + a * c]));
+                    }
+                }
+            }
+            println!("plane {name} [{a}x{b}x{c}]: 相邻单元相关 轴0={:.3} 轴1={:.3} (平滑→+1, 棋盘格→-1), 幅度 std={:.4}",
+                pearson(&p0), pearson(&p1),
+                (data.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / data.len() as f64).sqrt());
+            // 保存为 .npy [a, b, C] (行主序: 数据本身即 C-order)
+            let path = dir.join(format!("plane_{name}.npy"));
+            write_npy_f32(&path, &data, &[a, b, c])?;
+            println!("  saved -> {}", path.display());
+        }
+        return Ok(());
+    }
+
     // 网格: 包围盒 = scene_extent*2 立方 (与训练一致), 由 spacing 决定分辨率。
     let span = 2.0 * scene_extent;
     let grid = [
@@ -169,13 +217,14 @@ async fn main() -> Result<()> {
     let xyz_t = Tensor::<2>::from_data(TensorData::new(pts, [n_pts, 3]), &device_ad);
 
     for p in 0..n_phase {
-        let ph = phase + p as f32 / n_phase.max(1) as f32 * 0.25;
+        let ph = if n_phase > 1 { p as f32 / n_phase as f32 } else { phase };
         let phase_t = Tensor::<2>::from_data(TensorData::new(vec![ph; n_pts], [n_pts, 1]), &device_ad);
         let time_t = Tensor::<2>::from_data(TensorData::new(vec![time; n_pts], [n_pts, 1]), &device_ad);
         let d = model.forward(xyz_t.clone(), phase_t, time_t).d_xyz;
         let dv: Vec<f32> = d.into_data_async().await?.to_vec()?;
-        let nii = out.with_file_name(format!("{}_phase{p:02}.nii.gz", out.file_name().unwrap().to_string_lossy()));
-        write_nifti_vec4d_gz(&nii, &dv, grid, [spacing; 3], origin)?;
+        let npy = out.with_file_name(format!("{}_phase{p:02}.npy", out.file_name().unwrap().to_string_lossy()));
+        write_npy_f32(&npy, &dv, &[grid[0], grid[1], grid[2], 3])?;
+        println!("  saved deform field -> {}", npy.display());
         // 平滑度: 相邻体素位移差 / 平均位移, 及自相关
         let mut mag: Vec<f64> = dv.chunks_exact(3).map(|c| ((c[0] as f64).powi(2) + (c[1] as f64).powi(2) + (c[2] as f64).powi(2)).sqrt()).collect();
         let mean_mag = mag.iter().sum::<f64>() / mag.len() as f64;
