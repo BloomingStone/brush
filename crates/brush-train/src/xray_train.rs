@@ -1110,17 +1110,31 @@ impl XRayTrainer {
     }
 }
 
+/// Initial canonical splat sampling region.
+#[derive(Debug, Clone, Copy)]
+pub enum InitRegion {
+    /// Uniform in a ball of `radius` around the isocenter (historical).
+    Ball { radius: f32 },
+    /// Uniform in a cylinder aligned with the rotation axis (Z): radius
+    /// `radius` in XY, half-height `half_height` along Z. Matches the
+    /// cone-beam FOV geometry better than a ball.
+    Cylinder { radius: f32, half_height: f32 },
+}
+
 /// Convenience: create an X-ray trainer with random canonical splats inside a
 /// ball of radius `scene_extent` around the isocenter (used by the CLI path).
 ///
 /// `fov = Some((cameras, img_size))` filters the random points to keep only
 /// those that project inside at least one camera's FOV — points outside every
 /// view frustum receive no image gradient, so their density stays at the init
-/// value forever and they become high-opacity outliers.
+/// value forever and they become high-opacity outliers. Pass `None` to keep
+/// all sampled points (e.g. for cylinder init where points re-enter the FOV
+/// during rotation).
 pub fn create_xray_trainer(
     config: XRayTrainConfig,
     num_points: u32,
     scene_extent: f32,
+    init: InitRegion,
     device: &Device,
     fov: Option<(&[brush_render::camera::Camera], glam::UVec2)>,
 ) -> XRayTrainer {
@@ -1146,8 +1160,8 @@ pub fn create_xray_trainer(
             )
         });
 
-    // Random positions, uniform in a ball of radius scene_extent (optionally
-    // filtered to keep only points visible in ≥1 view).
+    // Random positions, uniform in the sampling region (ball or cylinder,
+    // optionally filtered to keep only points visible in ≥1 view).
     let mut means = Vec::with_capacity(num_points as usize * 3);
     let mut rots = Vec::with_capacity(num_points as usize * 4);
     // Beer-Lambert alpha = `opac · mu · exp(power)` with `mu ≈ scale·√(2π)`
@@ -1173,12 +1187,27 @@ pub fn create_xray_trainer(
     let max_attempts = (num_points as usize * 30).max(10_000) as u32;
     while means.len() < num_points as usize * 3 && attempts < max_attempts {
         attempts += 1;
-        let u: f32 = rng.random_range(0.0..1.0);
-        let r = scene_extent * u.cbrt();
-        let theta = rng.random_range(0.0..std::f32::consts::PI);
-        let phi = rng.random_range(0.0..2.0 * std::f32::consts::PI);
-        let (s, c) = theta.sin_cos();
-        let p = [r * s * phi.cos(), r * s * phi.sin(), r * c];
+        // 采样区域: 球 (均匀体积) 或绕 Z 的圆柱 (均匀体积)。
+        let p = match init {
+            InitRegion::Ball { radius } => {
+                let u: f32 = rng.random_range(0.0..1.0);
+                let r = radius * u.cbrt();
+                let theta = rng.random_range(0.0..std::f32::consts::PI);
+                let phi = rng.random_range(0.0..2.0 * std::f32::consts::PI);
+                let (s, c) = theta.sin_cos();
+                [r * s * phi.cos(), r * s * phi.sin(), r * c]
+            }
+            InitRegion::Cylinder { radius, half_height } => {
+                // 均匀圆柱体积: r = R·√u1, θ = 2π·u2, z = half_h·(2u3−1)。
+                let u1: f32 = rng.random_range(0.0..1.0);
+                let u2: f32 = rng.random_range(0.0..1.0);
+                let u3: f32 = rng.random_range(0.0..1.0);
+                let r = radius * u1.sqrt();
+                let phi = 2.0 * std::f32::consts::PI * u2;
+                let z = half_height * (2.0 * u3 - 1.0);
+                [r * phi.cos(), r * phi.sin(), z]
+            }
+        };
         if let Some((views, img_size)) = &fov_views {
             let mut visible = false;
             for (view, (fx, fy, cx, cy)) in views {

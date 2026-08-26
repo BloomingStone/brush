@@ -141,6 +141,9 @@ pub(crate) async fn xray_stream(
         xray_cfg,
         process_config.xray_num_points,
         process_config.xray_scene_extent,
+        brush_train::xray_train::InitRegion::Ball {
+            radius: process_config.xray_scene_extent,
+        },
         &device,
         None,
     );

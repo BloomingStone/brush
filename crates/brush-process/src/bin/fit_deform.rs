@@ -166,6 +166,13 @@ async fn main() -> anyhow::Result<()> {
     // 41.12 vs 40.63, 且快 ~1.5×)。densify 会按梯度阈值补足, 初始种子少
     // → 空气区噪声少、放置更高效。
     let mut points = 5_000u32;
+    // 初始化采样区域: ball (球, 默认) | cylinder (绕 Z 圆柱, 匹配锥束 FOV)。
+    let mut init_shape = "ball".to_string();
+    // 圆柱半径 = R0(=half_w=W/2 世界) × scale; 高度自动 = 2·half_h·(1+R/SOD)。
+    let mut init_radius_scale = 1.0f32;
+    let mut init_density_base = 5_000u32; // R0 时的标准点数 (密度基准)
+    let mut init_height_factor = 0.0f32; // >0 覆盖自动高度 = F × (2·half_h)
+    let mut no_fov_filter = false;
     // None → 从相机几何自动计算(等中心 FOV 半径), 保证点云覆盖整个视野。
     let mut scene_extent: Option<f32> = None;
     // 自动 gamma: 让全局强度中位数映射到该目标灰度(0.5 = 中灰)。
@@ -297,6 +304,16 @@ async fn main() -> anyhow::Result<()> {
             iters = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--points=") {
             points = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--init-shape=") {
+            init_shape = v.to_string();
+        } else if let Some(v) = a.strip_prefix("--init-radius-scale=") {
+            init_radius_scale = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--init-density-base=") {
+            init_density_base = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--init-height-factor=") {
+            init_height_factor = v.parse()?;
+        } else if a == "--no-fov-filter" {
+            no_fov_filter = true;
         } else if let Some(v) = a.strip_prefix("--scene-extent=") {
             scene_extent = Some(v.parse()?);
         } else if let Some(v) = a.strip_prefix("--gamma-target=") {
@@ -672,16 +689,46 @@ async fn main() -> anyhow::Result<()> {
         min_splats,
         ..XRayRefineConfig::default()
     };
-    // FOV 过滤初始化: 只保留至少在一个视角内投影的点, 消除 FOV 外的高
-    // opacity 离群点 (无梯度 → 密度永不下降)。
+    // 相机几何: R0 = half_w (W/2 世界), half_h, sod。
+    let img_size = glam::uvec2(g0.width, g0.height);
+    let cam0 = &dataset.train.views[0].camera;
+    let focal = cam0.focal(img_size);
+    let sod = cam0.position.length();
+    let half_w = (g0.width as f32 * 0.5) * sod / focal.x;
+    let half_h = (g0.height as f32 * 0.5) * sod / focal.y;
+    // 初始采样区域: ball (球, scene_extent) 或 cylinder (绕 Z, R=half_w×scale,
+    // 高度=可视高度上界 2·half_h·(1+R/SOD), 密度恒定 → 点数按体积比缩放)。
+    let init = if init_shape == "cylinder" {
+        let r0 = half_w;
+        let r = r0 * init_radius_scale;
+        let half_h_cyl = if init_height_factor > 0.0 {
+            half_h * init_height_factor
+        } else {
+            half_h * (1.0 + r / sod)
+        };
+        let h0 = 2.0 * half_h * (1.0 + r0 / sod);
+        let vol_ratio = (r / r0).powi(2) * (2.0 * half_h_cyl) / h0;
+        points = (init_density_base as f32 * vol_ratio).round().max(1.0) as u32;
+        println!(
+            "{} cylinder init: R={r:.1} (R0 {r0:.1} x {init_radius_scale}), half_h={half_h_cyl:.1}, N={points} (density base {init_density_base} @ R0)",
+            ts()
+        );
+        brush_train::xray_train::InitRegion::Cylinder {
+            radius: r,
+            half_height: half_h_cyl,
+        }
+    } else {
+        brush_train::xray_train::InitRegion::Ball { radius: scene_extent }
+    };
+    // FOV 过滤初始化: 默认只保留至少在一个视角内投影的点 (消离群点);
+    // --no-fov-filter 关闭 (圆柱旋转中会重新入视野, 见实验)。
     let train_cams: Vec<_> = dataset.train.views.iter().map(|v| v.camera).collect();
-    let mut trainer = create_xray_trainer(
-        cfg,
-        points,
-        scene_extent,
-        &device,
-        Some((&train_cams, glam::uvec2(g0.width, g0.height))),
-    );
+    let fov = if no_fov_filter {
+        None
+    } else {
+        Some((train_cams.as_slice(), glam::uvec2(g0.width, g0.height)))
+    };
+    let mut trainer = create_xray_trainer(cfg, points, scene_extent, init, &device, fov);
     // 梯度诊断只在 eval 步收集(打印 + CSV 用), 见训练循环。
     let backend_name = match deform_backend {
         DeformBackend::HexPlane => {
@@ -693,9 +740,10 @@ async fn main() -> anyhow::Result<()> {
         DeformBackend::HashGrid => "hashgrid".to_owned(),
     };
     println!(
-        "{} init splats: {} (random ball r={}mm, init μ={} mm⁻¹, lr_mean={}->{}, lr_deform={}->{}), deform={} (predict_scaling={}, enable_time={}, time_freqs={}[{}-{}Hz]), refine every {}{}",
+        "{} init splats: {} (init region {:?}, r={}mm, init μ={} mm⁻¹, lr_mean={}->{}, lr_deform={}->{}), deform={} (predict_scaling={}, enable_time={}, time_freqs={}[{}-{}Hz]), refine every {}{}",
         ts(),
         trainer.num_splats(),
+        init,
         scene_extent,
         init_density,
         lr_mean,

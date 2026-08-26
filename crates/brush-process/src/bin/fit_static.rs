@@ -375,6 +375,7 @@ async fn main() -> anyhow::Result<()> {
         cfg,
         points,
         scene_extent,
+        brush_train::xray_train::InitRegion::Ball { radius: scene_extent },
         &device,
         Some((&train_cams, glam::uvec2(g0.width, g0.height))),
     );
