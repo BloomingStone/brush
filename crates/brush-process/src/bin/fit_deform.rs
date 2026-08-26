@@ -524,6 +524,10 @@ async fn main() -> anyhow::Result<()> {
     };
     let result = brush_dataset::load_dataset(vfs, &load_config).await?;
     let dataset = result.dataset;
+    // 从 DICOM header 取 SDD (源到探测器距离), 用于场景尺度定义。
+    let bytes = std::fs::read(&dcm)?;
+    let dcm_meta = brush_dicom::parse_dicom(&bytes)?;
+    let sdd = dcm_meta.geometry.sdd as f32;
     let g0 = dataset.train.views[0].gray_image.as_ref().expect("gray");
     println!(
         "{} loaded {} views, frame0 {}x{}",
@@ -586,8 +590,16 @@ async fn main() -> anyhow::Result<()> {
     let scene_extent = match scene_extent {
         Some(r) => r,
         None => {
-            let r = dataset.train.isocenter_fov_radius() * 1.05;
-            println!("{} auto scene_extent = {r:.1} mm (isocenter FOV radius x1.05)", ts());
+            // 物理上界: C-arm 旋转所能容纳的最大长度 = min(SOD, SDD-SOD),
+            // x0.6 安全冗余 + deform 网格分辨率折中 (0.8→11mm/单元过粗,
+            // 0.6→8.3mm/单元)。SOD = 源到等中心, SDD-SOD = 等中心到探测器。
+            let sod = dataset.train.views[0].camera.position.length();
+            let r = sod.min(sdd - sod) * 0.6;
+            println!(
+                "{} auto scene_extent = {r:.1} mm (min(SOD {sod:.0}, SDD-SOD {:.0}) x 0.6)",
+                ts(),
+                sdd - sod
+            );
             r
         }
     };
@@ -677,7 +689,7 @@ async fn main() -> anyhow::Result<()> {
         density_reset_interval,
         percent_dense: percent_dense.unwrap_or(0.0003),
         split_scale_factor: split_scale.unwrap_or(std::f32::consts::FRAC_1_SQRT_2),
-        max_bound_factor: bound_factor.unwrap_or(3.0),
+        max_bound_factor: bound_factor.unwrap_or(1.0),
         // prune 阈值 5e-4 (25% 水密度): 2026-08-21 高阈值扫描 LPIPS 最优
         // (0.4658 vs 2e-4 的 0.4719), PSNR 持平, 且剪掉更多空气废点。
         cull_density_threshold: cull_density.unwrap_or(5e-4),
@@ -696,6 +708,8 @@ async fn main() -> anyhow::Result<()> {
     let sod = cam0.position.length();
     let half_w = (g0.width as f32 * 0.5) * sod / focal.x;
     let half_h = (g0.height as f32 * 0.5) * sod / focal.y;
+    // R0 = W/2 世界 (FOV 圆柱半径): 追踪 >R0 的点 (应是空气, refine 后大量 prune)。
+    let r0 = half_w;
     // 初始采样区域: ball (球, scene_extent) 或 cylinder (绕 Z, R=half_w×scale,
     // 高度=可视高度上界 2·half_h·(1+R/SOD), 密度恒定 → 点数按体积比缩放)。
     let init = if init_shape == "cylinder" {
@@ -866,8 +880,9 @@ async fn main() -> anyhow::Result<()> {
         if step > 1
             && let Some(refine_stats) = trainer.maybe_refine(step).await
         {
+            let (beyond, total, md) = trainer.splats_beyond_radius(r0).await;
             println!(
-                "{} refine iter {step}: {} splats (added {}, split {}, pruned {}) grad_thr={}",
+                "{} refine iter {step}: {} splats (added {}, split {}, pruned {}) grad_thr={} | >R0={beyond}/{total} ({:.1}%), meanμ={md:.5}",
                 ts(),
                 refine_stats.total_splats,
                 refine_stats.num_added,
@@ -876,6 +891,7 @@ async fn main() -> anyhow::Result<()> {
                 refine_stats
                     .grad_threshold
                     .map_or(-1.0f32, |t| t),
+                beyond as f32 / total.max(1) as f32 * 100.0,
             );
         }
 

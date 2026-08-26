@@ -1006,6 +1006,46 @@ impl XRayTrainer {
     }
 
     /// Run the density controller (densify + prune) if due.
+    /// Diagnostic: count canonical splats whose distance from the isocenter
+    /// exceeds `r0` (mm) and their mean activated density (mm^-1). Used to
+    /// verify the mostly-air region beyond the FOV cylinder (r0 = W/2) is
+    /// pruned after densification starts — if not, the prune threshold is
+    /// wrong.
+    pub async fn splats_beyond_radius(&self, r0: f32) -> (u32, u32, f32) {
+        let means: Vec<f32> = self
+            .canonical
+            .means()
+            .into_data_async()
+            .await
+            .expect("means readback")
+            .into_vec::<f32>()
+            .unwrap();
+        let raw: Vec<f32> = self
+            .canonical
+            .raw_opacities
+            .val()
+            .into_data_async()
+            .await
+            .expect("raw readback")
+            .into_vec::<f32>()
+            .unwrap();
+        let n = raw.len();
+        let mut count = 0u32;
+        let mut den = 0.0f64;
+        for i in 0..n {
+            let r = (means[i * 3] * means[i * 3]
+                + means[i * 3 + 1] * means[i * 3 + 1]
+                + means[i * 3 + 2] * means[i * 3 + 2])
+            .sqrt();
+            if r > r0 {
+                count += 1;
+                den += (brush_cube::MU_WATER * brush_cube::silu(raw[i])) as f64;
+            }
+        }
+        let mean_den = if count > 0 { den / count as f64 } else { 0.0 };
+        (count, n as u32, mean_den as f32)
+    }
+
     pub async fn maybe_refine(&mut self, iter: u32) -> Option<XRayRefineStats> {
         if iter.is_multiple_of(self.config.refine.refine_every) {
             let (canonical, update, stats) = self.refiner.refine(iter, self.canonical.clone()).await;
