@@ -435,8 +435,10 @@ async fn main() -> anyhow::Result<()> {
     let mut dcm: Option<PathBuf> = None;
     let mut vol_x = 256usize;
     let mut vol_z: Option<usize> = None;
-    let mut pad_xy = 1.0f32;
-    let mut roi_inset = 20u32;
+    // 重建域内缩系数 (默认 1.0): 圆柱 mask 半径 = half_w × mask_scale。
+    // 亮边实为标定 bias (padded 版 b<0 使圆柱外空气发亮); mask=1.0 无
+    // padding 时 b≈0, 亮边可忽略, 内缩反而切掉真实结构掉 PSNR。
+    let mut mask_scale = 1.0f32;
     let mut steps = 256usize;
     let mut calib_views = 12usize;
     let mut save_drr = 2usize;
@@ -449,10 +451,8 @@ async fn main() -> anyhow::Result<()> {
             vol_x = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--vol-z=") {
             vol_z = Some(v.parse()?);
-        } else if let Some(v) = a.strip_prefix("--pad-xy=") {
-            pad_xy = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--roi=") {
-            roi_inset = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--mask-scale=") {
+            mask_scale = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--steps=") {
             steps = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--calib-views=") {
@@ -493,11 +493,11 @@ async fn main() -> anyhow::Result<()> {
         dicom_gamma: None,
         dicom_gamma_target: Some(0.5),
         max_scene_batch_cache_size: 1 << 30,
-        roi: brush_dataset::config::RoiSpec::Inset(roi_inset),
+        roi: brush_dataset::config::RoiSpec::Inset(20),
     };
     let result = brush_dataset::load_dataset(vfs, &load_config).await?;
     let views = &result.dataset.train.views;
-    println!("loaded {} views (roi inset={roi_inset})", views.len());
+    println!("loaded {} views (roi inset=20)", views.len());
 
     // 几何。
     let bytes = std::fs::read(&dcm)?;
@@ -510,23 +510,24 @@ async fn main() -> anyhow::Result<()> {
     let sod = cam.position.length();
     let half_w = (g0.width as f32 * 0.5) * sod / focal.x;
     let half_h = (g0.height as f32 * 0.5) * sod / focal.y;
-    // 域: XY = half_w × pad_xy (padded), Z = half_h (只与投影高度平齐)。
-    let rx = half_w * pad_xy;
-    let ry = half_w * pad_xy;
+    // 域: XY = half_w (无 padding), Z = half_h (只与投影高度平齐)。
+    let rx = half_w;
+    let ry = half_w;
     let rz = half_h;
     let vol_y = vol_x; // XY 正方形
     let spacing_xy = 2.0 * rx / vol_x as f32;
     let vol_z = vol_z.unwrap_or(((2.0 * rz) / spacing_xy).round() as usize);
     println!(
-        "geometry: sod={sod:.1} frame {}x{} delx={delx:.3}\n  domain rx=ry={rx:.1} (half_w {half_w:.1} x pad {pad_xy}) rz={rz:.1} (half_h {half_h:.1})\n  grid {vol_x}x{vol_y}x{vol_z}  spacing_xy={spacing_xy:.3} spacing_z={:.3}",
-        g0.width, g0.height, 2.0 * rz / vol_z as f32
+        "geometry: sod={sod:.1} frame {}x{} delx={delx:.3}\n  domain rx=ry={rx:.1} rz={rz:.1}  mask_r={:.1} (half_w {half_w:.1} x {mask_scale})\n  grid {vol_x}x{vol_y}x{vol_z}  spacing_xy={spacing_xy:.3} spacing_z={:.3}",
+        g0.width, g0.height, half_w * mask_scale, 2.0 * rz / vol_z as f32
     );
 
     // ---- ramp 滤波 + FDK 反投影 (只填全采样圆柱 half_w) ----
     let frames = build_frames(views, delx);
     println!("built {} filtered frames", frames.len());
     let t0 = std::time::Instant::now();
-    let mut volume = backproject_aniso(&frames, vol_x, vol_y, vol_z, rx, ry, rz, half_w);
+    let mask_r = half_w * mask_scale;
+    let mut volume = backproject_aniso(&frames, vol_x, vol_y, vol_z, rx, ry, rz, mask_r);
     println!("FDK backproject {vol_x}x{vol_y}x{vol_z} in {:.1}s", t0.elapsed().as_secs_f32());
     let max_v = volume.iter().copied().fold(0.0f32, f32::max);
     let n_neg = volume.iter().filter(|&&v| v < 0.0).count();
