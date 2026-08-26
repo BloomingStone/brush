@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
@@ -41,6 +41,7 @@ def main() -> None:
 
     vol = np.load(args.npy)
     vol = np.ascontiguousarray(vol, dtype=np.float32)
+    vol = np.transpose(vol, (0, 2, 1))  # (z,y,x) -> (x,y,z)
     n = vol.shape[0]
     assert vol.shape == (n, n, n), f"expected cube, got {vol.shape}"
 
