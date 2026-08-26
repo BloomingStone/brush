@@ -310,9 +310,11 @@ fn write_nifti_volume(path: &Path, data: &[f32], vol: usize, half_r: f32) -> any
     hdr.pixdim[3] = spacing;
     hdr.qform_code = 0;
     hdr.sform_code = 2;
+    // nifti-rs 内部 data.t() (Fortran 序) → 文件轴 [X,Z,Y]:
+    // axis0=X→x(对角i), axis1=Z 需→z, axis2=Y 需→y。所以 srow_y 用 k, srow_z 用 j。
     hdr.srow_x = [spacing, 0.0, 0.0, -half_r];
-    hdr.srow_y = [0.0, spacing, 0.0, -half_r];
-    hdr.srow_z = [0.0, 0.0, spacing, -half_r];
+    hdr.srow_y = [0.0, 0.0, spacing, -half_r];
+    hdr.srow_z = [0.0, spacing, 0.0, -half_r];
     WriterOptions::new(path)
         .reference_header(&hdr)
         .write_nifti(&arr)
@@ -421,6 +423,9 @@ async fn main() -> anyhow::Result<()> {
     let mut calib_views = 12usize;
     // 保存校准后 DRR 视图数 (0 = 不存) 用于目检 FDK 先验质量。
     let mut save_drr = 2usize;
+    // XY 方向 padding 系数: 重建/DRR 体积范围扩大 (half_w×pad), 容纳投影内
+    // 但超出等中心锥体半径的结构 (角落/肘部), 供后续 DRR 迭代优化表示。
+    let mut pad_xy = 1.0f32;
     // FDK 体积 → 真实 μ(mm⁻¹) 的缩放 (无量纲累加 × mu_scale = 线性衰减系数)。
     let mut mu_scale = 0.00021f32;
     let mut out = PathBuf::from("target/fdk/volume");
@@ -439,6 +444,8 @@ async fn main() -> anyhow::Result<()> {
             mu_scale = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--save-drr=") {
             save_drr = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--pad-xy=") {
+            pad_xy = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--out=") {
             out = PathBuf::from(v);
         } else if dcm.is_none() {
@@ -491,12 +498,11 @@ async fn main() -> anyhow::Result<()> {
     let sod = cam.position.length();
     let half_w = (g0.width as f32 * 0.5) * sod / focal.x;
     let half_h = (g0.height as f32 * 0.5) * sod / focal.y;
-    // 重建范围: XY(旋转平面)用完整锥体半径 half_w (探测器宽方向全跨),
-    // 不能用 min(half_w,half_h) — 那会缺失 84.7<ρ<118.6 的环带结构
-    // (肩/体部)。half_h 只限制 Z(竖直)方向。cube [-r,r]^3 覆盖全锥。
-    let cyl_radius = half_w;
+    // 重建范围: XY(旋转平面)用完整锥体半径 half_w × pad_xy (padding 容纳
+    // 投影内但超出等中心锥体的角落结构, 供 DRR 迭代优化表示)。
+    let cyl_radius = half_w * pad_xy;
     println!(
-        "SOD={sod:.1} mm, frame {}x{}, cyl radius={cyl_radius:.1} mm (half-w {half_w:.1}, half-h {half_h:.1})",
+        "SOD={sod:.1} mm, frame {}x{}, cyl radius={cyl_radius:.1} mm (half-w {half_w:.1} x pad {pad_xy}, half-h {half_h:.1})",
         g0.width, g0.height
     );
 

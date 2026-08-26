@@ -53,9 +53,11 @@ fn write_nifti_volume(path: &Path, data: &[f32], vol: usize, half_r: f32) -> any
     hdr.pixdim[3] = spacing;
     hdr.qform_code = 0;
     hdr.sform_code = 2;
+    // nifti-rs 内部 data.t() (Fortran 序) → 文件轴 [X,Z,Y]:
+    // axis0=X→x(对角i), axis1=Z 需→z, axis2=Y 需→y。所以 srow_y 用 k, srow_z 用 j。
     hdr.srow_x = [spacing, 0.0, 0.0, -half_r];
-    hdr.srow_y = [0.0, spacing, 0.0, -half_r];
-    hdr.srow_z = [0.0, 0.0, spacing, -half_r];
+    hdr.srow_y = [0.0, 0.0, spacing, -half_r];
+    hdr.srow_z = [0.0, spacing, 0.0, -half_r];
     WriterOptions::new(path)
         .reference_header(&hdr)
         .write_nifti(&arr)
@@ -136,6 +138,33 @@ async fn drr_backward_t(settings: &DrrSettings, v_proj: Tensor<2>) -> Tensor<3> 
     wrap_wgpu_float::<3>(out)
 }
 
+/// 平方 TV 梯度: TV = Σ(μ_{i+1}-μ_i)² (三轴), dTV/dμ = 离散 Laplacian×2
+/// (边界自动为 0 项)。加到体积梯度。
+fn tv_grad(v: &Tensor<3>) -> Tensor<3> {
+    use burn::tensor::s;
+    // x 轴 (dim2)
+    let prev_x = Tensor::cat(vec![v.clone().slice(s![.., .., 0..1]), v.clone().slice(s![.., .., 0..-1])], 2);
+    let next_x = Tensor::cat(vec![v.clone().slice(s![.., .., 1..]), v.clone().slice(s![.., .., -1..])], 2);
+    let mut g = v.clone().sub(prev_x).mul_scalar(2.0).add(v.clone().sub(next_x).mul_scalar(2.0));
+    // y 轴 (dim1)
+    let prev_y = Tensor::cat(vec![v.clone().slice(s![.., 0..1, ..]), v.clone().slice(s![.., 0..-1, ..])], 1);
+    let next_y = Tensor::cat(vec![v.clone().slice(s![.., 1.., ..]), v.clone().slice(s![.., -1.., ..])], 1);
+    g = g.add(v.clone().sub(prev_y).mul_scalar(2.0)).add(v.clone().sub(next_y).mul_scalar(2.0));
+    // z 轴 (dim0)
+    let prev_z = Tensor::cat(vec![v.clone().slice(s![0..1, .., ..]), v.clone().slice(s![0..-1, .., ..])], 0);
+    let next_z = Tensor::cat(vec![v.clone().slice(s![1.., .., ..]), v.clone().slice(s![-1.., .., ..])], 0);
+    g.add(v.clone().sub(prev_z).mul_scalar(2.0)).add(v.clone().sub(next_z).mul_scalar(2.0))
+}
+
+/// 平方 TV 值 (日志用)。
+fn tv_value(v: &Tensor<3>) -> f32 {
+    use burn::tensor::s;
+    let dx = v.clone().slice(s![.., .., 1..]).sub(v.clone().slice(s![.., .., ..-1])).powf_scalar(2.0).sum();
+    let dy = v.clone().slice(s![.., 1.., ..]).sub(v.clone().slice(s![.., ..-1, ..])).powf_scalar(2.0).sum();
+    let dz = v.clone().slice(s![1.., .., ..]).sub(v.clone().slice(s![..-1, .., ..])).powf_scalar(2.0).sum();
+    dx.add(dy).add(dz).into_scalar()
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -143,13 +172,17 @@ async fn main() -> anyhow::Result<()> {
     let mut volume_path = PathBuf::from("experiments/output/fdk-residual/fdk/volume.npy");
     let mut meta_path = PathBuf::from("experiments/output/fdk-residual/fdk/meta.json");
     let mut calib_path = PathBuf::from("experiments/output/fdk-residual/fdk/calib.json");
-    let mut iters = 300usize;
-    let mut lr = 0.05f32;
-    let mut batch = 8usize;
+    let mut iters = 500usize;
+    let mut lr = 1e-4f32;
+    let mut batch = 16usize;
     let mut steps = 256usize;
     let mut out = PathBuf::from("experiments/output/fdk-residual/fit_volume");
     let mut selftest = false;
     let mut eval_only = false;
+    let mut tv = 0.0f32;
+    let mut motion_mask = false;
+    let mut mask_sigma = 0.25f32; // 残差掩膜尺度 (proj 单位)
+    let mut mask_warmup = 150usize;
     let mut i = 1;
     while i < args.len() {
         let a = &args[i];
@@ -169,6 +202,14 @@ async fn main() -> anyhow::Result<()> {
             steps = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--out=") {
             out = PathBuf::from(v);
+        } else if let Some(v) = a.strip_prefix("--tv=") {
+            tv = v.parse()?;
+        } else if a == "--motion-mask" {
+            motion_mask = true;
+        } else if let Some(v) = a.strip_prefix("--mask-sigma=") {
+            mask_sigma = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--mask-warmup=") {
+            mask_warmup = v.parse()?;
         } else if a == "--selftest" {
             selftest = true;
         } else if a == "--eval-only" {
@@ -347,16 +388,29 @@ async fn main() -> anyhow::Result<()> {
             let s = &settings[vi];
             let proj = drr_forward_t(s, volume.clone()).await;
             let diff = proj.sub(gt_tensors[vi].clone());
-            let loss = diff.clone().powf_scalar(2.0).mean();
+            // 残差自适应运动掩膜: 静态区收敛后残差→0 权重→1, 心脏残差大→0。
+            // w = 1/(1+(|diff|/σ)²), 在 it>=mask_warmup 时启用。
+            let (diff_w, loss) = if motion_mask && it >= mask_warmup {
+                let r = diff.clone().abs();
+                let w = r.mul_scalar(1.0 / mask_sigma).powf_scalar(2.0).add_scalar(1.0).recip();
+                let md = diff.clone().mul(w.clone());
+                (md.clone(), md.mul(diff.clone()).mean())
+            } else {
+                (diff.clone(), diff.powf_scalar(2.0).mean())
+            };
             loss_acc += loss.clone().into_scalar::<f32>();
-            let v_proj = diff.mul_scalar(2.0 / n_pix);
+            let v_proj = diff_w.mul_scalar(2.0 / n_pix);
             let v_vol = drr_backward_t(s, v_proj).await;
             grad_acc = Some(match grad_acc {
                 Some(g) => g.add(v_vol),
                 None => v_vol,
             });
         }
-        let grad = grad_acc.expect("batch grad");
+        let mut grad = grad_acc.expect("batch grad");
+        // TV 正则: d(λ·TV)/dμ 加入梯度。
+        if tv > 0.0 {
+            grad = grad.add(tv_grad(&volume).mul_scalar(tv * batch as f32));
+        }
 
         // Adam (GPU 张量运算)。
         t_step += 1;

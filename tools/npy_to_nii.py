@@ -41,7 +41,7 @@ def main() -> None:
 
     vol = np.load(args.npy)
     vol = np.ascontiguousarray(vol, dtype=np.float32)
-    vol = np.transpose(vol, (0, 2, 1))  # (z,y,x) -> (x,y,z)
+    vol = np.transpose(vol, (2, 0, 1))  # FDK布局[Y,Z,X] -> nii数组[X,Y,Z] (i=x最快)
     n = vol.shape[0]
     assert vol.shape == (n, n, n), f"expected cube, got {vol.shape}"
 
