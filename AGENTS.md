@@ -36,14 +36,14 @@ systemd-run --user --scope -p CPUWeight=100 -p MemoryMax=12G \
 
 - 卡 0: hexplane 10k 基线
 
-### 实验组织规范 (2026-08-25 起, 强制)
+### 实验组织规范 (2026-08-26 起, 强制)
 
-- **输出目录**: `experiments/output/<exp_name>/<config_name>/`
+- **输出目录**: `experiments/output/<datetime>_<exp_name>/<config_name>/`
   (不要用 `target/`, 会被 cargo clean 清掉)。
-- **日志**: `experiments/output/<exp_name>/<config_name>.log`。
+- **日志**: `experiments/output/<datetime>_<exp_name>/<config_name>.log`。
 - **每个实验前必须先 git 提交** (提交信息以 `exp/` 开头), 并记录:
   - 日期时间 / 目的 / commit hash / 运行命令
-  - 写入 `experiments/output/<exp_name>/readme.md`。
+  - 写入 `experiments/output/<datetime>_<exp_name>/readme.md`。
 - 形变场导出: `deform_final.bin` + `deform_field_phase{p:02}.npy`
   (float32 行主序 `[nx,ny,nz,3]`) + `.nii.gz` (nifti-rs, 5D `[x,y,z,1,3]`
   同 ASOCA dvf, affine 随 nii)。
@@ -63,8 +63,9 @@ systemd-run --user --scope -p CPUWeight=100 -p MemoryMax=12G \
 
 - **LPIPS 是主要指标**(最符合人眼观感; PSNR/SSIM 在边缘处饱和失真,
   SSIM 早期就 0.999+ 不动)。对比实验看 LPIPS 为主, PSNR/SSIM 为辅。
+- 必须记录训练时间以便于后续评估运行速度
 - 边缘清晰度辅助指标 (`tools/edge_blur_analysis.py`): `blur_ratio` =
   pred/GT 梯度幅度比 (<1 越糊), `edge/bg_l1` = 边缘像素误差 vs 背景。
 - 数据诊断: `tools/roi_metric_dist.py`(ROI 分布), `tools/gt_gradmap.py`
-  (GT 梯度/噪声), `tools/data_consistency.py`(帧统计/相位调制), 
+  (GT 梯度/噪声), `tools/data_consistency.py`(帧统计/相位调制),
   `tools/edge_blur_map.py`(空间模糊热图)。
