@@ -461,7 +461,10 @@ async fn main() -> anyhow::Result<()> {
     let sod = cam.position.length();
     let half_w = (g0.width as f32 * 0.5) * sod / focal.x;
     let half_h = (g0.height as f32 * 0.5) * sod / focal.y;
-    let cyl_radius = half_w.min(half_h);
+    // 重建范围: XY(旋转平面)用完整锥体半径 half_w (探测器宽方向全跨),
+    // 不能用 min(half_w,half_h) — 那会缺失 84.7<ρ<118.6 的环带结构
+    // (肩/体部)。half_h 只限制 Z(竖直)方向。cube [-r,r]^3 覆盖全锥。
+    let cyl_radius = half_w;
     println!(
         "SOD={sod:.1} mm, frame {}x{}, cyl radius={cyl_radius:.1} mm (half-w {half_w:.1}, half-h {half_h:.1})",
         g0.width, g0.height
