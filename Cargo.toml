@@ -106,6 +106,7 @@ wasm-bindgen-futures = "0.4"
 wasm-streams = "0.6"
 
 rayon = "1.11"
+rustfft = "6.4"
 
 # Backends are chosen per platform.
 wgpu = { version = "29", default-features = false, features = ["naga-ir"] }
