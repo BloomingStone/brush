@@ -133,6 +133,7 @@ pub async fn render_xray(
     camera: &Camera,
     img_size: glam::UVec2,
     scale_modifier: f32,
+    signed_opac: bool,
 ) -> XRayRenderDiffOutput {
     let device = splats.device();
     assert!(
@@ -164,6 +165,7 @@ pub async fn render_xray(
         transforms_inner.clone(),
         raw_opac_inner.clone(),
         scale_modifier,
+        signed_opac,
         XRayPass::Backward,
     )
     .await;

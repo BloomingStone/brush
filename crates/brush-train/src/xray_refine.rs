@@ -53,6 +53,10 @@ pub struct XRayRefineConfig {
     pub fixed_grad_threshold: Option<f32>,
     /// Prune splats whose density is below this.
     pub cull_density_threshold: f32,
+    /// Signed (FDK-residual) opacity mode: density = `MU_WATER · raw` (can be
+    /// negative); prune uses `|density|` so near-zero residual splats of
+    /// either sign are culled.
+    pub signed_opac: bool,
     /// Reset opacity every this many steps.
     pub density_reset_interval: u32,
     /// Soft-reset cap (mm⁻¹): every `density_reset_interval` steps, activated
@@ -120,6 +124,7 @@ impl Default for XRayRefineConfig {
             // essentially decayed to zero (matches the Python project's
             // `cull_density_threshold: 5e-5`).
             cull_density_threshold: 5e-5,
+            signed_opac: false,
             // Disabled by default: an opacity/density reset is an RGB 3DGS
             // habit that does not survive the Beer-Lambert mapping — resetting
             // density mid-training destroys the learned attenuation field (the
@@ -307,10 +312,20 @@ impl XRayRefiner {
         // ---- Prune -------------------------------------------------------
         // Activated density = MU_WATER · silu(raw) (exp6); silu(raw)<0 for
         // raw<0 → decaying air splats fall under the cull threshold.
+        // Signed (FDK-residual) mode: density = MU_WATER·raw, prune on
+        // |density| so near-zero residuals of either sign are culled.
         let raw = splats.raw_opacities.val().clamp(-20.0, 20.0);
-        let sig = raw.clone().neg().exp().add_scalar(1.0).recip();
-        let density = raw.mul(sig).mul_scalar(MU_WATER);
-        let prune_density = density.clone().lower_elem(self.config.cull_density_threshold);
+        let density = if self.config.signed_opac {
+            raw.mul_scalar(MU_WATER)
+        } else {
+            let sig = raw.clone().neg().exp().add_scalar(1.0).recip();
+            raw.mul(sig).mul_scalar(MU_WATER)
+        };
+        let prune_density = if self.config.signed_opac {
+            density.clone().abs().lower_elem(self.config.cull_density_threshold)
+        } else {
+            density.clone().lower_elem(self.config.cull_density_threshold)
+        };
 
         let transforms_bad = row_non_finite(&splats.transforms.val());
         let opac_bad = row_non_finite(&splats.raw_opacities.val().unsqueeze_dim(1));

@@ -56,7 +56,7 @@ async fn autodiff_grads_match_pipeline() {
     );
 
     // Differentiable forward.
-    let out = render_xray(splats.clone(), &cam, img_size, 1.0).await;
+    let out = render_xray(splats.clone(), &cam, img_size, 1.0, false).await;
     assert_eq!(out.img.dims(), [64, 64]);
     let loss = out.img.sum();
     let grads = loss.backward();

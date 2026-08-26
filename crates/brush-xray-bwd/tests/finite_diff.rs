@@ -79,9 +79,10 @@ async fn render_loss(
     cam: &Camera,
     img_size: glam::UVec2,
     device: &burn::tensor::Device,
+    signed: bool,
 ) -> f32 {
     let splats = build_splats(scene, device);
-    let out = render_xray(splats, cam, img_size, 1.0).await;
+    let out = render_xray(splats, cam, img_size, 1.0, signed).await;
     out.img.sum().into_scalar_async::<f32>()
         .await
         .expect("loss readback")
@@ -92,9 +93,10 @@ async fn analytical_grads(
     cam: &Camera,
     img_size: glam::UVec2,
     device: &burn::tensor::Device,
+    signed: bool,
 ) -> (XRaySplats, Gradients) {
     let splats = build_splats(scene, device);
-    let out = render_xray(splats.clone(), cam, img_size, 1.0).await;
+    let out = render_xray(splats.clone(), cam, img_size, 1.0, signed).await;
     let grads = out.img.sum().backward();
     (splats, grads)
 }
@@ -166,13 +168,14 @@ async fn numerical_grad(
     splat: usize,
     comp: usize,
     eps: f32,
+    signed: bool,
 ) -> f32 {
     let mut plus = scene.clone();
     perturb(&mut plus, lane, splat, comp, eps);
     let mut minus = scene.clone();
     perturb(&mut minus, lane, splat, comp, -eps);
-    let vp = render_loss(&plus, cam, img_size, device).await;
-    let vm = render_loss(&minus, cam, img_size, device).await;
+    let vp = render_loss(&plus, cam, img_size, device, signed).await;
+    let vm = render_loss(&minus, cam, img_size, device, signed).await;
     (vp - vm) / (2.0 * eps)
 }
 
@@ -184,7 +187,32 @@ async fn finite_diff_vs_analytical() {
     let cam = std_cam();
     let img_size = glam::uvec2(64, 64);
     let scene = base_scene();
+    run_finite_diff(&scene, &cam, img_size, &device, false).await;
+}
 
+/// Signed (FDK-residual) mode: raw opacity used directly (`opac = MU_WATER ·
+/// raw`), small ± values — validates the constant `d opac/d raw = MU_WATER`.
+#[tokio::test]
+async fn finite_diff_vs_analytical_signed() {
+    let device = burn::tensor::Device::from(
+        brush_cube::test_helpers::test_device().await,
+    ).autodiff();
+    let cam = std_cam();
+    let img_size = glam::uvec2(64, 64);
+    // Small signed residuals (|density| ≈ MU_WATER·0.005 ≈ 1e-5), incl. a
+    // larger negative one to exercise the subtraction path.
+    let mut scene = base_scene();
+    scene.raw_opac = vec![-0.005, 0.004, -0.003, -0.12];
+    run_finite_diff(&scene, &cam, img_size, &device, true).await;
+}
+
+async fn run_finite_diff(
+    scene: &Scene,
+    cam: &Camera,
+    img_size: glam::UVec2,
+    device: &burn::tensor::Device,
+    signed: bool,
+) {
     let eps = 5e-4_f32;
     // Large gradients (means/log-scales/opacity) must match to ~5%; the
     // rotation gradients in this scene are tiny (~1e-3) and dominated by
@@ -194,7 +222,7 @@ async fn finite_diff_vs_analytical() {
     let atol = 5e-2_f32;   // absolute tolerance
     let rtol = 5e-2_f32;   // relative tolerance (5%)
 
-    let (splats, grads) = analytical_grads(&scene, &cam, img_size, &device).await;
+    let (splats, grads) = analytical_grads(scene, cam, img_size, device, signed).await;
 
     let cases: &[(Lane, usize, usize)] = &[
         // Means
@@ -226,7 +254,7 @@ async fn finite_diff_vs_analytical() {
     for &(lane, splat, comp) in cases {
         let analytical = analytical_at(&splats, &grads, lane, splat, comp).await;
         let numerical = numerical_grad(
-            &scene, &cam, img_size, &device, lane, splat, comp, eps,
+            &scene, &cam, img_size, &device, lane, splat, comp, eps, signed,
         )
         .await;
 

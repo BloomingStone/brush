@@ -64,6 +64,7 @@ pub trait XRayOps: Backend {
         transforms: FloatTensor<Self>,
         raw_opacities: FloatTensor<Self>,
         scale_modifier: f32,
+        signed_opac: bool,
         pass: XRayPass,
     ) -> impl Future<Output = XRayRenderOutput<Self>>;
 }
@@ -90,6 +91,7 @@ pub async fn render_xray_forward(
         transforms,
         raw_opac,
         scale_modifier,
+        false,
         XRayPass::Forward,
     )
     .await;

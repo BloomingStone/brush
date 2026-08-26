@@ -31,6 +31,7 @@ impl XRayOps for Fusion<MainBackendBase> {
         transforms: FloatTensor<Self>,
         raw_opacities: FloatTensor<Self>,
         scale_modifier: f32,
+        signed_opac: bool,
         pass: XRayPass,
     ) -> XRayRenderOutput<Self> {
         let client = transforms.client.clone();
@@ -51,6 +52,7 @@ impl XRayOps for Fusion<MainBackendBase> {
             base_transforms,
             base_raw_opac,
             scale_modifier,
+            signed_opac,
             pass,
         )
         .await;

@@ -37,7 +37,12 @@ pub fn project_visible_xray_kernel(
 
     let (conic, mu, cov3) = cone_cov2d_mu(mean_c, scale, quat, u);
     // Activated density = MU_WATER · softplus(raw) (see project_forward.rs).
-    let opac = MU_WATER * silu(raw_opacities[global_gid as usize]); // exp6
+    // Signed (FDK-residual) mode: `MU_WATER · raw` (raw used directly).
+    let opac = if u.signed_opac != 0u32 {
+        MU_WATER * raw_opacities[global_gid as usize]
+    } else {
+        MU_WATER * silu(raw_opacities[global_gid as usize])
+    }; // exp6
     let (xy_x, xy_y) = project_xy(mean_c, u);
     let radius = compute_radius(cov3);
 

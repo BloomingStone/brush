@@ -146,6 +146,7 @@ pub(crate) async fn xray_stream(
         },
         &device,
         None,
+        None,
     );
     if static_mode {
         log::info!(

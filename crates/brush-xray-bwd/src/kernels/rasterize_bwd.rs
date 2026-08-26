@@ -63,7 +63,8 @@ pub fn rasterize_xray_bwd_kernel<A: AtomicAddF32>(
         if power <= 0.0f32 {
             let g = f32::exp(power);
             let alpha = opac * mu * g;
-            if alpha >= MIN_ALPHA {
+            // Must mirror the forward gate exactly (|alpha| in signed mode).
+            if f32::abs(alpha) >= MIN_ALPHA {
                 let dL_dalpha = v_pix;
                 let dL_dg = opac * mu * dL_dalpha;
                 let gdx = g * d_x;

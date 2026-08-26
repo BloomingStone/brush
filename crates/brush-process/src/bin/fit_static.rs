@@ -378,6 +378,7 @@ async fn main() -> anyhow::Result<()> {
         brush_train::xray_train::InitRegion::Ball { radius: scene_extent },
         &device,
         Some((&train_cams, glam::uvec2(g0.width, g0.height))),
+        None,
     );
     // 梯度诊断只在 eval 步收集(打印 + CSV 用), 见训练循环。
     println!(

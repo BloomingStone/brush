@@ -296,9 +296,15 @@ pub fn project_xray_bwd_kernel(
 
     // Opacity: activated density is `MU_WATER · silu(raw)` (exp6), so
     // d opac/d raw = MU_WATER · silu'(raw), silu'(x) = σ(x) + x·σ(x)(1−σ(x)).
-    let sig = sigmoid(raw_opac);
-    let silu_deriv = sig + raw_opac * sig * (1.0f32 - sig);
-    let v_raw = v_opac * MU_WATER * silu_deriv;
+    // Signed (FDK-residual) mode: `opac = MU_WATER · raw` → d opac/d raw =
+    // MU_WATER (constant).
+    let v_raw = if u.signed_opac != 0u32 {
+        v_opac * MU_WATER
+    } else {
+        let sig = sigmoid(raw_opac);
+        let silu_deriv = sig + raw_opac * sig * (1.0f32 - sig);
+        v_opac * MU_WATER * silu_deriv
+    };
 
     // Refine weight: viewspace (mean2D) gradient norm per splat, used by the
     // density controller for densification (mirrors the RGB render path's

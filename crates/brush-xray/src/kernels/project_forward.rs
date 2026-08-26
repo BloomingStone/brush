@@ -67,7 +67,14 @@ pub fn project_forward_xray_kernel(
         terminate!();
     }
 
-    let opac = MU_WATER * silu(raw_opac); // exp6: silu 代替 softplus
+    // exp6: silu 代替 softplus. Signed (FDK-residual) mode uses `raw`
+    // directly so the residual splats can subtract absorption from the FDK
+    // static prior.
+    let opac = if u.signed_opac != 0u32 {
+        MU_WATER * raw_opac
+    } else {
+        MU_WATER * silu(raw_opac)
+    };
     // Physical-density floor: μ_water ≈ 0.002 mm⁻¹ is a perfectly meaningful
     // Beer-Lambert path-integral contribution (0.002 × 200 mm ≈ 0.4 optical
     // depth ≈ exp(-0.4) ≈ 0.67 intensity) even though it sits below the RGB
@@ -78,7 +85,8 @@ pub fn project_forward_xray_kernel(
     // Activated density = MU_WATER · softplus(raw): μ stays in the
     // water→iodine band (a stray large logit gives at most ~0.002·raw instead
     // of the unbounded sigmoid → 1 mm⁻¹ that caused black-blob artifacts).
-    if !(opac >= 1.0e-5f32) {
+    // Signed mode gates on |opac| so negative residuals are also projected.
+    if !(f32::abs(opac) >= 1.0e-5f32) {
         terminate!();
     }
 

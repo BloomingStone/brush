@@ -109,6 +109,17 @@ fn save_stack(dir: &Path, iter: u32, pairs: &[TensorData]) {
     println!("{} saved {} ({} views stacked)", ts(), p.display(), pairs.len());
 }
 
+/// 读 3D 体积为 .nii.gz → (vol_vec, vx, vy, vz)。与 fit_volume 相同。
+fn read_nifti_volume(path: &Path) -> anyhow::Result<(Vec<f32>, usize, usize, usize)> {
+    use nifti::{NiftiObject, ReaderOptions};
+    let obj = ReaderOptions::new().read_file(path)?;
+    let dims = obj.header().dim;
+    let (vx, vy, vz) = (dims[1] as usize, dims[2] as usize, dims[3] as usize);
+    let volume = obj.into_volume();
+    let data: Vec<f32> = volume.into_nifti_typed_data()?;
+    Ok((data, vx, vy, vz))
+}
+
 /// `[HH:MM:SS]` 北京时间 (UTC+8, 固定偏移; 轻量, 无 chrono 依赖)。
 fn ts() -> String {
     let d = SystemTime::now()
@@ -263,6 +274,13 @@ async fn main() -> anyhow::Result<()> {
     let mut bound_factor: Option<f32> = None;
     // prune 密度阈值 (默认 5e-5)。
     let mut cull_density: Option<f32> = None;
+    // FDK 静态先验 (残差 GS): --fdk-volume=<nii.gz> --fdk-meta=<json> --fdk-calib=<json>。
+    // 开启后有符号渲染 + 残差初始化 + proj = splat + fdk DRR。
+    let mut fdk_volume: Option<PathBuf> = None;
+    let mut fdk_meta: Option<PathBuf> = None;
+    let mut fdk_calib: Option<PathBuf> = None;
+    let mut fdk_steps = 256u32;
+    let mut fdk_residual_init_density = 1e-5f32;
     // screen-size prune 阈值 (px, 0 = 关闭)。
     let mut max_screen_size: Option<f32> = None;
     // 贡献裁剪 (默认关): 剪掉 density×屏幕面积×可见性 都低且处于最低百分位
@@ -426,6 +444,16 @@ async fn main() -> anyhow::Result<()> {
             bound_factor = Some(v.parse()?);
         } else if let Some(v) = a.strip_prefix("--cull-density=") {
             cull_density = Some(v.parse()?);
+        } else if let Some(v) = a.strip_prefix("--fdk-volume=") {
+            fdk_volume = Some(PathBuf::from(v));
+        } else if let Some(v) = a.strip_prefix("--fdk-meta=") {
+            fdk_meta = Some(PathBuf::from(v));
+        } else if let Some(v) = a.strip_prefix("--fdk-calib=") {
+            fdk_calib = Some(PathBuf::from(v));
+        } else if let Some(v) = a.strip_prefix("--fdk-steps=") {
+            fdk_steps = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--fdk-resid-init-density=") {
+            fdk_residual_init_density = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--max-screen-size=") {
             max_screen_size = Some(v.parse()?);
         } else if a == "--cull-contribution" {
@@ -742,7 +770,42 @@ async fn main() -> anyhow::Result<()> {
     } else {
         Some((train_cams.as_slice(), glam::uvec2(g0.width, g0.height)))
     };
-    let mut trainer = create_xray_trainer(cfg, points, scene_extent, init, &device, fov);
+    // FDK 静态先验 (残差 GS): 加载校准体积 + 元数据, 有符号渲染 + 残差初始化。
+    let mut fdk_prior = None;
+    if let Some(vol_path) = fdk_volume {
+        let meta_path = fdk_meta.unwrap_or_else(|| {
+            vol_path.with_file_name("meta.json")
+        });
+        let calib_path = fdk_calib.unwrap_or_else(|| {
+            vol_path.with_file_name("calib.json")
+        });
+        use brush_train::fdk_prior::FdkPrior;
+        let (vol_vec, _vx, _vy, _vz) = read_nifti_volume(&vol_path)?;
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
+        let rx = meta["rx"].as_f64().unwrap_or(118.6) as f32;
+        let ry = meta["ry"].as_f64().unwrap_or(rx as f64) as f32;
+        let rz = meta["rz"].as_f64().unwrap_or(84.7) as f32;
+        let vol_x = meta["vol_x"].as_u64().unwrap_or(_vx as u64) as usize;
+        let vol_y = meta["vol_y"].as_u64().unwrap_or(_vy as u64) as usize;
+        let vol_z = meta["vol_z"].as_u64().unwrap_or(_vz as u64) as usize;
+        assert_eq!(vol_vec.len(), vol_x * vol_y * vol_z, "FDK volume size mismatch");
+        let calib: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&calib_path)?)?;
+        let scale = calib["s"].as_f64().unwrap_or(1.0) as f32;
+        let bias = calib["b"].as_f64().unwrap_or(0.0) as f32;
+        println!(
+            "{} FDK prior: {vol_x}x{vol_y}x{vol_z} (rx={rx:.1} ry={ry:.1} rz={rz:.1}mm), calib s={scale:.5} b={bias:.5}, resid-init-density={fdk_residual_init_density:e}, signed render",
+            ts()
+        );
+        cfg.fdk_residual = true;
+        cfg.fdk_residual_init_density = fdk_residual_init_density;
+        fdk_prior = Some(FdkPrior::new(
+            vol_vec, vol_x, vol_y, vol_z, rx, ry, rz, fdk_steps, scale, bias,
+            &device.clone().autodiff(),
+        ));
+    }
+    let mut trainer = create_xray_trainer(cfg, points, scene_extent, init, &device, fov, fdk_prior);
     // 梯度诊断只在 eval 步收集(打印 + CSV 用), 见训练循环。
     let backend_name = match deform_backend {
         DeformBackend::HexPlane => {

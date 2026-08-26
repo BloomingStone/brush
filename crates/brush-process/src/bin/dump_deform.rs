@@ -198,6 +198,7 @@ async fn main() -> Result<()> {
             ..Default::default()
         },
         plane_tv_weight: 0.0,
+        rigid_anchor_weight: 0.0,
     };
     let model = HexPlaneDeformModel::new(cfg, &device_ad);
     // ckpt 是 DeformNetwork 枚举记录 (含 HexPlane/HashGrid variant tag),

@@ -200,6 +200,7 @@ pub async fn xray_bwd_pipeline(
         transforms.clone(),
         raw_opacities.clone(),
         scale_modifier,
+        false,
         XRayPass::Backward,
     )
     .await;

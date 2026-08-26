@@ -36,6 +36,7 @@ use burn::{
 };
 
 use crate::adam_scaled::{AdamScaled, AdamScaledConfig};
+use crate::fdk_prior::FdkPrior;
 use crate::xray_refine::{XRayRefineConfig, XRayRefineStats, XRayRefiner};
 
 /// Which deform-network backend to train.
@@ -153,6 +154,14 @@ pub struct XRayTrainConfig {
     /// target sits at higher intensity so the init ball starts at the right
     /// gray level (Beer-Lambert `proj` scales linearly with density).
     pub init_density: f32,
+    /// FDK-residual mode: render with **signed opacity** (`opac = MU_WATER ·
+    /// raw`, raw used directly so residual splats can subtract absorption),
+    /// init raw small (`±init_density/MU_WATER`, sign-randomized), and the
+    /// total projection = splat residual + FDK prior DRR.
+    pub fdk_residual: bool,
+    /// Small signed density magnitude the residual splats are initialized at
+    /// (`|density| ≈ 1e-5` by default) in FDK-residual mode.
+    pub fdk_residual_init_density: f32,
     /// L1 / SSIM weights for the gray loss.
     pub l1_weight: f32,
     pub ssim_weight: f32,
@@ -223,6 +232,8 @@ impl Default for XRayTrainConfig {
             time_enc: TimeEncodingConfig::default(),
             refine: XRayRefineConfig::default(),
             init_density: brush_cube::MU_WATER,
+            fdk_residual: false,
+            fdk_residual_init_density: 1e-5,
             l1_weight: 1.0,
             ssim_weight: 1.0,
             loss_type: GrayLossType::L1,
@@ -312,6 +323,8 @@ pub struct XRayTrainer {
     collect_loss: bool,
     /// Last read-back loss value (used when `collect_loss` is off).
     last_loss: f32,
+    /// FDK static prior (constant DRR volume). `None` = plain splat render.
+    fdk: Option<FdkPrior>,
     /// VGG-LPIPS model for perceptual eval (loaded once; `None` keeps the
     /// eval free of the extra GPU memory).
     lpips: Option<lpips::LpipsModel>,
@@ -323,12 +336,18 @@ impl XRayTrainer {
         canonical: XRaySplats,
         deform: Option<DeformNetwork>,
         respi: Option<DeformNetwork>,
+        fdk: Option<FdkPrior>,
         device: &Device,
     ) -> Self {
         let mut refine_cfg = config.refine.clone();
         refine_cfg.total_iters = config.total_iters;
         // 软重置的密度 cap 与训练初始化密度保持一致。
-        refine_cfg.init_density = config.init_density;
+        refine_cfg.init_density = if config.fdk_residual {
+            config.fdk_residual_init_density
+        } else {
+            config.init_density
+        };
+        refine_cfg.signed_opac = config.fdk_residual;
         let num_points = canonical.num_splats();
         let refiner = XRayRefiner::new(refine_cfg, num_points, device);
 
@@ -372,6 +391,7 @@ impl XRayTrainer {
             collect_grads: false,
             collect_loss: true,
             last_loss: f32::NAN,
+            fdk,
             lpips: Some(lpips::load_vgg_lpips(device)),
         }
     }
@@ -472,9 +492,14 @@ impl XRayTrainer {
         // 计时探针: 设置环境变量 BRUSH_PROFILE_EVAL=1 打印各段耗时(排查瓶颈)。
         let profile = std::env::var("BRUSH_PROFILE_EVAL").is_ok();
         let t0 = std::time::Instant::now();
-        let out = render_xray(deformed, camera, img_size, 1.0).await;
+        let out = render_xray(deformed, camera, img_size, 1.0, self.config.fdk_residual).await;
         let t_render = t0.elapsed();
-        let intensity = (-out.img.clamp(1e-3, 14.0)).exp();
+        let mut proj = out.img;
+        if let Some(fdk) = &self.fdk {
+            let fdk_drr = fdk.drr_for(camera, img_size).await;
+            proj = proj.add(fdk_drr);
+        }
+        let intensity = (-proj.clamp(1e-3, 14.0)).exp();
         let gt_t = Tensor::<2>::from_data(gt.clone(), &device_ad);
 
         let psnr = gray_psnr(intensity.clone(), gt_t.clone())
@@ -665,9 +690,17 @@ impl XRayTrainer {
                 .map_or(0, |g| g.shape[0]) as u32,
         );
         assert!(img_size[0] > 0 && img_size[1] > 0, "X-ray batch needs a gray GT image");
-        let out = render_xray(deformed, &batch.camera, img_size, 1.0).await;
+        let out = render_xray(deformed, &batch.camera, img_size, 1.0, self.config.fdk_residual).await;
 
-        let intensity = (-out.img.clone().clamp(1e-3, 14.0)).exp();
+        // FDK-residual: total projection = splat residual + static prior DRR
+        // (both in the `-ln(gray)` proj domain, so they sum additively).
+        let mut proj = out.img;
+        if let Some(fdk) = &self.fdk {
+            let fdk_drr = fdk.drr_for(&batch.camera, img_size).await;
+            proj = proj.add(fdk_drr);
+        }
+
+        let intensity = (-proj.clone().clamp(1e-3, 14.0)).exp();
         let gt = Tensor::<2>::from_data(batch.img_gray.clone().expect("gray GT"), &device_ad);
         let loss_cfg = GrayLossConfig {
             l1_weight: self.config.l1_weight,
@@ -696,7 +729,7 @@ impl XRayTrainer {
         // Proj 域损失: 在 `proj = -ln(intensity)`（Beer-Lambert 衰减积分）域比较,
         // 避开 exp 压缩导致暗部/高 proj 区梯度衰减的问题。
         if self.config.proj_weight > 0.0 || self.config.proj_ssim_weight > 0.0 {
-            let proj_pred = out.img.clone().clamp(1e-3, 14.0); // = -ln(intensity)
+            let proj_pred = proj.clone().clamp(1e-3, 14.0); // = -ln(intensity)
             let proj_gt = gt.clone().clamp(1e-4, 1.0).log().neg(); // = -ln(gt)
             if self.config.proj_weight > 0.0 {
                 // 同样使用配置的 robust 惩罚 (L1/Charbonnier/Huber/L2)。
@@ -738,7 +771,7 @@ impl XRayTrainer {
         // 多窗宽窗位损失: 在 proj(衰减)域做多个窗变换, 各窗下增强不同结构
         // (软组织 / 骨 / 细细节)。窗变换: clamp((x-(wl-ww/2))/ww, 0, 1)。
         if self.config.window_weight > 0.0 {
-            let proj_pred = out.img.clone().clamp(1e-3, 14.0);
+            let proj_pred = proj.clone().clamp(1e-3, 14.0);
             let proj_gt = gt.clone().clamp(1e-4, 1.0).log().neg();
             for (wl, ww) in [(0.6, 0.4), (1.2, 0.6), (0.4, 0.25)] {
                 let wp = (proj_pred.clone() - (wl - ww / 2.0))
@@ -1177,6 +1210,7 @@ pub fn create_xray_trainer(
     init: InitRegion,
     device: &Device,
     fov: Option<(&[brush_render::camera::Camera], glam::UVec2)>,
+    fdk: Option<FdkPrior>,
 ) -> XRayTrainer {
     let mut config = config;
     // 分阶段双场模式: 心电场必须纯相位 (关 time), 避免两场耦合。
@@ -1220,7 +1254,14 @@ pub fn create_xray_trainer(
     const MU_WATER: f32 = 0.002; // mm^-1 (density activation scale)
     // Density activation is `MU_WATER · silu(raw)` (exp6). Start at the
     // configured init density: raw = inverse_silu(init_density / MU_WATER).
-    let init_raw_opac = brush_cube::inverse_silu(config.init_density / MU_WATER);
+    // FDK-residual mode: signed (opac = MU_WATER·raw) + tiny |density| with a
+    // random sign, so the residual starts near zero and can go either way.
+    let (init_raw_opac, fdk_residual): (f32, bool) = if config.fdk_residual {
+        let mag = config.fdk_residual_init_density / MU_WATER;
+        (mag, true)
+    } else {
+        (brush_cube::inverse_silu(config.init_density / MU_WATER), false)
+    };
     let mut raw_opac = Vec::with_capacity(num_points as usize);
     let mut attempts = 0u32;
     // 防死循环上限 (FOV 过滤可能拒绝大量随机点)。
@@ -1273,7 +1314,16 @@ pub fn create_xray_trainer(
         }
         means.extend_from_slice(&p);
         rots.extend_from_slice(&[1.0, 0.0, 0.0, 0.0]);
-        raw_opac.push(init_raw_opac);
+        let raw = if fdk_residual {
+            if rng.random_range(0.0..1.0) < 0.5 {
+                init_raw_opac
+            } else {
+                -init_raw_opac
+            }
+        } else {
+            init_raw_opac
+        };
+        raw_opac.push(raw);
     }
     if means.len() < num_points as usize * 3 {
         log::warn!(
@@ -1356,5 +1406,5 @@ pub fn create_xray_trainer(
         None
     };
 
-    XRayTrainer::new(config, canonical, deform, respi, device)
+    XRayTrainer::new(config, canonical, deform, respi, fdk, device)
 }

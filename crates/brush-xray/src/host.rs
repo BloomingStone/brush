@@ -33,6 +33,8 @@ pub struct XRayProjectUniforms {
     /// Linear scale multiplier applied to all splats before covariance 
     /// (R2-Gaussian `scale_modifier`).
     pub scale_modifier: f32,
+    /// Signed (FDK-residual) opacity mode: `opac = MU_WATER · raw`.
+    pub signed_opac: u32,
 }
 
 impl XRayProjectUniforms {
@@ -44,6 +46,7 @@ impl XRayProjectUniforms {
         img_size: glam::UVec2,
         total_splats: u32,
         scale_modifier: f32,
+        signed_opac: bool,
     ) -> Self {
         let viewmat = glam::Mat4::from(camera.world_to_local()).to_cols_array_2d();
         let focal = camera.focal(img_size);
@@ -78,6 +81,7 @@ impl XRayProjectUniforms {
             total_splats,
             num_visible: 0,
             scale_modifier,
+            signed_opac: signed_opac as u32,
         }
     }
 
@@ -111,6 +115,7 @@ impl XRayProjectUniforms {
             self.total_splats,
             self.num_visible,
             self.scale_modifier,
+            self.signed_opac,
         )
     }
 }
@@ -156,7 +161,7 @@ mod tests {
             brush_render::kernels::camera_model::CameraModel::Pinhole,
         );
         let img = glam::uvec2(648, 474);
-        let u = XRayProjectUniforms::from_camera(&cam, img, 1000, 1.0);
+        let u = XRayProjectUniforms::from_camera(&cam, img, 1000, 1.0, false);
 
         // Column-major viewmat.
         let v = |c: usize, r: usize| u.viewmat[c][r];

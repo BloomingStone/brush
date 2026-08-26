@@ -1272,6 +1272,7 @@ dependencies = [
  "brush-dataset",
  "brush-deform",
  "brush-dicom",
+ "brush-drr",
  "brush-loss",
  "brush-render",
  "brush-render-bwd",

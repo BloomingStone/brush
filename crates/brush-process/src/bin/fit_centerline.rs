@@ -186,7 +186,7 @@ async fn main() -> anyhow::Result<()> {
         refine_every: u32::MAX, // 禁用 densify/prune, 验证纯梯度
         ..XRayRefineConfig::default()
     };
-    let mut trainer = XRayTrainer::new(cfg, canonical, None, None, &device);
+    let mut trainer = XRayTrainer::new(cfg, canonical, None, None, None, &device);
 
     let mut dataloader = SceneLoader::new(&dataset.train, 42, &load_config);
 

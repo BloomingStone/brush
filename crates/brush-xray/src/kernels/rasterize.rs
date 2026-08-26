@@ -117,7 +117,10 @@ pub fn rasterize_xray_kernel(
                 -0.5f32 * (conic.c00 * d_x * d_x + conic.c11 * d_y * d_y) - conic.c01 * d_x * d_y;
             if power <= 0.0f32 {
                 let alpha = opac * mu * f32::exp(power);
-                if alpha >= MIN_ALPHA {
+                // Signed-residual mode allows negative `opac` (splats that
+                // subtract absorption). |alpha| keeps the gate consistent in
+                // both modes (unsigned `alpha ≥ 0`, so abs is a no-op there).
+                if f32::abs(alpha) >= MIN_ALPHA {
                     acc += alpha;
                     last_useful_isect = batch_start + t + 1u32;
                     if comptime![bwd_info] {

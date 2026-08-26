@@ -42,6 +42,9 @@ pub struct XRayProjectUniforms {
     pub num_visible: u32,
     /// Linear scale multiplier applied before covariance (R2 `scale_modifier`).
     pub scale_modifier: f32,
+    /// Signed (FDK-residual) opacity mode: `opac = MU_WATER · raw` (raw used
+    /// directly, can be negative) instead of `MU_WATER · silu(raw) ≥ 0`.
+    pub signed_opac: u32,
 }
 
 #[cube]
