@@ -1,8 +1,7 @@
 //! DRR backward: scatter the per-pixel projection gradient back along each
-//! ray into the volume (trilinear weights, atomic add).
+//! ray into the anisotropic volume (trilinear weights, atomic add).
 //!
-//! `proj = scale * ∫ μ dl + bias` → `dL/dμ_voxel = v_proj[x,y] * scale * dt * w`
-//! where `w` are the trilinear interpolation weights of the sample.
+//! `proj = scale * ∫ μ dl + bias` → `dL/dμ_voxel = v_proj[x,y] * scale * dt * w`.
 
 use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::cube;
@@ -36,23 +35,26 @@ pub fn drr_backward_kernel<A: AtomicAddF32>(
     let cam_pos = Vec3A::new(u.cam_x, u.cam_y, u.cam_z);
     let dir = Vec3A::new((x as f32 - u.cx) / u.fx, (y as f32 - u.cy) / u.fy, 1.0);
 
-    let t_near = u.sod - u.half_r;
-    let t_far = u.sod + u.half_r;
+    let t_near = u.sod - u.rx;
+    let t_far = u.sod + u.rx;
     let dt = (t_far - t_near) / u.steps as f32;
+
+    let sz = u.vol_x;
+    let sy = u.vol_x * u.vol_z;
 
     for s in 0..u.steps {
         let t = t_near + (s as f32 + 0.5) * dt;
         let p_local = dir.scale(t);
         let p_world = cam_rot.mul_vec3(p_local).add(cam_pos);
 
-        let vx = (p_world.x() + u.half_r) * u.inv_delta - 0.5;
-        let vy = (p_world.y() + u.half_r) * u.inv_delta - 0.5;
-        let vz = (p_world.z() + u.half_r) * u.inv_delta - 0.5;
+        let vx = (p_world.x() + u.rx) * u.inv_dx - 0.5;
+        let vy = (p_world.y() + u.ry) * u.inv_dy - 0.5;
+        let vz = (p_world.z() + u.rz) * u.inv_dz - 0.5;
         if vx >= 0.0 && vy >= 0.0 && vz >= 0.0 {
             let ix = vx as u32;
             let iy = vy as u32;
             let iz = vz as u32;
-            if ix + 1 < u.vol && iy + 1 < u.vol && iz + 1 < u.vol {
+            if ix + 1 < u.vol_x && iy + 1 < u.vol_y && iz + 1 < u.vol_z {
                 let tx = vx - ix as f32;
                 let ty = vy - iy as f32;
                 let tz = vz - iz as f32;
@@ -63,20 +65,18 @@ pub fn drr_backward_kernel<A: AtomicAddF32>(
                 let wz0 = 1.0 - tz;
                 let wz1 = tz;
 
-                let base = (iy * u.vol + iz) * u.vol + ix;
-                let sx = u.vol * u.vol;
-                let sz = u.vol;
+                let base = iy * sy + iz * sz + ix;
                 let val = vp * dt * u.scale;
 
                 A::add(&v_volume[base as usize], val * wx0 * wy0 * wz0);
                 A::add(&v_volume[(base + 1) as usize], val * wx1 * wy0 * wz0);
                 A::add(&v_volume[(base + sz) as usize], val * wx0 * wy1 * wz0);
                 A::add(&v_volume[(base + sz + 1) as usize], val * wx1 * wy1 * wz0);
-                A::add(&v_volume[(base + sx) as usize], val * wx0 * wy0 * wz1);
-                A::add(&v_volume[(base + sx + 1) as usize], val * wx1 * wy0 * wz1);
-                A::add(&v_volume[(base + sx + sz) as usize], val * wx0 * wy1 * wz1);
+                A::add(&v_volume[(base + sy) as usize], val * wx0 * wy0 * wz1);
+                A::add(&v_volume[(base + sy + 1) as usize], val * wx1 * wy0 * wz1);
+                A::add(&v_volume[(base + sy + sz) as usize], val * wx0 * wy1 * wz1);
                 A::add(
-                    &v_volume[(base + sx + sz + 1) as usize],
+                    &v_volume[(base + sy + sz + 1) as usize],
                     val * wx1 * wy1 * wz1,
                 );
             }

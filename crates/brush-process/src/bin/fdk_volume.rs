@@ -1,15 +1,17 @@
-//! FDK cone-beam 重建 → 静态先验体积 + 逐视角 DRR 预计算 + LSQ 密度标定。
+//! FDK cone-beam 重建 → 各向异性静态先验体积 + 逐视角 DRR 预计算 + LSQ 标定。
 //!
-//! 用途: 作为 GS 残差建模的静态先验 (FDK 静态结构高度吻合, 动态部分由
-//! 带符号残差 GS 修正)。本 bin:
+//! 用途: 作为 GS 残差建模的静态先验。本 bin:
 //!   1. 每帧投影 `p = -ln(gray)`, 2D cosine 加权 + 频域 ramp 滤波 (Ram-Lak+Hann)。
-//!   2. FDK 反投影到等中心圆柱 FOV (XY 圆内, 旋转轴 Z) 体素网格。
-//!   3. 存 `<out>/volume.nii.gz` (float32, 世界坐标 [-r,r]³, affine 随 nii) + `<out>/meta.json`。
-//!   4. 正向投影 (射线步进 ∫μ dl) 若干视图 → 测耗时 (P1a 闸门) + LSQ 标定。
+//!   2. FDK 反投影到**各向异性**圆柱 FOV: XY(旋转平面) 域 `[-rx,rx]^2`
+//!      (rx = half_w × pad_xy, padding 容纳投影内角落结构), Z 方向 `[-rz,rz]`
+//!      (rz = half_h, 只需与投影高度平齐)。**只填充全采样圆柱**
+//!      (`x²+y² < half_w²`), 部分采样环带置 0 (240° 短扫描下伪影 > 缺失)。
+//!   3. 存 `<out>/volume.nii.gz` (float32, affine 由 rx/ry/rz 推导) + meta.json。
+//!   4. 正向投影 (射线步进 ∫μ dl) 若干视图 → 测耗时 + LSQ 标定。
 //!
 //! 用法:
-//!   cargo run --release -p brush-process --bin fdk_volume -- \
-//!     images/pig-data-cor-new-phase.dcm --vol=256 --out=experiments/output/.../fdk
+//!   fdk_volume images/pig-data-cor-new-phase.dcm --vol-x=256 [--pad-xy=1.3]
+//!     [--roi=40] [--mu-scale=0.00021] --out=.../fdk
 
 use std::f32::consts::PI;
 use std::path::{Path, PathBuf};
@@ -22,10 +24,10 @@ use glam::{Affine3A, Vec3};
 use rayon::prelude::*;
 use rustfft::{FftPlanner, num_complex::Complex, Fft};
 
-/// 频域 ramp 滤波 (Ram-Lak + Hann 窗)。对每行 FFT, 乘 |k|/N · Hann, IFFT。
+/// 频域 ramp 滤波 (Ram-Lak + Hann 窗)。
 fn ramp_filter_row_fft(row: &[f32], fft: &Arc<dyn Fft<f32>>, ifft: &Arc<dyn Fft<f32>>) -> Vec<f32> {
     let n = row.len();
-    let n2 = n * 2; // zero-padding 避免周期性边界振铃
+    let n2 = n * 2;
     let mut buf: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); n2];
     for i in 0..n {
         buf[i] = Complex::new(row[i], 0.0);
@@ -42,7 +44,7 @@ fn ramp_filter_row_fft(row: &[f32], fft: &Arc<dyn Fft<f32>>, ifft: &Arc<dyn Fft<
     buf[..n].iter().map(|c| c.re * inv).collect()
 }
 
-/// 单帧 FDK 数据: 相机局部变换 + ramp 滤波后的投影。
+/// 单帧 FDK 数据。
 struct Frame {
     w2l: Affine3A,
     fx: f32,
@@ -52,15 +54,11 @@ struct Frame {
     sod: f32,
     width: usize,
     height: usize,
-    /// Ramp 滤波后的投影 `[H, W]`。
     filtered: Vec<f32>,
 }
 
-/// 对每帧构建 `proj = -ln(gray)`, 2D cosine 加权 + ramp 滤波。
-/// 短扫描 (Δ<360°) 加 **Parker 加权**: 扫描两端视角的射线未被互补弧覆盖,
-/// 权重 → 0, 抑制截断/边界条纹伪影。标量近似
-/// `w(α) = sin²(π·(α-α_start) / (Δ + 2·fan_half))`。
-fn build_frames(views: &[SceneView], sdd: f32) -> Vec<Frame> {
+/// 对每帧构建 `proj = -ln(gray)`, 2D cosine 加权 + ramp 滤波 + Parker 加权。
+fn build_frames(views: &[SceneView], delx: f32) -> Vec<Frame> {
     let mut planner = FftPlanner::<f32>::new();
     let w0 = views[0].gray_image.as_ref().expect("gray GT").width as usize;
     let fft = planner.plan_fft_forward(2 * w0);
@@ -68,7 +66,6 @@ fn build_frames(views: &[SceneView], sdd: f32) -> Vec<Frame> {
     let fft = Arc::new(fft);
     let ifft = Arc::new(ifft);
 
-    // Parker 权重参数 (弧度)。
     let angles: Vec<f32> = views
         .iter()
         .map(|v| v.camera.position.x.atan2(v.camera.position.y))
@@ -77,13 +74,10 @@ fn build_frames(views: &[SceneView], sdd: f32) -> Vec<Frame> {
     let a_end = angles.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let delta = a_end - a_start;
     let g0 = views[0].gray_image.as_ref().expect("gray GT");
-    let fx0 = views[0]
-        .camera
-        .focal(glam::uvec2(g0.width, g0.height))
-        .x;
+    let fx0 = views[0].camera.focal(glam::uvec2(g0.width, g0.height)).x;
     let fan_half = ((g0.width as f32 * 0.5) / fx0).atan();
     let parker_span = delta + 2.0 * fan_half;
-    let is_short = delta < 6.0; // 短扫描 (<~344°)
+    let is_short = delta < 6.0;
     println!(
         "Parker: Δ={:.1}° fan_half={:.1}° span={:.1}° applied={is_short}",
         delta.to_degrees(),
@@ -95,7 +89,6 @@ fn build_frames(views: &[SceneView], sdd: f32) -> Vec<Frame> {
         .par_iter()
         .zip(angles.par_iter())
         .map(|(view, &alpha)| {
-            // Parker 权重: 两端 → 0 (仅短扫描)。
             let parker = if is_short {
                 let u = ((alpha - a_start) / parker_span).clamp(0.0, 1.0);
                 (PI * u).sin().powi(2)
@@ -116,9 +109,7 @@ fn build_frames(views: &[SceneView], sdd: f32) -> Vec<Frame> {
             for (i, &g) in gray.data.iter().enumerate() {
                 proj[i] = -g.clamp(1e-3, 1.0).ln();
             }
-
-            // 2D cosine 加权 (锥束倾斜补偿)。
-            let det_px = sdd / fx;
+            let det_px = delx;
             let mut weighted = vec![0.0f32; w * h];
             for y in 0..h {
                 let v_det = (y as f32 - cy) * det_px;
@@ -128,14 +119,12 @@ fn build_frames(views: &[SceneView], sdd: f32) -> Vec<Frame> {
                     weighted[y * w + x] = proj[y * w + x] * cos_w;
                 }
             }
-
             let du_world = sod / fx;
             let mut filtered = vec![0.0f32; w * h];
             for y in 0..h {
                 let row = &weighted[y * w..(y + 1) * w];
                 let filt = ramp_filter_row_fft(row, &fft, &ifft);
                 for x in 0..w {
-                    // Parker 标量权重: ramp 滤波是线性的, 前后乘等价。
                     filtered[y * w + x] = filt[x] * du_world * parker;
                 }
             }
@@ -154,36 +143,49 @@ fn build_frames(views: &[SceneView], sdd: f32) -> Vec<Frame> {
         .collect()
 }
 
-/// FDK 反投影: 体素网格 `vol^3`, 世界范围 `[-cyl_radius, cyl_radius]^3`。
-/// C-arm 绕世界 Z 轴旋转, 圆柱 FOV 沿 Z 轴延伸, 圆截面在 XY 平面。
-fn backproject(frames: &[Frame], vol: usize, cyl_radius: f32, cyl_scale: f32) -> Vec<f32> {
-    let delta = 2.0 * cyl_radius / vol as f32;
-    let cyl_r2 = (cyl_radius * cyl_scale).powi(2);
-    let mut volume = vec![0.0f32; vol * vol * vol];
+/// 各向异性 FDK 反投影: 网格 `[vol_x, vol_y, vol_z]`, 世界域
+/// `[-rx,rx]x[-ry,ry]x[-rz,rz]`, **只填充全采样圆柱** `x²+y² < mask_r²`
+/// (mask_r = half_w, 部分采样环带置 0)。内存布局 `idx(x,y,z) = (y*vol_x*vol_z) + z*vol_x + x`
+/// (x 最快, 同 DRR 内核)。
+fn backproject_aniso(
+    frames: &[Frame],
+    vol_x: usize,
+    vol_y: usize,
+    vol_z: usize,
+    rx: f32,
+    ry: f32,
+    rz: f32,
+    mask_r: f32,
+) -> Vec<f32> {
+    let dx = 2.0 * rx / vol_x as f32;
+    let dy = 2.0 * ry / vol_y as f32;
+    let dz = 2.0 * rz / vol_z as f32;
+    let mask_r2 = mask_r * mask_r;
+    let sy = vol_x * vol_z;
+    let mut volume = vec![0.0f32; vol_x * vol_y * vol_z];
     volume
-        .par_chunks_mut(vol * vol)
+        .par_chunks_mut(sy)
         .enumerate()
         .for_each(|(iy, slice)| {
-            let y = -cyl_radius + (iy as f32 + 0.5) * delta;
-            let y2 = y * y;
-            for iz in 0..vol {
-                let z = -cyl_radius + (iz as f32 + 0.5) * delta;
-                let row_base = iz * vol;
-                for ix in 0..vol {
-                    let x = -cyl_radius + (ix as f32 + 0.5) * delta;
-                    if x * x + y2 > cyl_r2 {
+            let y = -ry + (iy as f32 + 0.5) * dy;
+            for iz in 0..vol_z {
+                let z = -rz + (iz as f32 + 0.5) * dz;
+                let row_base = iz * vol_x;
+                for ix in 0..vol_x {
+                    let x = -rx + (ix as f32 + 0.5) * dx;
+                    if x * x + y * y > mask_r2 {
                         continue;
                     }
                     let p_w = Vec3::new(x, y, z);
                     let mut acc = 0.0f32;
                     for f in frames {
                         let p_c = f.w2l.transform_point3(p_w);
-                        let dz = p_c.z;
-                        if dz <= 1.0 {
+                        let dzp = p_c.z;
+                        if dzp <= 1.0 {
                             continue;
                         }
-                        let u = f.fx * p_c.x / dz + f.cx;
-                        let v = f.fy * p_c.y / dz + f.cy;
+                        let u = f.fx * p_c.x / dzp + f.cx;
+                        let v = f.fy * p_c.y / dzp + f.cy;
                         if u < 0.0 || v < 0.0 {
                             continue;
                         }
@@ -203,7 +205,7 @@ fn backproject(frames: &[Frame], vol: usize, cyl_radius: f32, cyl_scale: f32) ->
                             + p10 * fu * (1.0 - fv)
                             + p01 * (1.0 - fu) * fv
                             + p11 * fu * fv;
-                        let wgt = f.sod / dz;
+                        let wgt = f.sod / dzp;
                         acc += wgt * wgt * val;
                     }
                     slice[row_base + ix] = acc;
@@ -213,34 +215,47 @@ fn backproject(frames: &[Frame], vol: usize, cyl_radius: f32, cyl_scale: f32) ->
     volume
 }
 
-/// 三线性插值采样体积 `vol^3`, 世界范围 `[-r, r]^3`。圆柱外返回 0。
+/// 三线性插值采样各向异性体积 (同 DRR 内核布局)。
 #[inline]
-fn sample_vol(volume: &[f32], vol: usize, r: f32, p: Vec3) -> f32 {
-    let delta = 2.0 * r / vol as f32;
-    let fx = (p.x + r) / delta - 0.5;
-    let fy = (p.y + r) / delta - 0.5;
-    let fz = (p.z + r) / delta - 0.5;
+fn sample_vol_aniso(
+    volume: &[f32],
+    vol_x: usize,
+    vol_y: usize,
+    vol_z: usize,
+    rx: f32,
+    ry: f32,
+    rz: f32,
+    p: Vec3,
+) -> f32 {
+    let inv_dx = vol_x as f32 / (2.0 * rx);
+    let inv_dy = vol_y as f32 / (2.0 * ry);
+    let inv_dz = vol_z as f32 / (2.0 * rz);
+    let fx = (p.x + rx) * inv_dx - 0.5;
+    let fy = (p.y + ry) * inv_dy - 0.5;
+    let fz = (p.z + rz) * inv_dz - 0.5;
     if fx < 0.0 || fy < 0.0 || fz < 0.0 {
         return 0.0;
     }
     let ix = fx as usize;
     let iy = fy as usize;
     let iz = fz as usize;
-    if ix + 1 >= vol || iy + 1 >= vol || iz + 1 >= vol {
+    if ix + 1 >= vol_x || iy + 1 >= vol_y || iz + 1 >= vol_z {
         return 0.0;
     }
     let tx = fx - ix as f32;
     let ty = fy - iy as f32;
     let tz = fz - iz as f32;
-    let idx = |x: usize, y: usize, z: usize| (y * vol + z) * vol + x;
-    let c000 = volume[idx(ix, iy, iz)];
-    let c100 = volume[idx(ix + 1, iy, iz)];
-    let c010 = volume[idx(ix, iy + 1, iz)];
-    let c110 = volume[idx(ix + 1, iy + 1, iz)];
-    let c001 = volume[idx(ix, iy, iz + 1)];
-    let c101 = volume[idx(ix + 1, iy, iz + 1)];
-    let c011 = volume[idx(ix, iy + 1, iz + 1)];
-    let c111 = volume[idx(ix + 1, iy + 1, iz + 1)];
+    let sz = vol_x;
+    let sy = vol_x * vol_z;
+    let base = iy * sy + iz * sz + ix;
+    let c000 = volume[base];
+    let c100 = volume[base + 1];
+    let c010 = volume[base + sz];
+    let c110 = volume[base + sz + 1];
+    let c001 = volume[base + sy];
+    let c101 = volume[base + sy + 1];
+    let c011 = volume[base + sy + sz];
+    let c111 = volume[base + sy + sz + 1];
     let c00 = c000 * (1.0 - tx) + c100 * tx;
     let c10 = c010 * (1.0 - tx) + c110 * tx;
     let c01 = c001 * (1.0 - tx) + c101 * tx;
@@ -250,12 +265,15 @@ fn sample_vol(volume: &[f32], vol: usize, r: f32, p: Vec3) -> f32 {
     c0 * (1.0 - tz) + c1 * tz
 }
 
-/// 正向投影 (射线步进 ∫μ dl): 对给定视图, 累加穿过体积的密度积分。
-/// 返回原始 proj 积分 `[H, W]` (未经 exp 映射, 也未经密度尺度缩放)。
+/// 正向投影 (CPU 射线步进, 各向异性体积)。
 fn forward_project_view(
     volume: &[f32],
-    vol: usize,
-    r: f32,
+    vol_x: usize,
+    vol_y: usize,
+    vol_z: usize,
+    rx: f32,
+    ry: f32,
+    rz: f32,
     view: &SceneView,
     steps: usize,
 ) -> Vec<f32> {
@@ -268,8 +286,8 @@ fn forward_project_view(
     let (fx, fy) = (focal.x, focal.y);
     let (cx, cy) = (center.x, center.y);
     let sod = cam.position.length();
-    let t_near = sod - r;
-    let t_far = sod + r;
+    let t_near = sod - rx;
+    let t_far = sod + rx;
     let dt = (t_far - t_near) / steps as f32;
 
     (0..h)
@@ -282,7 +300,7 @@ fn forward_project_view(
                     let t = t_near + (s as f32 + 0.5) * dt;
                     let p_local = dir * t;
                     let p_world = cam.local_to_world().transform_point3(p_local);
-                    acc += sample_vol(volume, vol, r, p_world) * dt;
+                    acc += sample_vol_aniso(volume, vol_x, vol_y, vol_z, rx, ry, rz, p_world) * dt;
                 }
                 acc
             })
@@ -290,31 +308,35 @@ fn forward_project_view(
         .collect()
 }
 
-/// 写 3D 体积为 .nii.gz (nifti-rs, sform_code=2)。世界范围 `[-half_r, half_r]^3`,
-/// spacing = 2*half_r/vol 各向同性, origin = -half_r。
-fn write_nifti_volume(path: &Path, data: &[f32], vol: usize, half_r: f32) -> anyhow::Result<()> {
+/// 写 3D 体积 .nii.gz (nifti-rs, sform_code=2)。各向异性 affine:
+/// nifti-rs 内部 data.t() → 文件轴 [X,Z,Y], srow_y 用 k, srow_z 用 j。
+fn write_nifti_volume(
+    path: &Path,
+    data: &[f32],
+    vol_x: usize,
+    vol_y: usize,
+    vol_z: usize,
+    rx: f32,
+    ry: f32,
+    rz: f32,
+) -> anyhow::Result<()> {
     use nifti::writer::WriterOptions;
     use nifti::{NiftiHeader, NiftiType};
-    let arr = ndarray::Array3::from_shape_vec((vol, vol, vol), data.to_vec())
+    // 内核布局 [y,z,x] (y 最慢, x 最快) → 数组形状必须 (vol_y, vol_z, vol_x)。
+    let arr = ndarray::Array3::from_shape_vec((vol_y, vol_z, vol_x), data.to_vec())
         .map_err(|e| anyhow::anyhow!("ndarray shape: {e}"))?;
-    let spacing = 2.0 * half_r / vol as f32;
+    let sx = 2.0 * rx / vol_x as f32;
+    let sy = 2.0 * ry / vol_y as f32;
+    let sz = 2.0 * rz / vol_z as f32;
     let mut hdr = NiftiHeader::default();
-    hdr.dim[0] = 3;
-    hdr.dim[1] = vol as u16;
-    hdr.dim[2] = vol as u16;
-    hdr.dim[3] = vol as u16;
     hdr.datatype = NiftiType::Float32 as i16;
     hdr.bitpix = 32;
-    hdr.pixdim[1] = spacing;
-    hdr.pixdim[2] = spacing;
-    hdr.pixdim[3] = spacing;
     hdr.qform_code = 0;
     hdr.sform_code = 2;
-    // nifti-rs 内部 data.t() (Fortran 序) → 文件轴 [X,Z,Y]:
-    // axis0=X→x(对角i), axis1=Z 需→z, axis2=Y 需→y。所以 srow_y 用 k, srow_z 用 j。
-    hdr.srow_x = [spacing, 0.0, 0.0, -half_r];
-    hdr.srow_y = [0.0, 0.0, spacing, -half_r];
-    hdr.srow_z = [0.0, spacing, 0.0, -half_r];
+    // 数组轴 = [y,z,x], nifti-rs 视为 [i,j,k] → i→y, j→z, k→x。
+    hdr.srow_x = [0.0, 0.0, sx, -rx];
+    hdr.srow_y = [sy, 0.0, 0.0, -ry];
+    hdr.srow_z = [0.0, sz, 0.0, -rz];
     WriterOptions::new(path)
         .reference_header(&hdr)
         .write_nifti(&arr)
@@ -322,7 +344,7 @@ fn write_nifti_volume(path: &Path, data: &[f32], vol: usize, half_r: f32) -> any
     Ok(())
 }
 
-/// 写 .npy (v1.0, float32, C-order)。
+/// 写 .npy (v1.0, float32, C-order) — DRR 目检图。
 fn write_npy_f32(path: &Path, data: &[f32], shape: &[usize]) -> anyhow::Result<()> {
     use std::io::Write;
     let total: usize = shape.iter().product();
@@ -332,10 +354,7 @@ fn write_npy_f32(path: &Path, data: &[f32], shape: &[usize]) -> anyhow::Result<(
         shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", "),
         if shape.len() == 1 { "," } else { "" }
     );
-    let mut header = format!(
-        "{{'descr': '<f4', 'fortran_order': False, 'shape': {}, }}",
-        shape_str
-    );
+    let mut header = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': {}, }}", shape_str);
     let header_len = header.len() + 1;
     let pad = (16 - (10 + header_len) % 16) % 16;
     for _ in 0..pad {
@@ -354,10 +373,7 @@ fn write_npy_f32(path: &Path, data: &[f32], shape: &[usize]) -> anyhow::Result<(
     Ok(())
 }
 
-/// LSQ 密度标定: 在静态区像素拟合 `proj_gt ≈ s·proj_fdk + b` (最小二乘闭式)。
-/// 静态区 = 真实图像时序方差最低的像素 (低时序方差 → 骨/背景, 无运动)。
-/// 用前 `nvar` 个 GT 帧估方差; 只保留 proj_fdk > min_fdk 的组织区像素。
-/// 返回 `(s, b, mean|err| over all pixels)`。
+/// LSQ 密度标定: 静态区 (低 GT 时序方差) 拟合 `proj_gt ≈ s·proj_fdk + b`。
 fn lsq_calibrate(
     proj_fdk: &[f32],
     gts: &[&[f32]],
@@ -417,35 +433,34 @@ fn lsq_calibrate(
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut dcm: Option<PathBuf> = None;
-    let mut vol = 256usize;
-    let mut cyl_scale = 1.0f32;
+    let mut vol_x = 256usize;
+    let mut vol_z: Option<usize> = None;
+    let mut pad_xy = 1.0f32;
+    let mut roi_inset = 20u32;
     let mut steps = 256usize;
     let mut calib_views = 12usize;
-    // 保存校准后 DRR 视图数 (0 = 不存) 用于目检 FDK 先验质量。
     let mut save_drr = 2usize;
-    // XY 方向 padding 系数: 重建/DRR 体积范围扩大 (half_w×pad), 容纳投影内
-    // 但超出等中心锥体半径的结构 (角落/肘部), 供后续 DRR 迭代优化表示。
-    let mut pad_xy = 1.0f32;
-    // FDK 体积 → 真实 μ(mm⁻¹) 的缩放 (无量纲累加 × mu_scale = 线性衰减系数)。
     let mut mu_scale = 0.00021f32;
     let mut out = PathBuf::from("target/fdk/volume");
     let mut i = 1;
     while i < args.len() {
         let a = &args[i];
-        if let Some(v) = a.strip_prefix("--vol=") {
-            vol = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--cyl-scale=") {
-            cyl_scale = v.parse()?;
+        if let Some(v) = a.strip_prefix("--vol-x=") {
+            vol_x = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--vol-z=") {
+            vol_z = Some(v.parse()?);
+        } else if let Some(v) = a.strip_prefix("--pad-xy=") {
+            pad_xy = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--roi=") {
+            roi_inset = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--steps=") {
             steps = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--calib-views=") {
             calib_views = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--mu-scale=") {
-            mu_scale = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--save-drr=") {
             save_drr = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--pad-xy=") {
-            pad_xy = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--mu-scale=") {
+            mu_scale = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--out=") {
             out = PathBuf::from(v);
         } else if dcm.is_none() {
@@ -453,8 +468,9 @@ async fn main() -> anyhow::Result<()> {
         }
         i += 1;
     }
-    let dcm = dcm.expect("usage: fdk_volume <dcm> [--vol=N] [--cyl-scale=F] [--steps=N] [--out=DIR]");
+    let dcm = dcm.expect("usage: fdk_volume <dcm> [--vol-x=N] [--pad-xy=F] [--roi=N]");
 
+    // ---- 加载 DICOM (roi 裁暗边, minmax + 自动 gamma) ----
     let file = tokio::fs::File::open(&dcm).await?;
     let name = dcm
         .file_name()
@@ -465,7 +481,6 @@ async fn main() -> anyhow::Result<()> {
             .await
             .expect("construct vfs"),
     );
-    // 与 fit_deform 相同: roi=Inset(20) (608x434), minmax 归一化 + 自动 gamma。
     let load_config = LoadDatasetConfig {
         max_frames: None,
         max_resolution: 1920,
@@ -478,19 +493,16 @@ async fn main() -> anyhow::Result<()> {
         dicom_gamma: None,
         dicom_gamma_target: Some(0.5),
         max_scene_batch_cache_size: 1 << 30,
-        roi: brush_dataset::config::RoiSpec::Inset(20),
+        roi: brush_dataset::config::RoiSpec::Inset(roi_inset),
     };
     let result = brush_dataset::load_dataset(vfs, &load_config).await?;
     let views = &result.dataset.train.views;
-    println!("loaded {} views", views.len());
+    println!("loaded {} views (roi inset={roi_inset})", views.len());
 
-    // 从 DICOM header 取探测器像素间距 delx (cosine 加权用)。
+    // 几何。
     let bytes = std::fs::read(&dcm)?;
     let meta = brush_dicom::parse_dicom(&bytes)?;
     let delx = meta.geometry.delx as f32;
-    println!("delx = {delx:.4} mm (detector pixel spacing)");
-
-    // 几何: 圆柱半径 = 探测器内切圆在等中心处的半宽。
     let g0 = views[0].gray_image.as_ref().expect("gray");
     let img_size = glam::uvec2(g0.width, g0.height);
     let cam = &views[0].camera;
@@ -498,29 +510,30 @@ async fn main() -> anyhow::Result<()> {
     let sod = cam.position.length();
     let half_w = (g0.width as f32 * 0.5) * sod / focal.x;
     let half_h = (g0.height as f32 * 0.5) * sod / focal.y;
-    // 重建范围: XY(旋转平面)用完整锥体半径 half_w × pad_xy (padding 容纳
-    // 投影内但超出等中心锥体的角落结构, 供 DRR 迭代优化表示)。
-    let cyl_radius = half_w * pad_xy;
+    // 域: XY = half_w × pad_xy (padded), Z = half_h (只与投影高度平齐)。
+    let rx = half_w * pad_xy;
+    let ry = half_w * pad_xy;
+    let rz = half_h;
+    let vol_y = vol_x; // XY 正方形
+    let spacing_xy = 2.0 * rx / vol_x as f32;
+    let vol_z = vol_z.unwrap_or(((2.0 * rz) / spacing_xy).round() as usize);
     println!(
-        "SOD={sod:.1} mm, frame {}x{}, cyl radius={cyl_radius:.1} mm (half-w {half_w:.1} x pad {pad_xy}, half-h {half_h:.1})",
-        g0.width, g0.height
+        "geometry: sod={sod:.1} frame {}x{} delx={delx:.3}\n  domain rx=ry={rx:.1} (half_w {half_w:.1} x pad {pad_xy}) rz={rz:.1} (half_h {half_h:.1})\n  grid {vol_x}x{vol_y}x{vol_z}  spacing_xy={spacing_xy:.3} spacing_z={:.3}",
+        g0.width, g0.height, 2.0 * rz / vol_z as f32
     );
 
-    // ---- ramp 滤波 + FDK 反投影 ----
+    // ---- ramp 滤波 + FDK 反投影 (只填全采样圆柱 half_w) ----
     let frames = build_frames(views, delx);
     println!("built {} filtered frames", frames.len());
     let t0 = std::time::Instant::now();
-    let mut volume = backproject(&frames, vol, cyl_radius, cyl_scale);
-    println!("FDK backproject {}^3 in {:.1}s", vol, t0.elapsed().as_secs_f32());
-
+    let mut volume = backproject_aniso(&frames, vol_x, vol_y, vol_z, rx, ry, rz, half_w);
+    println!("FDK backproject {vol_x}x{vol_y}x{vol_z} in {:.1}s", t0.elapsed().as_secs_f32());
     let max_v = volume.iter().copied().fold(0.0f32, f32::max);
     let n_neg = volume.iter().filter(|&&v| v < 0.0).count();
     println!(
-        "volume {vol}^3 (voxel {:.2} mm), raw_max={max_v:.4}, neg={n_neg} ({:.1}%), mu_scale={mu_scale}",
-        2.0 * cyl_radius / vol as f32,
+        "volume max={max_v:.4} neg={n_neg} ({:.1}%), mu_scale={mu_scale}",
         n_neg as f32 / volume.len() as f32 * 100.0
     );
-    // 应用 mu_scale: 体积现在为真实 μ (mm^-1), 线积分 = 真实光程。
     for v in &mut volume {
         *v *= mu_scale;
     }
@@ -528,15 +541,14 @@ async fn main() -> anyhow::Result<()> {
     // ---- 保存体积 + 元数据 ----
     std::fs::create_dir_all(&out)?;
     let vol_path = out.join("volume.nii.gz");
-    write_nifti_volume(&vol_path, &volume, vol, cyl_radius)?;
+    write_nifti_volume(&vol_path, &volume, vol_x, vol_y, vol_z, rx, ry, rz)?;
     let meta_json = format!(
-        "{{\"vol\":{vol},\"cyl_radius\":{cyl_radius},\"delx\":{delx},\"sod\":{sod},\"world_range\":{cyl_radius}}}"
+        "{{\"vol_x\":{vol_x},\"vol_y\":{vol_y},\"vol_z\":{vol_z},\"rx\":{rx},\"ry\":{ry},\"rz\":{rz},\"delx\":{delx},\"sod\":{sod}}}"
     );
     std::fs::write(out.join("meta.json"), meta_json)?;
     println!("saved {vol_path:?} + meta.json");
 
-    // ---- 正向投影耗时 (P1a 闸门) + LSQ 标定 ----
-    // 均匀取 calib_views 个视图。
+    // ---- 正向投影耗时 + LSQ 标定 ----
     let sel: Vec<usize> = (0..views.len())
         .step_by((views.len() / calib_views).max(1))
         .take(calib_views)
@@ -544,92 +556,58 @@ async fn main() -> anyhow::Result<()> {
     let t1 = std::time::Instant::now();
     let projs: Vec<Vec<f32>> = sel
         .iter()
-        .map(|&vi| forward_project_view(&volume, vol, cyl_radius, &views[vi], steps))
+        .map(|&vi| forward_project_view(&volume, vol_x, vol_y, vol_z, rx, ry, rz, &views[vi], steps))
         .collect();
     let dt = t1.elapsed();
     let per_view = dt.as_secs_f32() / projs.len() as f32;
-    let est_all = per_view * views.len() as f32;
     println!(
-        "forward project {}/{} views ({} steps) in {:.1}s → {:.2}s/view, 全 {}/帧 ≈ {:.0}s",
+        "forward project {}/{} views ({steps} steps) in {:.1}s → {:.2}s/view, 全 ≈ {:.0}s",
         projs.len(),
         views.len(),
-        steps,
         dt.as_secs_f32(),
         per_view,
-        views.len(),
-        est_all
+        per_view * views.len() as f32
     );
 
-    // LSQ 标定: 静态像素按 GT 时序方差选 (低方差 = 骨/背景), 只取组织区。
     let gts: Vec<Vec<f32>> = sel
         .iter()
         .map(|&vi| {
             let g = views[vi].gray_image.as_ref().expect("gray GT");
-            g.data
-                .iter()
-                .map(|&v| -v.clamp(1e-3, 1.0).ln())
-                .collect()
+            g.data.iter().map(|&v| -v.clamp(1e-3, 1.0).ln()).collect()
         })
         .collect();
     let n_pix = projs[0].len();
     let gt_refs: Vec<&[f32]> = gts.iter().map(|g| g.as_slice()).collect();
-    // min_fdk: 组织区阈值 = p50 of proj_fdk (避开空气)。
     let mut fdk_sorted = projs[0].clone();
     fdk_sorted.sort_by(|a, b| a.total_cmp(b));
     let min_fdk = fdk_sorted[fdk_sorted.len() / 2].max(1e-4);
     let (s, b, mean_err) = lsq_calibrate(&projs[0], &gt_refs, n_pix, min_fdk, n_pix / 50);
-    println!(
-        "LSQ 标定: s={s:.6}, b={b:.6} (min_fdk={min_fdk:.4}, mean |err|={mean_err:.4} over all pixels)"
-    );
+    println!("LSQ 标定: s={s:.6}, b={b:.6} (min_fdk={min_fdk:.4}, mean |err|={mean_err:.4})");
     std::fs::write(out.join("calib.json"), format!("{{\"s\":{s},\"b\":{b}}}"))?;
 
-    // ---- FDK 先验质量验证: 校准后 DRR (exp(-(s·proj_fdk+b))) vs GT ----
-    // 全图 PSNR + 静态区 PSNR (低时序方差像素)。
-    let nvar = gt_refs.len().min(4);
-    let mut static_mask = vec![false; n_pix];
-    let mut svar = vec![f32::INFINITY; n_pix];
-    for i in 0..n_pix {
-        let mut v = 0.0f32;
-        for k in 0..nvar.saturating_sub(1) {
-            let d = gt_refs[k][i] - gt_refs[k + 1][i];
-            v += d * d;
-        }
-        svar[i] = v;
-    }
-    let mut order: Vec<usize> = (0..n_pix).collect();
-    order.sort_by(|&a, &b| svar[a].total_cmp(&svar[b]));
-    for &idx in order[..(n_pix / 5)].iter() {
-        static_mask[idx] = true;
-    }
-    // 重新用下标算 (上面对 static_mask 的用法错误)。
-    let mut se_all = 0.0f64;
-    let mut se_st = 0.0f64;
-    let (mut n_all, mut n_st) = (0u64, 0u64);
-    for (i, (&p, &g)) in projs[0].iter().zip(gt_refs[0].iter()).enumerate() {
+    // FDK 先验强度 PSNR。
+    let mut se = 0.0f64;
+    let mut n = 0u64;
+    for (i, (&p, &g)) in projs[0].iter().zip(gts[0].iter()).enumerate() {
         let y = s as f64 * p as f64 + b as f64;
         let pred = (-y).exp().clamp(0.0, 1.0);
-        let gt_int = (-g as f64).exp().clamp(0.0, 1.0);
-        let d = pred - gt_int;
-        se_all += d * d;
-        n_all += 1;
-        if static_mask[i] {
-            se_st += d * d;
-            n_st += 1;
-        }
+        let gi = (-(g as f64)).exp().clamp(0.0, 1.0);
+        let d = pred - gi;
+        se += d * d;
+        n += 1;
     }
-    let mse_all = se_all / n_all.max(1) as f64;
-    let mse_st = se_st / n_st.max(1) as f64;
-    let psnr_all = if mse_all > 1e-12 { 10.0 * (1.0 / mse_all).log10() } else { 100.0 };
-    let psnr_st = if mse_st > 1e-12 { 10.0 * (1.0 / mse_st).log10() } else { 100.0 };
-    println!(
-        "FDK 先验 (校准后, 视图0): PSNR_all={psnr_all:.2} dB, PSNR_static={psnr_st:.2} dB (n_st={n_st}/{n_all})"
-    );
-    println!("done -> {out:?}");
-    // 保存校准后 DRR (intensity = exp(-(s·proj_fdk+b))) 供目检。
+    let psnr = if se / n.max(1) as f64 > 1e-12 {
+        10.0 * (1.0 / (se / n.max(1) as f64)).log10()
+    } else {
+        100.0
+    };
+    println!("FDK 先验 (校准后, 视图0): PSNR_int={psnr:.2} dB");
+
+    // 保存校准后 DRR 目检。
     for (vi, &idx) in sel.iter().enumerate().take(save_drr) {
         let mut drr = vec![0.0f32; n_pix];
-        for (i, &p) in projs[vi].iter().enumerate() {
-            drr[i] = (-(s as f64 * p as f64 + b as f64)).exp().clamp(0.0, 1.0) as f32;
+        for (k, &p) in projs[vi].iter().enumerate() {
+            drr[k] = (-(s as f64 * p as f64 + b as f64)).exp().clamp(0.0, 1.0) as f32;
         }
         let g = views[idx].gray_image.as_ref().expect("gray");
         let (w, h) = (g.width as usize, g.height as usize);
@@ -637,8 +615,6 @@ async fn main() -> anyhow::Result<()> {
         let gt: Vec<f32> = g.data.iter().copied().collect();
         write_npy_f32(&out.join(format!("gt_drr_v{vi:02}.npy")), &gt, &[h, w])?;
     }
-    if save_drr > 0 {
-        println!("saved calibrated DRR + GT for {} views (目检先验质量)", save_drr.min(sel.len()));
-    }
+    println!("done -> {out:?}");
     Ok(())
 }

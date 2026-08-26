@@ -35,6 +35,7 @@ impl DrrOps for MainBackendBase {
         &device,
         DType::F32,
     );
+    let _ = settings;
     trace_span!("DrrForward").in_scope(|| {
         drr_forward_kernel::launch::<WgpuRuntime>(
             &client,
@@ -65,9 +66,9 @@ impl DrrOps for MainBackendBase {
     // 原子累加: 必须先清零 (create_tensor 是未初始化内存)。
     let v_volume = <Self as burn::backend::ops::FloatTensorOps<Self>>::float_zeros(
         [
-            settings.vol as usize,
-            settings.vol as usize,
-            settings.vol as usize,
+            settings.vol_x as usize,
+            settings.vol_y as usize,
+            settings.vol_z as usize,
         ]
         .into(),
         &device,

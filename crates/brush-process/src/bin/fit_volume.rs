@@ -24,40 +24,44 @@ use brush_vfs::BrushVfs;
 use burn::tensor::{Tensor, TensorData};
 use brush_render::burn_glue::{unwrap_wgpu_float, wrap_wgpu_float};
 /// 读 3D 体积 .nii.gz (nifti-rs), 返回 (float32 数据, vol)。
-fn read_nifti_volume(path: &Path) -> anyhow::Result<(Vec<f32>, usize)> {
+fn read_nifti_volume(path: &Path) -> anyhow::Result<(Vec<f32>, usize, usize, usize)> {
     use nifti::{NiftiObject, ReaderOptions};
     let obj = ReaderOptions::new().read_file(path)?;
     let dims = obj.header().dim;
-    let vol = dims[1] as usize;
+    let (vx, vy, vz) = (dims[1] as usize, dims[2] as usize, dims[3] as usize);
     let volume = obj.into_volume();
     let data: Vec<f32> = volume.into_nifti_typed_data()?;
-    Ok((data, vol))
+    Ok((data, vx, vy, vz))
 }
 
 /// 写 3D 体积为 .nii.gz (nifti-rs, sform_code=2)。世界范围 `[-half_r, half_r]^3`。
-fn write_nifti_volume(path: &Path, data: &[f32], vol: usize, half_r: f32) -> anyhow::Result<()> {
+fn write_nifti_volume(
+    path: &Path,
+    data: &[f32],
+    vol_x: usize,
+    vol_y: usize,
+    vol_z: usize,
+    rx: f32,
+    ry: f32,
+    rz: f32,
+) -> anyhow::Result<()> {
     use nifti::writer::WriterOptions;
     use nifti::{NiftiHeader, NiftiType};
-    let arr = ndarray::Array3::from_shape_vec((vol, vol, vol), data.to_vec())
+    // 内核布局 [y,z,x] (y 最慢, x 最快) → 数组形状必须 (vol_y, vol_z, vol_x)。
+    let arr = ndarray::Array3::from_shape_vec((vol_y, vol_z, vol_x), data.to_vec())
         .map_err(|e| anyhow::anyhow!("ndarray shape: {e}"))?;
-    let spacing = 2.0 * half_r / vol as f32;
+    let sx = 2.0 * rx / vol_x as f32;
+    let sy = 2.0 * ry / vol_y as f32;
+    let sz = 2.0 * rz / vol_z as f32;
     let mut hdr = NiftiHeader::default();
-    hdr.dim[0] = 3;
-    hdr.dim[1] = vol as u16;
-    hdr.dim[2] = vol as u16;
-    hdr.dim[3] = vol as u16;
     hdr.datatype = NiftiType::Float32 as i16;
     hdr.bitpix = 32;
-    hdr.pixdim[1] = spacing;
-    hdr.pixdim[2] = spacing;
-    hdr.pixdim[3] = spacing;
     hdr.qform_code = 0;
     hdr.sform_code = 2;
-    // nifti-rs 内部 data.t() (Fortran 序) → 文件轴 [X,Z,Y]:
-    // axis0=X→x(对角i), axis1=Z 需→z, axis2=Y 需→y。所以 srow_y 用 k, srow_z 用 j。
-    hdr.srow_x = [spacing, 0.0, 0.0, -half_r];
-    hdr.srow_y = [0.0, 0.0, spacing, -half_r];
-    hdr.srow_z = [0.0, spacing, 0.0, -half_r];
+    // 数组轴 = [y,z,x], nifti-rs 视为 [i,j,k] → i→y, j→z, k→x。
+    hdr.srow_x = [0.0, 0.0, sx, -rx];
+    hdr.srow_y = [sy, 0.0, 0.0, -ry];
+    hdr.srow_z = [0.0, sz, 0.0, -rz];
     WriterOptions::new(path)
         .reference_header(&hdr)
         .write_nifti(&arr)
@@ -156,6 +160,25 @@ fn tv_grad(v: &Tensor<3>) -> Tensor<3> {
     g.add(v.clone().sub(prev_z).mul_scalar(2.0)).add(v.clone().sub(next_z).mul_scalar(2.0))
 }
 
+/// L1 TV 梯度 (边缘保持): TV = Σ|μ_{i+1}-μ_i|, dTV/dμ = sign 差和
+/// (smooth tanh 近似, ε 控制平滑)。
+fn tv_l1_grad(v: &Tensor<3>, eps: f32) -> Tensor<3> {
+    use burn::tensor::s;
+    let sn = |t: Tensor<3>| t.clone().mul_scalar(1.0 / eps).tanh();
+    // x 轴 (dim2): 前向/后向差分的符号。
+    let dx_f = v.clone().slice(s![.., .., 1..]).sub(v.clone().slice(s![.., .., ..-1])); // μ_{i+1}-μ_i
+    // μ_i 的贡献: 对前向差 (μ_i - μ_{i-1}) 是 -sign(dx_f[.., .., i-1]); 简化用移位。
+    let prev_x = Tensor::cat(vec![v.clone().slice(s![.., .., 0..1]), v.clone().slice(s![.., .., 0..-1])], 2);
+    let next_x = Tensor::cat(vec![v.clone().slice(s![.., .., 1..]), v.clone().slice(s![.., .., -1..])], 2);
+    let mut g = sn(v.clone().sub(prev_x)).add(sn(v.clone().sub(next_x)));
+    let prev_y = Tensor::cat(vec![v.clone().slice(s![.., 0..1, ..]), v.clone().slice(s![.., 0..-1, ..])], 1);
+    let next_y = Tensor::cat(vec![v.clone().slice(s![.., 1.., ..]), v.clone().slice(s![.., -1.., ..])], 1);
+    g = g.add(sn(v.clone().sub(prev_y))).add(sn(v.clone().sub(next_y)));
+    let prev_z = Tensor::cat(vec![v.clone().slice(s![0..1, .., ..]), v.clone().slice(s![0..-1, .., ..])], 0);
+    let next_z = Tensor::cat(vec![v.clone().slice(s![1.., .., ..]), v.clone().slice(s![-1.., .., ..])], 0);
+    g.add(sn(v.clone().sub(prev_z))).add(sn(v.clone().sub(next_z)))
+}
+
 /// 平方 TV 值 (日志用)。
 fn tv_value(v: &Tensor<3>) -> f32 {
     use burn::tensor::s;
@@ -180,6 +203,8 @@ async fn main() -> anyhow::Result<()> {
     let mut selftest = false;
     let mut eval_only = false;
     let mut tv = 0.0f32;
+    let mut tv_type = "l1".to_string();
+    let mut tv_eps = 0.01f32;
     let mut motion_mask = false;
     let mut mask_sigma = 0.25f32; // 残差掩膜尺度 (proj 单位)
     let mut mask_warmup = 150usize;
@@ -204,6 +229,10 @@ async fn main() -> anyhow::Result<()> {
             out = PathBuf::from(v);
         } else if let Some(v) = a.strip_prefix("--tv=") {
             tv = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--tv-type=") {
+            tv_type = v.to_string();
+        } else if let Some(v) = a.strip_prefix("--tv-eps=") {
+            tv_eps = v.parse()?;
         } else if a == "--motion-mask" {
             motion_mask = true;
         } else if let Some(v) = a.strip_prefix("--mask-sigma=") {
@@ -251,20 +280,25 @@ async fn main() -> anyhow::Result<()> {
     println!("loaded {} views", views.len());
 
     // ---- 加载体积 + 元数据 + 标定 ----
-    let (vol_vec, vol_shape) = read_nifti_volume(&volume_path)?;
-    let vol = vol_shape;
-    assert_eq!(vol_vec.len(), vol * vol * vol, "volume must be cubic");
     let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
-    let cyl_radius = meta["cyl_radius"].as_f64().unwrap_or(0.0) as f32;
+    let rx = meta["rx"].as_f64().unwrap_or(118.6) as f32;
+    let ry = meta["ry"].as_f64().unwrap_or(rx as f64) as f32;
+    let rz = meta["rz"].as_f64().unwrap_or(84.7) as f32;
+    let (vol_vec, _hx, _hy, _hz) = read_nifti_volume(&volume_path)?;
+    // 维度以 meta.json 为准 (nii header dims 是置换后的 [y,z,x])。
+    let vol_x = meta["vol_x"].as_u64().unwrap_or(_hx as u64) as usize;
+    let vol_y = meta["vol_y"].as_u64().unwrap_or(_hy as u64) as usize;
+    let vol_z = meta["vol_z"].as_u64().unwrap_or(_hz as u64) as usize;
+    assert_eq!(vol_vec.len(), vol_x * vol_y * vol_z, "volume size mismatch");
     let calib: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&calib_path)?)?;
     let scale = calib["s"].as_f64().unwrap_or(1.0) as f32;
     let bias = calib["b"].as_f64().unwrap_or(0.0) as f32;
     println!(
-        "volume {vol}^3 (half_r={cyl_radius:.1}mm), calib s={scale:.5} b={bias:.5}, iters={iters} lr={lr} batch={batch}"
+        "volume {vol_x}x{vol_y}x{vol_z} (rx={rx:.1} ry={ry:.1} rz={rz:.1}mm), calib s={scale:.5} b={bias:.5}, iters={iters} lr={lr} batch={batch}"
     );
 
     let device: burn::tensor::Device = test_device().await.into();
-    let vol_total = vol * vol * vol;
+    let vol_total = vol_x * vol_y * vol_z;
 
     // ---- 投影 GT (proj_gt = -ln(gray)) + 每视图 DrrSettings + GT 张量 ----
     let mut gts: Vec<Vec<f32>> = Vec::with_capacity(views.len());
@@ -281,9 +315,13 @@ async fn main() -> anyhow::Result<()> {
             &v.camera,
             img_w,
             img_h,
-            vol as u32,
+            vol_x as u32,
+            vol_y as u32,
+            vol_z as u32,
             steps as u32,
-            cyl_radius,
+            rx,
+            ry,
+            rz,
             scale,
             bias,
         ));
@@ -296,23 +334,31 @@ async fn main() -> anyhow::Result<()> {
 
     // ---- 有限差分自检: backward 解析梯度 vs 数值梯度 ----
     if selftest {
-        let vol: u32 = 16;
+        let volx: u32 = 16;
+        let voly: u32 = 16;
+        let volz: u32 = 12;
         let img: u32 = 48;
-        let half_r = 100.0f32;
+        let rx: f32 = 100.0;
+        let ry: f32 = 100.0;
+        let rz: f32 = 75.0;
         let steps: u32 = 64;
-        let mut v: Vec<f32> = (0..vol * vol * vol).map(|_| rand::random::<f32>() * 0.01).collect();
+        let mut v: Vec<f32> = (0..volx * voly * volz).map(|_| rand::random::<f32>() * 0.01).collect();
         let st = DrrSettings::new(
             &views[0].camera,
             img,
             img,
-            vol,
+            volx,
+            voly,
+            volz,
             steps,
-            half_r,
+            rx,
+            ry,
+            rz,
             1.0,
             0.0,
         );
         let fwd = |vv: Vec<f32>| {
-            let t = Tensor::<3>::from_data(TensorData::new::<f32, _>(vv, [vol as usize; 3]), &device);
+            let t = Tensor::<3>::from_data(TensorData::new::<f32, _>(vv, [volx as usize, voly as usize, volz as usize]), &device);
             let p = drr_forward_t(&st, t);
             p
         };
@@ -322,13 +368,13 @@ async fn main() -> anyhow::Result<()> {
         let v_vol = drr_backward_t(&st, ones).await;
         let v_vol_cpu: Vec<f32> = v_vol.into_data().into_vec::<f32>().unwrap();
         let eps = 1e-4f32;
-        for idx in [0usize, 100, 1000, vol as usize * vol as usize / 2 + 17, v.len() / 2] {
+        for idx in [0usize, 100, 1000, volx as usize * voly as usize / 2 + 17, v.len() / 2] {
             let orig = v[idx];
             v[idx] = orig + eps;
-            let p2 = drr_forward_t(&st, Tensor::<3>::from_data(TensorData::new::<f32, _>(v.clone(), [vol as usize; 3]), &device)).await;
+            let p2 = drr_forward_t(&st, Tensor::<3>::from_data(TensorData::new::<f32, _>(v.clone(), [volx as usize, voly as usize, volz as usize]), &device)).await;
             let s2: f32 = p2.sum().into_scalar();
             v[idx] = orig - eps;
-            let p3 = drr_forward_t(&st, Tensor::<3>::from_data(TensorData::new::<f32, _>(v.clone(), [vol as usize; 3]), &device)).await;
+            let p3 = drr_forward_t(&st, Tensor::<3>::from_data(TensorData::new::<f32, _>(v.clone(), [volx as usize, voly as usize, volz as usize]), &device)).await;
             let s3: f32 = p3.sum().into_scalar();
             v[idx] = orig;
             let num = (s2 - s3) / (2.0 * eps);
@@ -340,7 +386,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ---- 体积 + Adam 状态 (全程 GPU) ----
     let mut volume = Tensor::<3>::from_data(
-        TensorData::new::<f32, _>(vol_vec, [vol, vol, vol]),
+        TensorData::new::<f32, _>(vol_vec, [vol_x, vol_y, vol_z]),
         &device,
     );
 
@@ -407,9 +453,14 @@ async fn main() -> anyhow::Result<()> {
             });
         }
         let mut grad = grad_acc.expect("batch grad");
-        // TV 正则: d(λ·TV)/dμ 加入梯度。
+        // TV 正则: d(λ·TV)/dμ 加入梯度 (l1 边缘保持 / l2 平滑)。
         if tv > 0.0 {
-            grad = grad.add(tv_grad(&volume).mul_scalar(tv * batch as f32));
+            let g = if tv_type == "l2" {
+                tv_grad(&volume)
+            } else {
+                tv_l1_grad(&volume, tv_eps)
+            };
+            grad = grad.add(g.mul_scalar(tv * batch as f32));
         }
 
         // Adam (GPU 张量运算)。
@@ -457,7 +508,7 @@ async fn main() -> anyhow::Result<()> {
     // ---- 保存 refined 体积 ----
     std::fs::create_dir_all(&out)?;
     let vol_cpu: Vec<f32> = volume.clone().into_data().into_vec::<f32>().unwrap();
-    write_nifti_volume(&out.join("volume_refined.nii.gz"), &vol_cpu, vol, cyl_radius)?;
+    write_nifti_volume(&out.join("volume_refined.nii.gz"), &vol_cpu, vol_x, vol_y, vol_z, rx, ry, rz)?;
     println!("saved {out:?}/volume_refined.nii.gz");
     Ok(())
 }
