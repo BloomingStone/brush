@@ -57,6 +57,9 @@ struct Frame {
 }
 
 /// 对每帧构建 `proj = -ln(gray)`, 2D cosine 加权 + ramp 滤波。
+/// 短扫描 (Δ<360°) 加 **Parker 加权**: 扫描两端视角的射线未被互补弧覆盖,
+/// 权重 → 0, 抑制截断/边界条纹伪影。标量近似
+/// `w(α) = sin²(π·(α-α_start) / (Δ + 2·fan_half))`。
 fn build_frames(views: &[SceneView], sdd: f32) -> Vec<Frame> {
     let mut planner = FftPlanner::<f32>::new();
     let w0 = views[0].gray_image.as_ref().expect("gray GT").width as usize;
@@ -64,9 +67,41 @@ fn build_frames(views: &[SceneView], sdd: f32) -> Vec<Frame> {
     let ifft = planner.plan_fft_inverse(2 * w0);
     let fft = Arc::new(fft);
     let ifft = Arc::new(ifft);
+
+    // Parker 权重参数 (弧度)。
+    let angles: Vec<f32> = views
+        .iter()
+        .map(|v| v.camera.position.x.atan2(v.camera.position.y))
+        .collect();
+    let a_start = angles.iter().cloned().fold(f32::INFINITY, f32::min);
+    let a_end = angles.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let delta = a_end - a_start;
+    let g0 = views[0].gray_image.as_ref().expect("gray GT");
+    let fx0 = views[0]
+        .camera
+        .focal(glam::uvec2(g0.width, g0.height))
+        .x;
+    let fan_half = ((g0.width as f32 * 0.5) / fx0).atan();
+    let parker_span = delta + 2.0 * fan_half;
+    let is_short = delta < 6.0; // 短扫描 (<~344°)
+    println!(
+        "Parker: Δ={:.1}° fan_half={:.1}° span={:.1}° applied={is_short}",
+        delta.to_degrees(),
+        fan_half.to_degrees(),
+        parker_span.to_degrees()
+    );
+
     views
         .par_iter()
-        .map(|view| {
+        .zip(angles.par_iter())
+        .map(|(view, &alpha)| {
+            // Parker 权重: 两端 → 0 (仅短扫描)。
+            let parker = if is_short {
+                let u = ((alpha - a_start) / parker_span).clamp(0.0, 1.0);
+                (PI * u).sin().powi(2)
+            } else {
+                1.0
+            };
             let gray = view.gray_image.as_ref().expect("gray GT");
             let (w, h) = (gray.width as usize, gray.height as usize);
             let img_size = glam::uvec2(w as u32, h as u32);
@@ -100,7 +135,8 @@ fn build_frames(views: &[SceneView], sdd: f32) -> Vec<Frame> {
                 let row = &weighted[y * w..(y + 1) * w];
                 let filt = ramp_filter_row_fft(row, &fft, &ifft);
                 for x in 0..w {
-                    filtered[y * w + x] = filt[x] * du_world;
+                    // Parker 标量权重: ramp 滤波是线性的, 前后乘等价。
+                    filtered[y * w + x] = filt[x] * du_world * parker;
                 }
             }
             Frame {
