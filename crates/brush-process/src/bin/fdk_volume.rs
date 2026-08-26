@@ -4,7 +4,7 @@
 //! 带符号残差 GS 修正)。本 bin:
 //!   1. 每帧投影 `p = -ln(gray)`, 2D cosine 加权 + 频域 ramp 滤波 (Ram-Lak+Hann)。
 //!   2. FDK 反投影到等中心圆柱 FOV (XY 圆内, 旋转轴 Z) 体素网格。
-//!   3. 存 `<out>/volume.npy` (float32, 世界坐标 [-r,r]³) + `<out>/meta.json`。
+//!   3. 存 `<out>/volume.nii.gz` (float32, 世界坐标 [-r,r]³, affine 随 nii) + `<out>/meta.json`。
 //!   4. 正向投影 (射线步进 ∫μ dl) 若干视图 → 测耗时 (P1a 闸门) + LSQ 标定。
 //!
 //! 用法:
@@ -290,6 +290,36 @@ fn forward_project_view(
         .collect()
 }
 
+/// 写 3D 体积为 .nii.gz (nifti-rs, sform_code=2)。世界范围 `[-half_r, half_r]^3`,
+/// spacing = 2*half_r/vol 各向同性, origin = -half_r。
+fn write_nifti_volume(path: &Path, data: &[f32], vol: usize, half_r: f32) -> anyhow::Result<()> {
+    use nifti::writer::WriterOptions;
+    use nifti::{NiftiHeader, NiftiType};
+    let arr = ndarray::Array3::from_shape_vec((vol, vol, vol), data.to_vec())
+        .map_err(|e| anyhow::anyhow!("ndarray shape: {e}"))?;
+    let spacing = 2.0 * half_r / vol as f32;
+    let mut hdr = NiftiHeader::default();
+    hdr.dim[0] = 3;
+    hdr.dim[1] = vol as u16;
+    hdr.dim[2] = vol as u16;
+    hdr.dim[3] = vol as u16;
+    hdr.datatype = NiftiType::Float32 as i16;
+    hdr.bitpix = 32;
+    hdr.pixdim[1] = spacing;
+    hdr.pixdim[2] = spacing;
+    hdr.pixdim[3] = spacing;
+    hdr.qform_code = 0;
+    hdr.sform_code = 2;
+    hdr.srow_x = [spacing, 0.0, 0.0, -half_r];
+    hdr.srow_y = [0.0, spacing, 0.0, -half_r];
+    hdr.srow_z = [0.0, 0.0, spacing, -half_r];
+    WriterOptions::new(path)
+        .reference_header(&hdr)
+        .write_nifti(&arr)
+        .map_err(|e| anyhow::anyhow!("write nifti: {e}"))?;
+    Ok(())
+}
+
 /// 写 .npy (v1.0, float32, C-order)。
 fn write_npy_f32(path: &Path, data: &[f32], shape: &[usize]) -> anyhow::Result<()> {
     use std::io::Write;
@@ -491,8 +521,8 @@ async fn main() -> anyhow::Result<()> {
 
     // ---- 保存体积 + 元数据 ----
     std::fs::create_dir_all(&out)?;
-    let vol_path = out.join("volume.npy");
-    write_npy_f32(&vol_path, &volume, &[vol, vol, vol])?;
+    let vol_path = out.join("volume.nii.gz");
+    write_nifti_volume(&vol_path, &volume, vol, cyl_radius)?;
     let meta_json = format!(
         "{{\"vol\":{vol},\"cyl_radius\":{cyl_radius},\"delx\":{delx},\"sod\":{sod},\"world_range\":{cyl_radius}}}"
     );

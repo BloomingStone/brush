@@ -11,6 +11,7 @@ members = [
     "crates/brush-dataset",
     "crates/brush-deform",
     "crates/brush-dicom",
+    "crates/brush-drr",
     "crates/brush-loss",
     "crates/brush-prefix-sum",
     "crates/brush-process",

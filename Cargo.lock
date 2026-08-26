@@ -1043,6 +1043,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "brush-drr"
+version = "0.3.0"
+dependencies = [
+ "brush-cube",
+ "brush-render",
+ "burn",
+ "burn-cubecl",
+ "burn-fusion",
+ "burn-ir",
+ "burn-wgpu",
+ "bytemuck",
+ "glam",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "brush-js"
 version = "0.3.0"
 dependencies = [
@@ -1107,6 +1124,7 @@ dependencies = [
  "brush-dataset",
  "brush-deform",
  "brush-dicom",
+ "brush-drr",
  "brush-loss",
  "brush-render",
  "brush-render-bwd",

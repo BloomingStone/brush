@@ -1,0 +1,31 @@
+[package]
+name = "brush-drr"
+edition.workspace = true
+version.workspace = true
+readme.workspace = true
+license.workspace = true
+
+# Differentiable digitally reconstructed radiograph (DRR): cone-beam line
+# integral through a 3D density volume via cubecl ray-marching kernels.
+# Forward + backward (volume gradient) in one crate. Used to refine an FDK
+# static prior against the DICOM projections with gradient descent
+# (DiffDRR / nanodrr analogue for the burn/cubecl stack).
+
+[dependencies]
+brush-cube.path = "../brush-cube"
+brush-render.path = "../brush-render"
+
+burn = { workspace = true, features = ["wgpu", "autodiff"] }
+burn-wgpu.workspace = true
+burn-cubecl.workspace = true
+burn-fusion.workspace = true
+burn-ir.workspace = true
+
+glam.workspace = true
+tracing.workspace = true
+bytemuck.workspace = true
+
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

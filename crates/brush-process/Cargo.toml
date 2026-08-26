@@ -48,6 +48,7 @@ brush-train = { path = "../brush-train" }
 brush-loss = { path = "../brush-loss" }
 brush-dataset = { path = "../brush-dataset"}
 brush-dicom = { path = "../brush-dicom"}
+brush-drr = { path = "../brush-drr"}
 brush-deform = { path = "../brush-deform" }
 brush-rerun = { path = "../brush-rerun" }
 brush-xray = { path = "../brush-xray" }
