@@ -254,6 +254,7 @@ async fn main() -> anyhow::Result<()> {
     let mut volume_mirror = false;
     let mut volume_transpose = false;
     let mut save_volume: Option<PathBuf> = None;
+    let mut pad_xy = 0usize; // >0: XY 方向 0 填充到 N (给 DRR 优化器外围空间)
     let mut tv = 0.0f32;
     let mut tv_type = "l1".to_string();
     let mut tv_eps = 0.01f32;
@@ -263,6 +264,8 @@ async fn main() -> anyhow::Result<()> {
     // 训练中周期保存验证 NRRD 序列 (pred+gt 拼接, 目视验证方向/质量)。
     let mut save_val_nrrd: Option<PathBuf> = None;
     let mut save_val_every = 500usize;
+    let mut save_vol_every = 0usize; // >0: 周期保存中间体积 (out/vol_{it}.nii.gz)
+    let mut lr_decay = 0.05f32;      // 最终 LR = lr*lr_decay (cosine 衰减)
     let mut i = 1;
     while i < args.len() {
         let a = &args[i];
@@ -308,10 +311,16 @@ async fn main() -> anyhow::Result<()> {
             volume_transpose = true;
         } else if let Some(v) = a.strip_prefix("--save-volume=") {
             save_volume = Some(PathBuf::from(v));
+        } else if let Some(v) = a.strip_prefix("--pad-xy=") {
+            pad_xy = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--save-val-nrrd=") {
             save_val_nrrd = Some(PathBuf::from(v));
         } else if let Some(v) = a.strip_prefix("--save-val-every=") {
             save_val_every = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--save-vol-every=") {
+            save_vol_every = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--lr-decay=") {
+            lr_decay = v.parse()?;
         } else if dcm.is_none() {
             dcm = Some(PathBuf::from(a));
         }
@@ -350,15 +359,40 @@ async fn main() -> anyhow::Result<()> {
 
     // ---- 加载体积 + 元数据 + 标定 ----
     let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
-    let rx = meta["rx"].as_f64().unwrap_or(118.6) as f32;
-    let ry = meta["ry"].as_f64().unwrap_or(rx as f64) as f32;
+    let mut rx = meta["rx"].as_f64().unwrap_or(118.6) as f32;
+    let mut ry = meta["ry"].as_f64().unwrap_or(rx as f64) as f32;
     let rz = meta["rz"].as_f64().unwrap_or(84.7) as f32;
     let (mut vol_vec, _hx, _hy, _hz) = read_nifti_volume(&volume_path)?;
     // 维度以 meta.json 为准 (nii header dims 是置换后的 [y,z,x])。
-    let vol_x = meta["vol_x"].as_u64().unwrap_or(_hx as u64) as usize;
-    let vol_y = meta["vol_y"].as_u64().unwrap_or(_hy as u64) as usize;
+    let mut vol_x = meta["vol_x"].as_u64().unwrap_or(_hx as u64) as usize;
+    let mut vol_y = meta["vol_y"].as_u64().unwrap_or(_hy as u64) as usize;
     let vol_z = meta["vol_z"].as_u64().unwrap_or(_hz as u64) as usize;
     assert_eq!(vol_vec.len(), vol_x * vol_y * vol_z, "volume size mismatch");
+    // XY 方向 0 填充 (居中, 保持体素大小): 给 DRR 优化器在 FDK 圆柱外
+    // 放置真实外围结构的空间, 避免把外围结构硬挤进有限域产生伪影。
+    if pad_xy > vol_x || pad_xy > vol_y {
+        let n = pad_xy.max(vol_x).max(vol_y);
+        let mut out = vec![0.0f32; n * n * vol_z];
+        let ox = (n - vol_x) / 2;
+        let oy = (n - vol_y) / 2;
+        for iy in 0..vol_y {
+            for iz in 0..vol_z {
+                for ix in 0..vol_x {
+                    let src = iy * vol_x * vol_z + iz * vol_x + ix;
+                    let dst = (iy + oy) * n * vol_z + iz * n + (ix + ox);
+                    out[dst] = vol_vec[src];
+                }
+            }
+        }
+        let sx = 2.0 * rx / vol_x as f32;
+        let sy = 2.0 * ry / vol_y as f32;
+        vol_vec = out;
+        vol_x = n;
+        vol_y = n;
+        rx = sx * n as f32 / 2.0;
+        ry = sy * n as f32 / 2.0;
+        println!("volume padded XY {n}x{n} (voxel {sx:.3}mm, world {rx:.1}x{ry:.1}mm)");
+    }
     let calib: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&calib_path)?)?;
     let scale = calib["s"].as_f64().unwrap_or(1.0) as f32;
     let bias = calib["b"].as_f64().unwrap_or(0.0) as f32;
@@ -544,11 +578,13 @@ async fn main() -> anyhow::Result<()> {
     // ---- 训练循环 (全部 GPU 算子) ----
     let t0 = std::time::Instant::now();
     for it in 0..iters {
-        let start = (it * batch) % views.len();
+        // 每步视角多样化: 跨整个弧均匀采样 batch 张 (非连续), 避免
+        // mini-batch 过拟合单一角度区间导致的震荡/条纹伪影。
+        let stride = (views.len() / batch).max(1);
         let mut grad_acc: Option<Tensor<3>> = None;
         let mut loss_acc = 0.0f32;
         for b in 0..batch {
-            let vi = (start + b) % views.len();
+            let vi = (it + b * stride) % views.len();
             let s = &settings[vi];
             let proj = drr_forward_t(s, volume.clone()).await;
             let diff = proj.sub(gt_tensors[vi].clone());
@@ -581,7 +617,7 @@ async fn main() -> anyhow::Result<()> {
             grad = grad.add(g.mul_scalar(tv * batch as f32));
         }
 
-        // Adam (GPU 张量运算)。
+        // Adam (GPU 张量运算)。cosine LR 衰减: lr_cur = lr*(decay+(1-decay)*0.5*(1+cos(πu)))
         t_step += 1;
         let b1_t = b1.powf(t_step as f32);
         let b2_t = b2.powf(t_step as f32);
@@ -590,7 +626,20 @@ async fn main() -> anyhow::Result<()> {
         let m_hat = m.clone().div_scalar(1.0 - b1_t);
         let v_hat = v.clone().div_scalar(1.0 - b2_t);
         let step = m_hat.div(v_hat.sqrt().add_scalar(eps));
-        volume = volume.sub(step.mul_scalar(lr));
+        let u = if iters > 1 { it as f32 / (iters - 1) as f32 } else { 1.0 };
+        let lr_cur = lr * (lr_decay + (1.0 - lr_decay) * 0.5 * (1.0 + (std::f32::consts::PI * u).cos()));
+        volume = volume.sub(step.mul_scalar(lr_cur));
+
+        // 周期保存中间体积 (直接评估 volume 上的重建结果)。
+        if save_vol_every > 0
+            && it > 0
+            && (it % save_vol_every == 0 || it == iters - 1)
+        {
+            std::fs::create_dir_all(&out)?;
+            let vc: Vec<f32> = volume.clone().into_data().into_vec::<f32>().unwrap();
+            write_nifti_volume(&out.join(format!("vol_{it:05}.nii.gz")), &vc, vol_x, vol_y, vol_z, rx, ry, rz)?;
+            println!("saved volume iter {it} -> {out:?}/vol_{it:05}.nii.gz (lr_cur={lr_cur:.2e})");
+        }
 
         if it % 10 == 0 || it == iters - 1 {
             // eval: 8 均匀视图 PSNR (proj 域 + 强度域 exp(-proj) vs GT gray)。

@@ -28,3 +28,15 @@
   ~13min (vs ~27min, 一半)。
 - 验证了核心假设: FDK 提供静态解剖 + 残差只修动态 → 点云容量大幅减少。
 - 待做: 稀疏权重扫描 (P2c), 残差 init/阈值调优, 更多视角评估确认。
+
+## GS2volume 目视监察 (2026-08-27)
+- 工具: gs2volume (brush-voxel 体素化 GS → 与 FDK 相加, XY padding 326,
+  spacing 0.927mm, 布局 [y][z][x] x 最快)。
+- 输出:
+  - fdksplat_trans (signed 残差): gs_signed / fdk_padded / total_signed
+    (.nrrd + .nii.gz) + slices_fdksplat_trans.png
+    gs μ 范围 [0,0.368], total 相邻切片相关中位 0.965
+  - cyl_r15_ref (纯 GS): gs_uns / total_uns, slices_cyl_r15_ref.png
+    gs μ 范围 [0,0.036], total 相邻切片相关 0.917
+- 观察: 两个 GS 体积相邻切片高度相关 (0.92-0.97) → 有连贯 3D 结构,
+  非纯条纹。signed 残差 GS 峰值 μ 高 (0.368, 碘级), 纯 GS 均匀偏低。

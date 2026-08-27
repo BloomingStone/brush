@@ -1132,6 +1132,7 @@ dependencies = [
  "brush-serde",
  "brush-train",
  "brush-vfs",
+ "brush-voxel",
  "brush-xray",
  "burn",
  "burn-cubecl",
