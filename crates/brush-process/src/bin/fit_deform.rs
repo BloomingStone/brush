@@ -284,6 +284,9 @@ async fn main() -> anyhow::Result<()> {
     // nifti-rs 读写有 data.t() 转置: FDK 体积从 nii.gz 读回后 x<->y 被交换,
     // DRR 渲染出来是转置的镜像。--fdk-transpose 在加载时转置修正。
     let mut fdk_transpose = false;
+    // 独立 --signed: 有符号渲染 (opac=MU_WATER·raw, 可负) 但不要求 FDK 体积。
+    // 用于剪影等数据: 前景可建模为负密度高斯 (图像变亮 = 低密度积分)。
+    let mut signed_only = false;
     let mut resid_sparse_weight = 0.0f32;
     // screen-size prune 阈值 (px, 0 = 关闭)。
     let mut max_screen_size: Option<f32> = None;
@@ -460,6 +463,8 @@ async fn main() -> anyhow::Result<()> {
             fdk_residual_init_density = v.parse()?;
         } else if a == "--fdk-transpose" {
             fdk_transpose = true;
+        } else if a == "--signed" {
+            signed_only = true;
         } else if let Some(v) = a.strip_prefix("--resid-sparse-weight=") {
             resid_sparse_weight = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--max-screen-size=") {
@@ -830,6 +835,15 @@ async fn main() -> anyhow::Result<()> {
             vol_vec, vol_x, vol_y, vol_z, rx, ry, rz, fdk_steps, scale, bias,
             &device.clone().autodiff(),
         ));
+    }
+    // 独立 --signed (无 FDK): 有符号渲染 + 有符号 init。
+    if signed_only {
+        if !cfg.fdk_residual {
+            println!("{} signed-only mode (no FDK prior): signed render, raw=±{} init", ts(), fdk_residual_init_density);
+        }
+        cfg.fdk_residual = true;
+        cfg.fdk_residual_init_density = fdk_residual_init_density;
+        cfg.resid_sparse_weight = resid_sparse_weight;
     }
     let mut trainer = create_xray_trainer(cfg, points, scene_extent, init, &device, fov, fdk_prior);
     // 梯度诊断只在 eval 步收集(打印 + CSV 用), 见训练循环。

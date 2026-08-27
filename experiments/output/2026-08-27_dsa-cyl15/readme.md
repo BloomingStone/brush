@@ -19,3 +19,28 @@
 
 - phase0 time0 体积 (纯 GS, no-fdk, deform field phase00, max|d|=19.9mm):
   `dsa_cyl15/phase0_vol/gs_uns.nrrd` (+nii.gz), gs μ [0,0.157], 相邻切片相关 ~0.9x
+
+## ③ dsa_sub_with_phase — images/heart_pig_sub/subtracted_with_phase.dcm
+- 剪影(减影)后数据 (只剩造影/动态, 静态背景被减掉)。虽然不一定符合真实
+  3D 结构, 跑纯 GS 试试。同样 cyl_r15 配置。
+
+## ④ dsa_sub_signed — 剪影数据 + --signed (有符号高斯)
+- 动机: 剪影重建中"前景遮挡却使结构变亮"与 Beer-Lambert 密度积分矛盾;
+  有符号高斯 (负密度前景) 可表达"图像变亮 = 低密度积分"。
+- 配置: 同 cyl_r15 纯 GS + --signed (无 FDK, opac=MU_WATER·raw 可负,
+  raw=±1e-5 init)。
+
+## 最终结果总结
+| 配置 | 数据 | LPIPS | PSNR | SSIM | splats | 训练时间 |
+|---|---|---|---|---|---|---|
+| dsa_cyl15 | rotate_dsa_raw | 0.1297 | 42.09 | 0.990 | 52.4k | ~28min |
+| **dsa_cyl15_gamma** | rotate_dsa_raw_gamma_preprocessed | **0.1170** | 45.53 | 0.994 | 45.4k | ~27min |
+| dsa_sub_with_phase | heart_pig_sub/subtracted_with_phase | 0.1358 | 42.71 | 0.992 | 65.0k | (暂停, 有遮挡/亮度矛盾伪影) |
+| dsa_sub_signed | 同上 + --signed | (11k 时 0.1936, 已暂停) | | | | |
+
+- **gamma 预处理优于 raw**: 0.1170 vs 0.1297 (LPIPS -10%), PSNR +3.4dB。
+  (修复低灰度变 0 后, 暗部/低对比结构重建更好)
+- phase0 time0 体积 (纯 GS, deform field phase00):
+  - dsa_cyl15: `dsa_cyl15/phase0_vol/gs_uns.nrrd` (μ[0,0.157], 相关 0.857)
+  - dsa_cyl15_gamma: `dsa_cyl15_gamma/phase0_vol/gs_uns.nrrd` (μ[0,0.085])
+- sub 剪影两个实验 (unsigned + signed) 都有建模/优化问题, 暂停, 后续再优化。
