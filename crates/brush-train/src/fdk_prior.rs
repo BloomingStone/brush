@@ -28,9 +28,7 @@ use burn::{
 /// producing a projection-domain image `[H, W]` in the autodiff graph. The
 /// backward pass discards `v_output` — no gradients flow into the prior.
 #[derive(Debug)]
-struct FdkDrrBackwards {
-    settings: DrrSettings,
-}
+struct FdkDrrBackwards;
 
 impl<B: Backend + DrrOps> Backward<B, 1> for FdkDrrBackwards {
     type State = ();
@@ -121,12 +119,10 @@ impl FdkPrior {
             self.bias,
         );
         let volume_ad = unwrap_ad_wgpu_float(self.volume.clone());
-        let prep = FdkDrrBackwards {
-            settings: settings.clone(),
-        }
-        .prepare::<NoCheckpointing>([volume_ad.node.clone()])
-        .compute_bound()
-        .stateful();
+        let prep = FdkDrrBackwards
+            .prepare::<NoCheckpointing>([volume_ad.node.clone()])
+            .compute_bound()
+            .stateful();
 
         let volume_inner: FloatTensor<brush_cube::MainBackend> = volume_ad.primitive.clone();
         let out = <brush_cube::MainBackend as DrrOps>::drr_forward(&settings, volume_inner).await;

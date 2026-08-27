@@ -10,6 +10,32 @@
 
 ## ② dsa_cyl15_gamma — rotate_dsa_raw_gamma_preprocessed.dcm
 - 修复某些地方灰度值过低变 0 的预处理版本; 同样 cyl_r15 纯 GS 配置。
+```bash
+cd /media/data4/sj/brush-hexplane-1d8eac && \
+setsid systemd-run --user --scope -p CPUWeight=100 -p MemoryMax=12G -- \
+  env -u DISPLAY CUBECL_WGPU_DEFAULT_DEVICE='DiscreteGpu(1)' \
+  ./target/release/fit_deform \
+  images/rotate_dsa_raw_gamma_preprocessed.dcm \
+  --points=5000 \
+  --init-shape=cylinder \
+  --init-radius-scale=1.5 \
+  --no-fov-filter \
+  --cull-density=5e-4 \
+  --loss=charbonnier \
+  --roi=20 \
+  --enable-time \
+  --time-min-freq=0.2 \
+  --time-max-freq=1.5 \
+  --refine-every=400 \
+  --eval-split-every=5 \
+  --eval-views=8 \
+  --eval-every=1000 \
+  --split \
+  --iters=20000 \
+  --out=experiments/output/2026-08-27_dsa-cyl15/dsa_cyl15_gamma \
+  > experiments/output/2026-08-27_dsa-cyl15/dsa_cyl15_gamma.log 2>&1 \
+  < /dev/null & disown
+```
 
 ## 结果
 | 配置 | 数据 | LPIPS | PSNR | SSIM | splats | 训练时间 |

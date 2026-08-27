@@ -33,6 +33,7 @@
 //!     --iters=10000 --points=30000 --refine-every=400 \
 //!     --eval-split-every=5 --eval-views=8 --eval-every=500 \
 //!     --fixed-grad-thr=1e-6 --split --out=target/fit_deform
+//!   # 梯度阈值二选一: --fixed-grad-thr=F (固定, 默认) 或 --dyn-grad-percentile=0.98 (动态分位)
 //!   # HexPlane 参数 (默认): --deform-backend=hexplane \
 //!   #   --hex-res=64 --hex-time-res=32 --hex-features=16 \
 //!   #   --hex-mlp-width=128 --hex-mlp-layers=2
@@ -41,16 +42,322 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use brush_dataset::config::{DicomNormalization, LoadDatasetConfig, XRayOrientation};
+use brush_dataset::config::{parse_roi, DicomNormalization, LoadDatasetConfig, RoiSpec, XRayOrientation};
 use brush_dataset::scene::SceneView;
 use brush_dataset::scene_loader::SceneLoader;
 use brush_deform::{HexPlaneConfig, HexPlaneDeformConfig};
+use brush_loss::gray::GrayLossType;
+use clap::Parser;
 use brush_render::gaussian_splats::{SplatRenderMode, Splats};
 use brush_train::xray_eval::save_gray_nrrd_f32_stack;
-use brush_train::xray_refine::XRayRefineConfig;
+use brush_train::xray_refine::{XRayRefineConfig, XRayRefineGradThreshold};
 use brush_train::xray_train::{DeformBackend, XRayTrainConfig, create_xray_trainer};use brush_vfs::BrushVfs;
 use brush_xray::XRaySplats;
 use burn::tensor::{Device, TensorData};
+
+/// 解析 `--loss` (l1|charbonnier|huber|l2) → [`GrayLossType`]。
+fn parse_loss(s: &str) -> Result<GrayLossType, String> {
+    match s {
+        "l1" => Ok(GrayLossType::L1),
+        "charbonnier" => Ok(GrayLossType::Charbonnier),
+        "huber" => Ok(GrayLossType::Huber),
+        "l2" => Ok(GrayLossType::L2),
+        _ => Err(format!("invalid --loss '{s}' (l1|charbonnier|huber|l2)")),
+    }
+}
+
+/// 解析 `--deform-backend` (hexplane|hashgrid) → [`DeformBackend`]。
+fn parse_deform_backend(s: &str) -> Result<DeformBackend, String> {
+    match s {
+        "hexplane" => Ok(DeformBackend::HexPlane),
+        "hashgrid" => Ok(DeformBackend::HashGrid),
+        _ => Err(format!("invalid --deform-backend '{s}' (hexplane|hashgrid)")),
+    }
+}
+
+/// 动态 X-ray 重建 CLI (clap)。参数按功能分组, 默认值与旧手写解析一致。
+#[derive(Parser)]
+#[command(name = "fit_deform", about = "心动相位驱动的动态 X-ray 重建")]
+struct FitDeformArgs {
+    /// DICOM 序列文件路径 (如 images/RXA_pig_with_phase.dcm)。
+    #[arg(value_name = "DCM", help_heading = "输入数据")]
+    dcm: PathBuf,
+
+    // ---- 数据预处理 ------------------------------------------------------
+    /// 自动 gamma: 让全局强度中位数映射到该目标灰度 (0.5 = 中灰)。
+    #[arg(long, value_name = "G", help_heading = "数据预处理")]
+    gamma_target: Option<f32>,
+    /// 关闭自动 gamma。
+    #[arg(long, help_heading = "数据预处理")]
+    no_gamma: bool,
+    /// 关闭 FOV 过滤 (默认只保留至少在一个视角内投影的点)。
+    #[arg(long, help_heading = "数据预处理")]
+    no_fov_filter: bool,
+    /// 场景半径 (mm); 缺省按相机几何自动计算等中心 FOV 半径。
+    #[arg(long, value_name = "MM", help_heading = "数据预处理")]
+    scene_extent: Option<f32>,
+    /// ROI 截取: no | N | x0,y0,w,h (像素)。默认四边各裁 20。
+    #[arg(long, value_name = "ROI", default_value = "20", value_parser = parse_roi, help_heading = "数据预处理")]
+    roi: RoiSpec,
+
+    // ---- 初始化 ----------------------------------------------------------
+    /// 初始化 splat 点数 (densify 会按梯度阈值补足)。
+    #[arg(long, value_name = "N", default_value_t = 5_000, help_heading = "初始化")]
+    points: u32,
+    /// 初始化采样区域: ball | cylinder (绕 Z 圆柱, 匹配锥束 FOV)。
+    #[arg(long, default_value = "ball", value_parser = ["ball", "cylinder"], help_heading = "初始化")]
+    init_shape: String,
+    /// 圆柱半径 = R0(=half_w 世界) × scale; 高度自动 = 2·half_h·(1+R/SOD)。
+    #[arg(long, default_value_t = 1.0, help_heading = "初始化")]
+    init_radius_scale: f32,
+    /// R0 时的标准点数 (密度基准, cylinder 按体积比缩放)。
+    #[arg(long, value_name = "N", default_value_t = 5_000, help_heading = "初始化")]
+    init_density_base: u32,
+    /// >0 覆盖自动高度 = F × (2·half_h)。
+    #[arg(long, default_value_t = 0.0, help_heading = "初始化")]
+    init_height_factor: f32,
+    /// 初始密度 (mm⁻¹, 默认 0.01 = 5×水)。
+    #[arg(long, value_name = "MU", default_value_t = 0.01, help_heading = "初始化")]
+    init_density: f32,
+
+    // ---- 优化 / 学习率 ----------------------------------------------------
+    /// 总训练步数。
+    #[arg(long, value_name = "N", default_value_t = 10_000, help_heading = "优化 / 学习率")]
+    iters: u32,
+    /// 位置学习率起点。
+    #[arg(long, default_value_t = 2e-5, help_heading = "优化 / 学习率")]
+    lr_mean: f64,
+    /// 位置学习率终点 (cosine min / 指数末段)。
+    #[arg(long, default_value_t = 2e-6, help_heading = "优化 / 学习率")]
+    lr_mean_end: f64,
+    /// 尺度 (log-scale) 学习率。
+    #[arg(long, default_value_t = 5e-3, help_heading = "优化 / 学习率")]
+    lr_scale: f64,
+    /// 不透明度 (密度) 学习率。
+    #[arg(long, default_value_t = 0.012, help_heading = "优化 / 学习率")]
+    lr_opac: f64,
+    /// Deform 网络学习率 (线性衰减到 lr_deform_end)。
+    #[arg(long, default_value_t = 1e-3, help_heading = "优化 / 学习率")]
+    lr_deform: f64,
+    /// Deform 网络学习率终点。
+    #[arg(long, default_value_t = 1e-4, help_heading = "优化 / 学习率")]
+    lr_deform_end: f64,
+    /// 使用 cosine LR (默认指数衰减)。
+    #[arg(long, help_heading = "优化 / 学习率")]
+    cosine_lr: bool,
+
+    // ---- 形变网络 (deform) ------------------------------------------------
+    /// 关闭 AST (asynchronous time) 噪声 (默认开)。
+    #[arg(long = "no-ast", help_heading = "形变网络 (deform)")]
+    no_ast: bool,
+    /// Warm-up 步数: 前 N 步不施加形变 (dummy 梯度)。
+    #[arg(long, value_name = "N", default_value_t = 300, help_heading = "形变网络 (deform)")]
+    warm_up: u32,
+    /// Deform 后端: hexplane | hashgrid。
+    #[arg(long, default_value = "hexplane", value_parser = parse_deform_backend, help_heading = "形变网络 (deform)")]
+    deform_backend: DeformBackend,
+    /// 预测 d_scaling (默认不预测, 保质量形变)。
+    #[arg(long, help_heading = "形变网络 (deform)")]
+    predict_scaling: bool,
+    /// 关闭保质量形变 (预测 d_scaling)。
+    #[arg(long = "no-predict-scaling", help_heading = "形变网络 (deform)")]
+    no_predict_scaling: bool,
+    /// 可学习时间条件化 (默认开): 用可学习傅里叶频率拟合呼吸等非周期运动。
+    #[arg(long, default_value_t = true, help_heading = "形变网络 (deform)")]
+    enable_time: bool,
+    /// 关闭可学习时间条件化。
+    #[arg(long = "no-time", help_heading = "形变网络 (deform)")]
+    no_time: bool,
+    /// 时间编码频率个数。
+    #[arg(long, value_name = "N", default_value_t = 10, help_heading = "形变网络 (deform)")]
+    time_freqs: usize,
+    /// 时间编码最小频率 (Hz)。
+    #[arg(long, default_value_t = 0.2, help_heading = "形变网络 (deform)")]
+    time_min_freq: f32,
+    /// 时间编码最大频率 (Hz)。
+    #[arg(long, default_value_t = 1.5, help_heading = "形变网络 (deform)")]
+    time_max_freq: f32,
+    /// 时间抖动 (秒, 高斯std; 0=关)。
+    #[arg(long, default_value_t = 0.0, help_heading = "形变网络 (deform)")]
+    time_jitter: f32,
+    /// 时间 TV 正则权重 (0=关)。
+    #[arg(long, default_value_t = 0.0, help_heading = "形变网络 (deform)")]
+    time_tv_weight: f32,
+    /// 时间 TV 相位步长 (每帧心搏推进)。
+    #[arg(long, default_value_t = 0.0, help_heading = "形变网络 (deform)")]
+    time_tv_dp: f32,
+    /// 时间 TV 时间步长 (1帧 @80fps)。
+    #[arg(long, default_value_t = 0.0125, help_heading = "形变网络 (deform)")]
+    time_tv_dt: f32,
+    /// 时间 TV 子集 splat 数。
+    #[arg(long, value_name = "N", default_value_t = 1024, help_heading = "形变网络 (deform)")]
+    time_tv_sample: usize,
+
+    // ---- HexPlane 超参 ----------------------------------------------------
+    /// 空间分辨率。
+    #[arg(long, value_name = "N", default_value_t = 64, help_heading = "HexPlane 超参")]
+    hex_res: u32,
+    /// 时间分辨率。
+    #[arg(long, value_name = "N", default_value_t = 32, help_heading = "HexPlane 超参")]
+    hex_time_res: u32,
+    /// 特征通道数。
+    #[arg(long, value_name = "N", default_value_t = 16, help_heading = "HexPlane 超参")]
+    hex_features: usize,
+    /// MLP 隐藏宽度。
+    #[arg(long, value_name = "N", default_value_t = 128, help_heading = "HexPlane 超参")]
+    hex_mlp_width: usize,
+    /// MLP 层数。
+    #[arg(long, value_name = "N", default_value_t = 2, help_heading = "HexPlane 超参")]
+    hex_mlp_layers: usize,
+    /// 特征平面空间 TV 权重 (0=关): 强制形变场低频/平滑。
+    #[arg(long, default_value_t = 0.0, help_heading = "HexPlane 超参")]
+    plane_tv_weight: f32,
+    /// 刚性锚点约束权重。
+    #[arg(long, default_value_t = 0.0, help_heading = "HexPlane 超参")]
+    rigid_anchor_weight: f32,
+
+    // ---- 密度控制 / refine ------------------------------------------------
+    /// 每次 refine 只 densify 25% 的过阈值 splat (平衡增长与速度)。
+    #[arg(long, default_value_t = 0.25, help_heading = "密度控制 / refine")]
+    growth_frac: f32,
+    /// 密度控制 (densify/prune) 间隔 (步)。
+    #[arg(long, value_name = "N", default_value_t = 400, help_heading = "密度控制 / refine")]
+    refine_every: u32,
+    /// 硬性 splat 数上限 (到顶后只 prune 不再增)。
+    #[arg(long, value_name = "N", default_value_t = 300_000, help_heading = "密度控制 / refine")]
+    max_splats: u32,
+    /// 固定 densify 梯度阈值 (缺省 5e-6; 与 dyn-grad-percentile 二选一)。
+    #[arg(long, value_name = "F", help_heading = "密度控制 / refine")]
+    fixed_grad_thr: Option<f32>,
+    /// 动态 densify 梯度百分位 (0~1, 如 0.98; 覆盖 fixed-grad-thr)。
+    #[arg(long, value_name = "PCT", help_heading = "密度控制 / refine")]
+    dyn_grad_percentile: Option<f32>,
+    /// 启用 oversized 高梯度点拆分。
+    #[arg(long, help_heading = "密度控制 / refine")]
+    split: bool,
+    /// clone/split 分界阈值系数 (默认 0.0005)。
+    #[arg(long, help_heading = "密度控制 / refine")]
+    percent_dense: Option<f32>,
+    /// split 尺度收缩系数 (默认 1/√2)。
+    #[arg(long, help_heading = "密度控制 / refine")]
+    split_scale: Option<f32>,
+    /// 离群点位置剪枝系数 (默认 3× scene_extent)。
+    #[arg(long, help_heading = "密度控制 / refine")]
+    bound_factor: Option<f32>,
+    /// prune 密度阈值 (mm⁻¹, 默认 5e-4)。
+    #[arg(long, value_name = "MU", help_heading = "密度控制 / refine")]
+    cull_density: Option<f32>,
+    /// screen-size prune 阈值 (px, 0 = 关闭)。
+    #[arg(long, value_name = "PX", help_heading = "密度控制 / refine")]
+    max_screen_size: Option<f32>,
+    /// 贡献裁剪: 剪掉 density×屏幕面积×可见性 都低且处于最低百分位的 splat。
+    #[arg(long, help_heading = "密度控制 / refine")]
+    cull_contribution: bool,
+    /// 关闭贡献裁剪。
+    #[arg(long, help_heading = "密度控制 / refine")]
+    no_cull_contribution: bool,
+    /// 贡献裁剪百分位 (默认 0.05)。
+    #[arg(long, default_value_t = 0.05, help_heading = "密度控制 / refine")]
+    cull_percentile: f32,
+    /// 贡献裁剪下限 (默认 1e-3)。
+    #[arg(long, default_value_t = 1e-3, help_heading = "密度控制 / refine")]
+    cull_floor: f32,
+    /// 最小保留 splat 数。
+    #[arg(long, value_name = "N", default_value_t = 0, help_heading = "密度控制 / refine")]
+    min_splats: u32,
+    /// 密度软重置间隔 (0 = 关闭; 参考项目用 2000)。
+    #[arg(long, value_name = "N", default_value_t = 0, help_heading = "密度控制 / refine")]
+    density_reset: u32,
+
+    // ---- 损失 ------------------------------------------------------------
+    /// 像素级损失类型: l1 | charbonnier | huber | l2。
+    #[arg(long, default_value = "charbonnier", value_parser = parse_loss, help_heading = "损失")]
+    loss: GrayLossType,
+    /// Charbonnier ε (平滑底)。
+    #[arg(long, default_value_t = 1e-3, help_heading = "损失")]
+    loss_eps: f32,
+    /// Huber δ。
+    #[arg(long, default_value_t = 0.1, help_heading = "损失")]
+    loss_delta: f32,
+    /// proj 域损失权重 (在 -ln(intensity) 域比较)。
+    #[arg(long, default_value_t = 1.0, help_heading = "损失")]
+    proj_weight: f32,
+    /// proj 域 SSIM 权重 (0 = 关闭, 纯 L1)。
+    #[arg(long, default_value_t = 0.0, help_heading = "损失")]
+    proj_ssim_weight: f32,
+    /// 多尺度(金字塔)损失权重。
+    #[arg(long, default_value_t = 0.5, help_heading = "损失")]
+    multiscale_weight: f32,
+    /// 多窗宽窗位损失权重 (LPIPS 感知增强)。
+    #[arg(long, default_value_t = 0.5, help_heading = "损失")]
+    window_weight: f32,
+    /// 梯度(Sobel 差分)损失权重 (0 = 关闭)。
+    #[arg(long, default_value_t = 0.0, help_heading = "损失")]
+    grad_weight: f32,
+    /// 边缘加权梯度损失 ramp 起点 (默认 3000 起步)。
+    #[arg(long, value_name = "N", default_value_t = 3_000, help_heading = "损失")]
+    grad_ramp_from: u32,
+    /// 边缘加权梯度损失 ramp 终点 (0 = total_iters)。
+    #[arg(long, value_name = "N", default_value_t = 0, help_heading = "损失")]
+    grad_ramp_to: u32,
+    /// GT 边缘幅度加权: clamp(|∇gt|/scale, 0, 1); 0 = 纯梯度损失。
+    #[arg(long, default_value_t = 0.03, help_heading = "损失")]
+    grad_edge_scale: f32,
+    /// 残差稀疏权重。
+    #[arg(long, default_value_t = 0.0, help_heading = "损失")]
+    resid_sparse_weight: f32,
+
+    // ---- FDK 先验 / 有符号渲染 --------------------------------------------
+    /// FDK 体积 (nii.gz), 残差 GS 先验。
+    #[arg(long, value_name = "NII", help_heading = "FDK 先验 / 有符号渲染")]
+    fdk_volume: Option<PathBuf>,
+    /// FDK 相机元数据 (json)。
+    #[arg(long, value_name = "JSON", help_heading = "FDK 先验 / 有符号渲染")]
+    fdk_meta: Option<PathBuf>,
+    /// FDK 标定 (json)。
+    #[arg(long, value_name = "JSON", help_heading = "FDK 先验 / 有符号渲染")]
+    fdk_calib: Option<PathBuf>,
+    /// FDK DRR 采样步数。
+    #[arg(long, value_name = "N", default_value_t = 256, help_heading = "FDK 先验 / 有符号渲染")]
+    fdk_steps: u32,
+    /// 残差初始化密度。
+    #[arg(long, default_value_t = 1e-5, help_heading = "FDK 先验 / 有符号渲染")]
+    fdk_resid_init_density: f32,
+    /// FDK 体积加载时转置修正 (nifti data.t())。
+    #[arg(long, help_heading = "FDK 先验 / 有符号渲染")]
+    fdk_transpose: bool,
+    /// 有符号渲染 (opac=MU_WATER·raw, 可负), 不要求 FDK 体积。
+    #[arg(long, help_heading = "FDK 先验 / 有符号渲染")]
+    signed: bool,
+
+    // ---- 分阶段呼吸场 (respi) ----------------------------------------------
+    /// 分阶段双场训练: N 步后开训时间条件呼吸场 (0 = 单场训练)。
+    #[arg(long, value_name = "N", default_value_t = 0, help_heading = "分阶段呼吸场 (respi)")]
+    respi_after: u32,
+    /// 关闭默认的"冻结心电场" (改为联合训练)。
+    #[arg(long = "no-respi-freeze", help_heading = "分阶段呼吸场 (respi)")]
+    no_respi_freeze: bool,
+
+    // ---- 评估与输出 -------------------------------------------------------
+    /// 每 N 步做一次 eval (PSNR/SSIM/LPIPS + 保存 GT|pred stack)。
+    #[arg(long, value_name = "N", default_value_t = 100, help_heading = "评估与输出")]
+    eval_every: u32,
+    /// 验证集: 每 N 帧扣一个 held-out 视图 (缺省用 train view 0)。
+    #[arg(long, value_name = "N", help_heading = "评估与输出")]
+    eval_split_every: Option<usize>,
+    /// 每次 eval 采 M 个验证视图 (均匀)。
+    #[arg(long, value_name = "M", default_value_t = 8, help_heading = "评估与输出")]
+    eval_views: usize,
+    /// 不保存形变场 (ckpt + 4D NIfTI)。
+    #[arg(long = "no-save-deform", help_heading = "评估与输出")]
+    no_save_deform: bool,
+    /// 指标 CSV: 默认 <out>/metrics.csv, "off" 关闭。
+    #[arg(long, value_name = "FILE", help_heading = "评估与输出")]
+    log_csv: Option<PathBuf>,
+    /// 输出目录。
+    #[arg(long, value_name = "DIR", default_value = "target/fit_deform", help_heading = "评估与输出")]
+    out: PathBuf,
+}
 
 /// Convert canonical [`brush_xray::XRaySplats`] into a viewer-able
 /// [`Splats`] (SH degree 0 → grayscale; the X-ray renderer is SH-free).
@@ -110,7 +417,7 @@ fn save_stack(dir: &Path, iter: u32, pairs: &[TensorData]) {
 }
 
 /// 读 3D 体积为 .nii.gz → (x-major vol_vec, vx, vy, vz)。nifti-rs 读回磁盘
-/// 列优先缓冲 (x 最快), 转成内部 x-major 布局 (与 fit_volume 相同)。
+/// 列优先缓冲 (x 最快), 转成内部 x-major 布局。
 fn read_nifti_volume(path: &Path) -> anyhow::Result<(Vec<f32>, usize, usize, usize)> {
     use nifti::{NiftiObject, ReaderOptions};
     let obj = ReaderOptions::new().read_file(path)?;
@@ -171,366 +478,129 @@ fn log_metrics_row(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let mut dcm: Option<PathBuf> = None;
-    let mut iters = 10_000u32;
+    let args = FitDeformArgs::parse();
+
+    // ---- 输入 / 数据预处理 -------------------------------------------------
+    let dcm = args.dcm.clone();
+    let roi = args.roi;
+    let no_fov_filter = args.no_fov_filter;
+    // None → 从相机几何自动计算(等中心 FOV 半径), 保证点云覆盖整个视野。
+    let scene_extent = args.scene_extent;
+    // 自动 gamma: 让全局强度中位数映射到该目标灰度 (0.5 = 中灰); --no-gamma 关闭。
+    let gamma_target = if args.no_gamma {
+        None
+    } else {
+        args.gamma_target.or(Some(0.5))
+    };
+    // ---- 初始化 -----------------------------------------------------------
     // 初始化点数: 5000 (2026-08-21 扫描最优: 比 30000 少, PSNR 反而更高
     // 41.12 vs 40.63, 且快 ~1.5×)。densify 会按梯度阈值补足, 初始种子少
     // → 空气区噪声少、放置更高效。
-    let mut points = 5_000u32;
-    // 初始化采样区域: ball (球, 默认) | cylinder (绕 Z 圆柱, 匹配锥束 FOV)。
-    let mut init_shape = "ball".to_string();
-    // 圆柱半径 = R0(=half_w=W/2 世界) × scale; 高度自动 = 2·half_h·(1+R/SOD)。
-    let mut init_radius_scale = 1.0f32;
-    let mut init_density_base = 5_000u32; // R0 时的标准点数 (密度基准)
-    let mut init_height_factor = 0.0f32; // >0 覆盖自动高度 = F × (2·half_h)
-    let mut no_fov_filter = false;
-    // None → 从相机几何自动计算(等中心 FOV 半径), 保证点云覆盖整个视野。
-    let mut scene_extent: Option<f32> = None;
-    // 自动 gamma: 让全局强度中位数映射到该目标灰度(0.5 = 中灰)。
-    let mut gamma_target: Option<f32> = Some(0.5);
+    let mut points = args.points;
+    let init_shape = args.init_shape.clone();
+    let init_radius_scale = args.init_radius_scale;
+    let init_density_base = args.init_density_base;
+    let init_height_factor = args.init_height_factor;
     // 初始密度 = 0.01 mm⁻¹ (5×水): 2026-08-21 扫描 points=5000 下甜点
     // (PSNR 41.32)。之前 0.02 (10×水) 让初始球成高密度雾, 空气 splat 密度
     // 饱和永不衰减 → pruned≈0; 降到 0.01 后空气点可衰减并被密度裁剪。
-    let mut init_density = 0.01f32;
-    let mut lr_mean = 2e-5f64;
+    let init_density = args.init_density;
+    // ---- 优化 / 学习率 ----------------------------------------------------
+    let iters = args.iters;
+    let lr_mean = args.lr_mean;
     // 末期不冻结: 默认 2e-6 (cosine min / 指数末段)。
-    let mut lr_mean_end = 2e-6f64;
-    let mut lr_scale = 5e-3f64;
-    let mut lr_opac = 0.012f64;
+    let lr_mean_end = args.lr_mean_end;
+    let lr_scale = args.lr_scale;
+    let lr_opac = args.lr_opac;
     // Deform 网络 LR (线性衰减到 lr_deform_end)。
-    let mut lr_deform = 1e-3f64;
-    let mut lr_deform_end = 1e-4f64;
-    // AST (asynchronous time) 噪声: 训练时给 phase 加随时间衰减的高斯噪声。
-    let mut enable_ast = true;
+    let lr_deform = args.lr_deform;
+    let lr_deform_end = args.lr_deform_end;
+    let cosine_lr = args.cosine_lr;
+    // ---- 形变网络 (deform) ------------------------------------------------
+    // AST (asynchronous time) 噪声: 训练时给 phase 加随时间衰减的高斯噪声 (默认开)。
+    let enable_ast = !args.no_ast;
     // Warm-up 步数: 前 N 步不施加形变 (dummy 梯度), 让 canonical 先收敛。
-    let mut warm_up = 300u32;
+    let warm_up = args.warm_up;
     // Deform 后端: hexplane (默认) 或 hashgrid。
-    let mut deform_backend = DeformBackend::HexPlane;
-    // HexPlane 超参 (默认: spatial=64 / time=32 / features=16 / mlp 128x2)。
-    let mut hex_res = 64u32;
-    let mut hex_time_res = 32u32;
-    let mut hex_features = 16usize;
-    let mut hex_mlp_width = 128usize;
-    let mut hex_mlp_layers = 2usize;
-    // HexPlane 特征平面空间 TV 权重 (0=关): 强制形变场低频/平滑, 防止
-    // 退化为带限周期模式拟合投影噪声 (2026-08-25 形变场诊断)。
-    let mut plane_tv_weight = 0.0f32;
-    let mut rigid_anchor_weight = 0.0f32;
+    let deform_backend = args.deform_backend;
     // 保质量形变 (默认): 不预测 d_scaling, 局部密度变化由位移/旋转产生。
-    let mut predict_scaling = false;
-    // 可学习时间条件化 (默认开): 形变网络用可学习傅里叶频率拟合呼吸等
-    // 非周期运动 (无需预知呼吸频率), 与心脏 phase 圆环轴互补。呼吸明显
-    // 数据 +4~5dB, 呼吸弱数据中性 (+0.04dB), 无害。
-    let mut enable_time = true;
-    // 时间编码参数: 频率个数 / 初始化范围 (Hz, 对数间隔)。紧生理带
-    // [0.2,1.5] 最优 (2026-08-20 扫描: 39.22 vs 默认 38.90)。
-    let mut time_freqs = 10usize;
-    let mut time_min_freq = 0.2f32;
-    let mut time_max_freq = 1.5f32;
-    // 时间抖动 (秒, 高斯std; 0=关): 对 time 条件加噪, 强制形变场时间局部平滑
-    // (连续视频式序列, 相邻帧形变小)。类似 AST 相位噪声。
-    let mut time_jitter = 0.0f32;
-    // 时间 TV 正则权重 (0=关): 惩罚 deform 在 (phase+dp,time+dt) 与
-    // (phase,time) 的位移差 → 编码"相邻帧形变小", 提升 held-out 泛化。
-    let mut time_tv_weight = 0.0f32;
-    let mut time_tv_dp = 0.0f32;       // 相位步长 (每帧心搏推进)
-    let mut time_tv_dt = 0.0125f32;    // 时间步长 = 1帧 @80fps
-    let mut time_tv_sample = 1024usize; // TV 子集 splat 数
-    // 每次 refine 只 densify 25% 的过阈值 splat → 平衡增长与速度。
-    let mut growth_frac = 0.25f32;
-    let mut refine_every = 400u32;
-    // 硬性 splat 数上限: 到顶后只 prune 不再增 (原 1M, 10k 步中期就可能顶到)。
-    let mut max_splats = 300_000u32;
-    let mut eval_every = 100u32;
-    // 保存形变场: deform 网络 ckpt (.bin) + 4D 形变场 NIfTI (d_xyz over
-    // [x,y,z,phase,3])。0 = 不保存 (诊断用)。
-    let mut save_deform = true;
-    // 验证集: `--eval-split-every=N` 每 N 帧扣一个 held-out 视图;
-    // `--eval-views=M` 每次 eval 采 M 个验证视图(均匀)。
-    let mut eval_split_every: Option<usize> = None;
-    let mut eval_views_count = 8usize;
+    let predict_scaling = args.predict_scaling && !args.no_predict_scaling;
+    // 可学习时间条件化 (默认开): 形变网络用可学习傅里叶频率拟合呼吸等非周期运动。
+    let enable_time = args.enable_time && !args.no_time;
+    // 时间编码参数: 频率个数 / 初始化范围 (Hz, 对数间隔)。
+    let time_freqs = args.time_freqs;
+    let time_min_freq = args.time_min_freq;
+    let time_max_freq = args.time_max_freq;
+    // 时间抖动 (秒, 高斯std; 0=关): 强制形变场时间局部平滑。
+    let time_jitter = args.time_jitter;
+    // 时间 TV 正则权重 (0=关): 惩罚 deform 相邻帧位移差, 提升 held-out 泛化。
+    let time_tv_weight = args.time_tv_weight;
+    let time_tv_dp = args.time_tv_dp; // 相位步长 (每帧心搏推进)
+    let time_tv_dt = args.time_tv_dt; // 时间步长 = 1帧 @80fps
+    let time_tv_sample = args.time_tv_sample; // TV 子集 splat 数
+    // ---- HexPlane 超参 ----------------------------------------------------
+    let hex_res = args.hex_res;
+    let hex_time_res = args.hex_time_res;
+    let hex_features = args.hex_features;
+    let hex_mlp_width = args.hex_mlp_width;
+    let hex_mlp_layers = args.hex_mlp_layers;
+    // HexPlane 特征平面空间 TV 权重 (0=关): 强制形变场低频/平滑。
+    let plane_tv_weight = args.plane_tv_weight;
+    let rigid_anchor_weight = args.rigid_anchor_weight;
+    // ---- 密度控制 / refine ------------------------------------------------
+    let growth_frac = args.growth_frac;
+    let refine_every = args.refine_every;
+    let max_splats = args.max_splats;
     // 固定 densify 梯度阈值 (默认 5e-6 = 2026-08-24 修正: 1e-5 质量过差,
-    // 5e-6 ~40k splats, LPIPS 0.192 vs 1e-5 的 0.222, 性价比甜点);
-    // None = 动态百分位 (0.98pct 仅 ~16k)。
-    let mut fixed_grad_thr: Option<f32> = Some(5e-6);
-    // 启用 oversized 高梯度点拆分(clone-only → clone+split, 参考 RGB refine_splats)。
-    let mut enable_split = false;
-    // proj 域损失权重 (在 -ln(intensity) 域比较; 默认 1.0 已作为最优默认)。
-    let mut proj_weight = 1.0f32;
-    // proj 域 SSIM 权重 (0 = 关闭, proj 损失保持纯 L1)。
-    let mut proj_ssim_weight = 0.0f32;
-    // 像素级损失类型: l1 | charbonnier | huber | l2。Charbonnier 最优
-    // (2026-08-21: PSNR +0.20dB, LPIPS -0.007 vs L1), X-ray 噪声更稳。
-    let mut loss_type = brush_loss::gray::GrayLossType::Charbonnier;
-    let mut loss_eps = 1e-3f32; // Charbonnier ε
-    let mut loss_delta = 0.1f32; // Huber δ
-    // 使用 cosine LR (默认指数衰减)。
-    let mut cosine_lr = false;
-    // clone/split 分界阈值系数 (默认 0.0005)。
-    let mut percent_dense: Option<f32> = None;
-    // split 尺度收缩系数 (默认 1/√2)。
-    let mut split_scale: Option<f32> = None;
-    // 离群点位置剪枝系数 (默认 3× scene_extent, 人体固定区域)。
-    let mut bound_factor: Option<f32> = None;
-    // prune 密度阈值 (默认 5e-5)。
-    let mut cull_density: Option<f32> = None;
-    // FDK 静态先验 (残差 GS): --fdk-volume=<nii.gz> --fdk-meta=<json> --fdk-calib=<json>。
-    // 开启后有符号渲染 + 残差初始化 + proj = splat + fdk DRR。
-    let mut fdk_volume: Option<PathBuf> = None;
-    let mut fdk_meta: Option<PathBuf> = None;
-    let mut fdk_calib: Option<PathBuf> = None;
-    let mut fdk_steps = 256u32;
-    let mut fdk_residual_init_density = 1e-5f32;
-    // FDK 重建世界系与训练/GT 差了跨 y=x 的反射 (历史转置问题已解耦):
-    // 布局转换在 read_nifti_volume 内自动完成, 此 flag 仅做世界系镜像。
-    let mut fdk_transpose = false;
-    // 独立 --signed: 有符号渲染 (opac=MU_WATER·raw, 可负) 但不要求 FDK 体积。
-    // 用于剪影等数据: 前景可建模为负密度高斯 (图像变亮 = 低密度积分)。
-    let mut signed_only = false;
-    let mut resid_sparse_weight = 0.0f32;
-    // screen-size prune 阈值 (px, 0 = 关闭)。
-    let mut max_screen_size: Option<f32> = None;
-    // 贡献裁剪 (默认关): 剪掉 density×屏幕面积×可见性 都低且处于最低百分位
-    // 的 splat (微小/永不可见废点, 密度裁剪剪不掉)。
-    let mut cull_contribution = false;
-    let mut cull_percentile = 0.05f32;
-    let mut cull_floor = 1e-3f32;
-    let mut min_splats = 0u32;
-    // 多尺度(金字塔)损失权重 (默认 0.5, 最强项)。
-    let mut multiscale_weight = 0.5f32;
-    // 多窗宽窗位损失权重 (默认 0.5, LPIPS 感知增强)。
-    let mut window_weight = 0.5f32;
-    // 梯度(Sobel 差分)损失权重 (0 = 关闭)。
-    let mut grad_weight = 0.0f32;
-    // 边缘加权梯度损失 ramp: [from,to] 内权重 0→grad_weight (smoothstep)。
-    // 默认 3000 起步、到训练末全权 → 前期 L1/SSIM 主导, 后期集中推边缘。
-    let mut grad_ramp_from = 3_000u32;
-    let mut grad_ramp_to = 0u32; // 0 = total_iters
-    // GT 边缘幅度加权: clamp(|∇gt|/scale, 0, 1); 0 = 纯梯度损失。
-    // 默认 0.03: 高于平坦区噪声底(~0.002) ~10x, 强边缘(p99 0.02-0.05)满权。
-    let mut grad_edge_scale = 0.03f32;
-    // 分阶段双场训练: N 步后开训时间条件呼吸场 (学残差运动), 心电场纯相位。
-    // 0 = 单场训练 (当前行为)。默认冻结心电场 (--no-respi-freeze 改为联合训练)。
-    let mut respi_after = 0u32;
-    let mut respi_freeze = true;
-    // 密度软重置间隔 (0 = 关闭; 参考项目用 2000)。
-    let mut density_reset_interval = 0u32;
-    let mut out = PathBuf::from("target/fit_deform");
-    // ROI 截取 (默认四边各裁 20px 去 FOV 暗边; `--roi=no` 关闭, `--roi=N`
-    // 四边各裁 N, `--roi=x0,y0,w,h` 显式矩形)。像素与相机内参同步调整。
-    let mut roi: brush_dataset::config::RoiSpec = brush_dataset::config::RoiSpec::Inset(20);
-    // 指标 CSV 记录器: 默认 <out>/metrics.csv, `--log-csv=FILE` 覆盖,
-    // `--log-csv=off` 关闭。每次 eval 追加一行(含时间戳 + 各指标)。
-    let mut log_csv: Option<PathBuf> = None;
-    let mut i = 1;
-    while i < args.len() {
-        let a = &args[i];
-        if let Some(v) = a.strip_prefix("--iters=") {
-            iters = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--points=") {
-            points = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--init-shape=") {
-            init_shape = v.to_string();
-        } else if let Some(v) = a.strip_prefix("--init-radius-scale=") {
-            init_radius_scale = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--init-density-base=") {
-            init_density_base = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--init-height-factor=") {
-            init_height_factor = v.parse()?;
-        } else if a == "--no-fov-filter" {
-            no_fov_filter = true;
-        } else if let Some(v) = a.strip_prefix("--scene-extent=") {
-            scene_extent = Some(v.parse()?);
-        } else if let Some(v) = a.strip_prefix("--gamma-target=") {
-            gamma_target = Some(v.parse()?);
-        } else if a == "--no-gamma" {
-            gamma_target = None;
-        } else if let Some(v) = a.strip_prefix("--init-density=") {
-            init_density = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--lr-mean=") {
-            lr_mean = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--lr-mean-end=") {
-            lr_mean_end = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--lr-scale=") {
-            lr_scale = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--lr-opac=") {
-            lr_opac = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--lr-deform=") {
-            lr_deform = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--lr-deform-end=") {
-            lr_deform_end = v.parse()?;
-        } else if a == "--no-ast" {
-            enable_ast = false;
-        } else if let Some(v) = a.strip_prefix("--warm-up=") {
-            warm_up = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--deform-backend=") {
-            deform_backend = match v {
-                "hexplane" => DeformBackend::HexPlane,
-                "hashgrid" => DeformBackend::HashGrid,
-                _ => anyhow::bail!("invalid --deform-backend '{v}' (hexplane|hashgrid)"),
-            };
-        } else if let Some(v) = a.strip_prefix("--hex-res=") {
-            hex_res = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--hex-time-res=") {
-            hex_time_res = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--hex-features=") {
-            hex_features = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--hex-mlp-width=") {
-            hex_mlp_width = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--hex-mlp-layers=") {
-            hex_mlp_layers = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--plane-tv-weight=") {
-            plane_tv_weight = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--rigid-anchor-weight=") {
-            rigid_anchor_weight = v.parse()?;
-        } else if a == "--predict-scaling" {
-            predict_scaling = true;
-        } else if a == "--no-predict-scaling" {
-            predict_scaling = false;
-        } else if a == "--enable-time" {
-            enable_time = true;
-        } else if a == "--no-time" {
-            enable_time = false;
-        } else if let Some(v) = a.strip_prefix("--time-freqs=") {
-            time_freqs = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--time-min-freq=") {
-            time_min_freq = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--time-max-freq=") {
-            time_max_freq = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--time-jitter=") {
-            time_jitter = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--time-tv-weight=") {
-            time_tv_weight = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--time-tv-dp=") {
-            time_tv_dp = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--time-tv-dt=") {
-            time_tv_dt = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--time-tv-sample=") {
-            time_tv_sample = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--growth-frac=") {
-            growth_frac = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--refine-every=") {
-            refine_every = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--max-splats=") {
-            max_splats = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--eval-every=") {
-            eval_every = v.parse()?;
-        } else if a == "--no-save-deform" {
-            save_deform = false;
-        } else if let Some(v) = a.strip_prefix("--eval-split-every=") {
-            eval_split_every = Some(v.parse()?);
-        } else if let Some(v) = a.strip_prefix("--eval-views=") {
-            eval_views_count = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--fixed-grad-thr=") {
-            fixed_grad_thr = Some(v.parse()?);
-        } else if a == "--split" {
-            enable_split = true;
-        } else if let Some(v) = a.strip_prefix("--proj-weight=") {
-            proj_weight = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--proj-ssim-weight=") {
-            proj_ssim_weight = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--loss=") {
-            loss_type = match v {
-                "l1" => brush_loss::gray::GrayLossType::L1,
-                "charbonnier" => brush_loss::gray::GrayLossType::Charbonnier,
-                "huber" => brush_loss::gray::GrayLossType::Huber,
-                "l2" => brush_loss::gray::GrayLossType::L2,
-                _ => anyhow::bail!("invalid --loss '{v}' (l1|charbonnier|huber|l2)"),
-            };
-        } else if let Some(v) = a.strip_prefix("--loss-eps=") {
-            loss_eps = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--loss-delta=") {
-            loss_delta = v.parse()?;
-        } else if a == "--cosine-lr" {
-            cosine_lr = true;
-        } else if let Some(v) = a.strip_prefix("--percent-dense=") {
-            percent_dense = Some(v.parse()?);
-        } else if let Some(v) = a.strip_prefix("--split-scale=") {
-            split_scale = Some(v.parse()?);
-        } else if let Some(v) = a.strip_prefix("--bound-factor=") {
-            bound_factor = Some(v.parse()?);
-        } else if let Some(v) = a.strip_prefix("--cull-density=") {
-            cull_density = Some(v.parse()?);
-        } else if let Some(v) = a.strip_prefix("--fdk-volume=") {
-            fdk_volume = Some(PathBuf::from(v));
-        } else if let Some(v) = a.strip_prefix("--fdk-meta=") {
-            fdk_meta = Some(PathBuf::from(v));
-        } else if let Some(v) = a.strip_prefix("--fdk-calib=") {
-            fdk_calib = Some(PathBuf::from(v));
-        } else if let Some(v) = a.strip_prefix("--fdk-steps=") {
-            fdk_steps = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--fdk-resid-init-density=") {
-            fdk_residual_init_density = v.parse()?;
-        } else if a == "--fdk-transpose" {
-            fdk_transpose = true;
-        } else if a == "--signed" {
-            signed_only = true;
-        } else if let Some(v) = a.strip_prefix("--resid-sparse-weight=") {
-            resid_sparse_weight = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--max-screen-size=") {
-            max_screen_size = Some(v.parse()?);
-        } else if a == "--cull-contribution" {
-            cull_contribution = true;
-        } else if a == "--no-cull-contribution" {
-            cull_contribution = false;
-        } else if let Some(v) = a.strip_prefix("--cull-percentile=") {
-            cull_percentile = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--cull-floor=") {
-            cull_floor = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--min-splats=") {
-            min_splats = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--multiscale-weight=") {
-            multiscale_weight = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--window-weight=") {
-            window_weight = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--grad-weight=") {
-            grad_weight = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--grad-ramp-from=") {
-            grad_ramp_from = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--grad-ramp-to=") {
-            grad_ramp_to = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--grad-edge-scale=") {
-            grad_edge_scale = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--respi-after=") {
-            respi_after = v.parse()?;
-        } else if a == "--no-respi-freeze" {
-            respi_freeze = false;
-        } else if let Some(v) = a.strip_prefix("--density-reset=") {
-            density_reset_interval = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--log-csv=") {
-            log_csv = Some(PathBuf::from(v));
-        } else if let Some(v) = a.strip_prefix("--out=") {
-            out = PathBuf::from(v);
-        } else if let Some(v) = a.strip_prefix("--roi=") {
-            // --roi=no | N | x0,y0,w,h (像素): 截取图像 ROI 并同步调整相机内参
-            // (fov/主点), 用于去除 FOV 暗边或局部区域重建。默认四边各裁 20。
-            roi = brush_dataset::config::parse_roi(v).map_err(anyhow::Error::msg)?;
-        } else if dcm.is_none() {
-            dcm = Some(PathBuf::from(a));
-        }
-        i += 1;
-    }
-    let dcm = dcm.expect(
-        "usage: fit_deform <dcm> [--iters=N] [--points=N] [--scene-extent=MM] \
-         [--gamma-target=G] [--init-density=MU] [--lr-mean=LR] \
-         [--lr-mean-end=LR] [--lr-scale=LR] [--lr-opac=LR] \
-         [--lr-deform=LR] [--lr-deform-end=LR] [--no-ast] [--warm-up=N] \
-         [--deform-backend=hexplane|hashgrid] [--hex-res=N] \
-         [--hex-time-res=N] [--hex-features=N] [--hex-mlp-width=N] \
-         [--hex-mlp-layers=N] [--plane-tv-weight=W] [--rigid-anchor-weight=W] \
-         [--predict-scaling|--no-predict-scaling] [--growth-frac=F] [--refine-every=N] [--max-splats=N] \
-         [--eval-split-every=N] \
-         [--eval-views=M] [--fixed-grad-thr=F] [--split] [--proj-weight=W] \
-         [--proj-ssim-weight=S] [--cosine-lr] [--percent-dense=F] \
-         [--split-scale=F] [--bound-factor=F] [--cull-density=MU] \
-         [--max-screen-size=PX] [--multiscale-weight=W] [--window-weight=W] \
-         [--grad-weight=W] [--grad-ramp-from=N] [--grad-ramp-to=N] \
-         [--grad-edge-scale=S] [--respi-after=N] [--no-respi-freeze] \
-         [--time-jitter=S] [--time-tv-weight=W] [--time-tv-dp=S] \
-         [--time-tv-dt=S] [--time-tv-sample=N] [--density-reset=N] [--eval-every=N] \
-         [--export-npy] [--no-save-deform] [--roi=no|N|x0,y0,w,h] [--log-csv=FILE] [--out=DIR]",
-    );
+    // 5e-6 ~40k splats, LPIPS 0.192 vs 1e-5 的 0.222, 性价比甜点)。
+    let fixed_grad_thr = args.fixed_grad_thr;
+    // 动态 densify 梯度阈值: 用最近梯度的分位点做阈值 (0~1, 如 0.98);
+    // 设置后覆盖 fixed_grad_thr (None = 保持固定阈值, 默认行为)。
+    let dyn_grad_percentile = args.dyn_grad_percentile;
+    let enable_split = args.split;
+    let percent_dense = args.percent_dense;
+    let split_scale = args.split_scale;
+    let bound_factor = args.bound_factor;
+    let cull_density = args.cull_density;
+    let max_screen_size = args.max_screen_size;
+    let cull_contribution = args.cull_contribution && !args.no_cull_contribution;
+    let cull_percentile = args.cull_percentile;
+    let cull_floor = args.cull_floor;
+    let min_splats = args.min_splats;
+    let density_reset_interval = args.density_reset;
+    // ---- 损失 -------------------------------------------------------------
+    let loss_type = args.loss;
+    let loss_eps = args.loss_eps;
+    let loss_delta = args.loss_delta;
+    let proj_weight = args.proj_weight;
+    let proj_ssim_weight = args.proj_ssim_weight;
+    let multiscale_weight = args.multiscale_weight;
+    let window_weight = args.window_weight;
+    let grad_weight = args.grad_weight;
+    let grad_ramp_from = args.grad_ramp_from;
+    let grad_ramp_to = args.grad_ramp_to;
+    let grad_edge_scale = args.grad_edge_scale;
+    let resid_sparse_weight = args.resid_sparse_weight;
+    // ---- FDK 先验 / 有符号渲染 --------------------------------------------
+    let fdk_volume = args.fdk_volume.clone();
+    let fdk_meta = args.fdk_meta.clone();
+    let fdk_calib = args.fdk_calib.clone();
+    let fdk_steps = args.fdk_steps;
+    let fdk_residual_init_density = args.fdk_resid_init_density;
+    let fdk_transpose = args.fdk_transpose;
+    let signed_only = args.signed;
+    // ---- 分阶段呼吸场 (respi) ----------------------------------------------
+    let respi_after = args.respi_after;
+    // 默认冻结心电场 (--no-respi-freeze 改为联合训练)。
+    let respi_freeze = !args.no_respi_freeze;
+    // ---- 评估与输出 --------------------------------------------------------
+    let eval_every = args.eval_every;
+    let eval_split_every = args.eval_split_every;
+    let eval_views_count = args.eval_views;
+    // 保存形变场: deform 网络 ckpt + 4D NIfTI (默认开; --no-save-deform 关闭)。
+    let save_deform = !args.no_save_deform;
+    let out = args.out.clone();
+    let log_csv = args.log_csv.clone();
 
     // ---- 后端 + 数据集 ---------------------------------------------------
     let wgpu = brush_process::burn_init_setup().await;
@@ -722,11 +792,21 @@ async fn main() -> anyhow::Result<()> {
     cfg.time_tv_dp = time_tv_dp;
     cfg.time_tv_dt = time_tv_dt;
     cfg.time_tv_sample = time_tv_sample;
+    // 梯度阈值: --dyn-grad-percentile 动态分位 (0~1) 或 --fixed-grad-thr 固定阈值 (默认)。
+    let grad_threshold = match dyn_grad_percentile {
+        Some(pct) => {
+            if pct <= 0.0 || pct >= 1.0 {
+                panic!("--dyn-grad-percentile must be in (0,1)");
+            }
+            XRayRefineGradThreshold::Dynamic(pct)
+        }
+        None => XRayRefineGradThreshold::Fixed(fixed_grad_thr.unwrap_or(5e-6)),
+    };
     cfg.refine = XRayRefineConfig {
         refine_every,
         scene_extent,
         growth_select_fraction: growth_frac,
-        fixed_grad_threshold: fixed_grad_thr,
+        grad_threshold,
         enable_split,
         density_reset_interval,
         percent_dense: percent_dense.unwrap_or(0.0003),
@@ -805,8 +885,8 @@ async fn main() -> anyhow::Result<()> {
         let vol_z = meta["vol_z"].as_u64().unwrap_or(_vz as u64) as usize;
         assert_eq!(vol_vec.len(), vol_x * vol_y * vol_z, "FDK volume size mismatch");
         // 布局已由 read_nifti_volume 转成 x-major (自动, 无 flag)。
-        // --fdk-transpose 现在只做纯世界系镜像: FDK 重建世界系与训练/GT
-        // 差了跨 y=x 的反射 → x<->y 交换 (方网格无插值)。
+        // --fdk-transpose 只做纯世界系镜像: FDK 重建世界系与训练/GT 差了
+        // 跨 y=x 的反射 → x<->y 交换 (方网格无插值)。
         if fdk_transpose {
             let xm = |x: usize, y: usize, z: usize| x * (vol_y * vol_z) + y * vol_z + z;
             let mut out = vec![0.0f32; vol_vec.len()];

@@ -38,8 +38,15 @@ pub fn drr_backward_kernel<A: AtomicAddF32>(
     let dir = Vec3A::new((x as f32 - u.cx) / u.fx, (y as f32 - u.cy) / u.fy, 1.0);
     let dir_len = f32::sqrt(dir.x() * dir.x() + dir.y() * dir.y() + 1.0f32);
 
-    let t_near = u.sod - u.rx;
-    let t_far = u.sod + u.rx;
+    // Marching range must cover the volume for ANY camera rotation: the
+    // volume spans [-rx,rx]x[-ry,ry]x[-rz,rz] centered at the origin, so
+    // |p| <= D = sqrt(rx²+ry²+rz²) (circumradius) and its projection onto
+    // the (rotated) camera z-axis lies within [sod-D, sod+D]. The old
+    // [sod±rx] range silently truncated the volume for rotated cameras or
+    // anisotropic grids.
+    let ray_half = f32::sqrt(u.rx * u.rx + u.ry * u.ry + u.rz * u.rz);
+    let t_near = u.sod - ray_half;
+    let t_far = u.sod + ray_half;
     let dt = (t_far - t_near) / u.steps as f32;
 
     // x-major: flat(x,y,z) = x·(vy·vz) + y·vz + z.

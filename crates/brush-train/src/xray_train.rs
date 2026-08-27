@@ -662,7 +662,7 @@ impl XRayTrainer {
                 use rand::seq::IteratorRandom;
                 let sample = self.config.time_tv_sample.min(n);
                 let idx: Vec<u32> = (0..n as u32)
-                    .choose_multiple(&mut rand::rng(), sample);
+                    .sample(&mut rand::rng(), sample);
                 let idx_t = Tensor::<1, Int>::from_data(TensorData::new(idx, [sample]), &device_ad);
                 let xyz_sub = xyz.select(0, idx_t).detach();
                 let phase_next = (phase + self.config.time_tv_dp).clamp(0.0, 1.0);

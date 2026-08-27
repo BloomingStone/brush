@@ -51,10 +51,14 @@ pub fn preprocess_voxel_kernel(
     let visible = valid && in_x && in_y && in_z && count > 0u32;
 
     if visible {
-        // Presort gid == original idx (no depth sort for voxelization).
-        global_from_presort_gid[idx as usize] = idx;
+        // Compact write via the atomic counter (NOT the original index):
+        // invisible splats leave holes in [0, n) otherwise, and the
+        // [0..num_visible) slice would pick up zeros that map every hole to
+        // splat 0 in `project_visible` (replaying splat 0's lanes N times).
+        // Mirrors brush-xray's `project_forward`.
+        let write_id = Atomic::fetch_add(&num_visible_buf[0], 1u32);
+        global_from_presort_gid[write_id as usize] = idx;
         intersect_counts[idx as usize] = count;
-        Atomic::fetch_add(&num_visible_buf[0], 1u32);
         Atomic::fetch_add(&num_intersections_buf[0], count);
     } else {
         intersect_counts[idx as usize] = 0u32;
