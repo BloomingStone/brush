@@ -162,6 +162,11 @@ pub struct XRayTrainConfig {
     /// Small signed density magnitude the residual splats are initialized at
     /// (`|density| ≈ 1e-5` by default) in FDK-residual mode.
     pub fdk_residual_init_density: f32,
+    /// L1 residual-sparsity prior (FDK-residual mode): `λ · mean(|density|)`
+    /// over all splats, where density = `MU_WATER·raw` (signed). Promotes a
+    /// sparse residual — splats only grow where they are needed to correct
+    /// the static FDK prior. 0 disables.
+    pub resid_sparse_weight: f32,
     /// L1 / SSIM weights for the gray loss.
     pub l1_weight: f32,
     pub ssim_weight: f32,
@@ -234,6 +239,7 @@ impl Default for XRayTrainConfig {
             init_density: brush_cube::MU_WATER,
             fdk_residual: false,
             fdk_residual_init_density: 1e-5,
+            resid_sparse_weight: 0.0,
             l1_weight: 1.0,
             ssim_weight: 1.0,
             loss_type: GrayLossType::L1,

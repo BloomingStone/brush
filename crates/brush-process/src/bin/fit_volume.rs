@@ -254,6 +254,9 @@ async fn main() -> anyhow::Result<()> {
     let mut motion_mask = false;
     let mut mask_sigma = 0.25f32; // 残差掩膜尺度 (proj 单位)
     let mut mask_warmup = 150usize;
+    // 训练中周期保存验证 NRRD 序列 (pred+gt 拼接, 目视验证方向/质量)。
+    let mut save_val_nrrd: Option<PathBuf> = None;
+    let mut save_val_every = 500usize;
     let mut i = 1;
     while i < args.len() {
         let a = &args[i];
@@ -299,6 +302,10 @@ async fn main() -> anyhow::Result<()> {
             volume_transpose = true;
         } else if let Some(v) = a.strip_prefix("--save-volume=") {
             save_volume = Some(PathBuf::from(v));
+        } else if let Some(v) = a.strip_prefix("--save-val-nrrd=") {
+            save_val_nrrd = Some(PathBuf::from(v));
+        } else if let Some(v) = a.strip_prefix("--save-val-every=") {
+            save_val_every = v.parse()?;
         } else if dcm.is_none() {
             dcm = Some(PathBuf::from(a));
         }
@@ -606,6 +613,34 @@ async fn main() -> anyhow::Result<()> {
                 loss_acc / batch as f32,
                 t0.elapsed().as_secs_f32()
             );
+            // 周期保存验证 NRRD 序列 (8 视角, pred|gt 拼接)。
+            if let Some(dir) = &save_val_nrrd
+                && (it % save_val_every == 0 || it == iters - 1)
+            {
+                use brush_train::xray_eval::save_gray_nrrd_f32_stack;
+                std::fs::create_dir_all(dir)?;
+                let (w, h) = (img_w as usize, img_h as usize);
+                let mut merged: Vec<f32> = Vec::with_capacity(8 * h * w * 2);
+                for k in 0..8 {
+                    let vi = (k * views.len() / 8) % views.len();
+                    let proj = drr_forward_t(&settings[vi], volume.clone()).await;
+                    let pred: Vec<f32> = proj.into_data().into_vec::<f32>().unwrap();
+                    // 水平拼接 [GT row | pred row] (非逐像素交错, 避免竖条纹)。
+                    for y in 0..h {
+                        let row_g = y * w;
+                        for x in 0..w {
+                            let g = gts[vi][row_g + x];
+                            merged.push((-(g as f64)).exp().clamp(0.0, 1.0) as f32);
+                        }
+                        for x in 0..w {
+                            let p = pred[row_g + x];
+                            merged.push((-(p as f64)).exp().clamp(0.0, 1.0) as f32);
+                        }
+                    }
+                }
+                let td = TensorData::new::<f32, _>(merged, [8, h, w * 2]);
+                save_gray_nrrd_f32_stack(&dir.join(format!("val_{it:05}.nrrd")), &td)?;
+            }
         }
     }
     println!("done in {:.1}s", t0.elapsed().as_secs_f32());
