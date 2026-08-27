@@ -2,7 +2,6 @@
 //! volume geometry. Carried (as a plain struct) across the backend
 //! boundary.
 
-use brush_cube::MainBackend;
 use brush_render::camera::Camera;
 
 use burn_cubecl::cubecl::wgpu::WgpuRuntime;

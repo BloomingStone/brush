@@ -206,7 +206,6 @@ async fn main() -> anyhow::Result<()> {
     // ---- 后端 + 设备 ----
     let wgpu = brush_process::burn_init_setup().await;
     let device: Device = wgpu.into();
-    let device_ad = device.clone().autodiff();
 
     // ---- 加载 GS ply ----
     let file = tokio::fs::File::open(&ply).await?;
@@ -331,7 +330,7 @@ async fn main() -> anyhow::Result<()> {
         let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
         rx0 = meta["rx"].as_f64().unwrap_or(118.6) as f32;
         rz0 = meta["rz"].as_f64().unwrap_or(84.7) as f32;
-        let (mut fdk_vec0, _hx, _hy, _hz) = read_nifti_volume(&fdk_vol)?;
+        let (fdk_vec0, _hx, _hy, _hz) = read_nifti_volume(&fdk_vol)?;
         fdk_x = meta["vol_x"].as_u64().unwrap_or(_hx as u64) as usize;
         fdk_y = meta["vol_y"].as_u64().unwrap_or(_hy as u64) as usize;
         fdk_z = meta["vol_z"].as_u64().unwrap_or(_hz as u64) as usize;

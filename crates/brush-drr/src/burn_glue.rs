@@ -3,7 +3,7 @@
 //! into the fusion stream. Mirrors `brush-voxel`'s `burn_glue.rs` — keeps
 //! the volume + gradients on GPU (no CPU round-trips).
 
-use brush_cube::{MainBackendBase, MainBackend as FusionBackend};
+use brush_cube::MainBackendBase;
 use burn::backend::TensorMetadata;
 use burn::backend::tensor::FloatTensor;
 use burn::tensor::DType;

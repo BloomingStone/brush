@@ -623,7 +623,7 @@ mod tests {
             y0: 0.0,
         };
         let roi = [20u32, 30, 300, 200];
-        let cam = build_camera(0.0, 0.0, 760.0, XRayOrientation::Ap, &geom);
+        // let cam = build_camera(0.0, 0.0, 760.0, XRayOrientation::Ap, &geom);
         let cam_c = build_camera_roi(0.0, 0.0, 760.0, XRayOrientation::Ap, &geom, Some(roi));
         let [x0, y0, w, h] = roi;
 

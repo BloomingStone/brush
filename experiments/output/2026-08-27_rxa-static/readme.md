@@ -25,3 +25,22 @@
 - 之前的"杂乱点云"问题与动态 (形变) 相关 — 静态数据验证通过,
   说明体素化/导出链路本身正确; 动态情况需用 deform_final.bin 网络权重
   (--ckpt) 且注意相位匹配。
+
+## density_reset
+```bash
+cargo run -p brush-process --bin fit_static images/RXA_chest.dcm \
+    --points=50000 \
+    --refine-every=400 \
+    --eval-split-every=5 \
+    --eval-views=8 \
+    --eval-every=1000 \
+    --cull-density=0.001 \
+    --density-reset=3000 \
+    --out=experiments/output/2026-08-27_rxa-static/density_reset/ \
+    | tee experiments/output/2026-08-27_rxa-static/density_reset.log 2>&1
+```
+
+结果较好， 
+[03:35:55] iter 10000 loss=  0.1399 psnr= 34.83 ssim=0.967 lpips=0.3906 visible=23779 splats=23779 (eval 8 views) | grads mean=1.0e-5 rot=1.1e-4 scale=1.0e-4 density=3.4e-5 | pos step≈2.01e-11mm
+但不如不进行reset:
+[02:59:53] iter 10000 loss=  0.1444 psnr= 34.67 ssim=0.968 lpips=0.3614 visible=46733 splats=46733 (eval 8 views) | grads mean=5.7e-6 rot=5.7e-5 scale=8.9e-5 density=2.9e-5 | pos step≈1.15e-11mm

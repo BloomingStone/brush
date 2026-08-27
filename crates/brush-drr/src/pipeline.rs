@@ -2,7 +2,6 @@
 //! launch the cube kernels.
 
 use brush_cube::{MainBackendBase, calc_cube_count_1d, create_tensor};
-use burn::backend::TensorMetadata;
 use burn::backend::tensor::FloatTensor;
 use burn::tensor::DType;
 use burn_cubecl::cubecl::CubeDim;

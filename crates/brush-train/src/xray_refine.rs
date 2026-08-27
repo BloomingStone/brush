@@ -30,9 +30,15 @@ use rand::SeedableRng;
 
 use crate::quat_vec::quaternion_vec_multiply;
 
-/// Floor used when converting raw opacity → density and back.
-/// TODO NOT USED FOR NOW
-pub const MIN_DENSITY: f32 = 1.0 / 255.0;
+
+#[derive(Debug, Clone)]
+pub enum XRayRefineGradThreshold {
+    /// Use a fixed threshold (default 5e-6).
+    Fixed(f32),
+    /// Use a dynamic threshold: the `densify_grad_percentile` of the recent
+    /// 5 refine steps' mean viewspace gradient norms.
+    Dynamic(f32),
+}
 
 /// Hyperparameters for the X-ray density controller (defaults follow the
 /// Python `RotateXrayDensityController`).
@@ -46,11 +52,8 @@ pub struct XRayRefineConfig {
     pub densify_from_iter: u32,
     /// Stop densifying after `densify_until_frac * total_iters`.
     pub densify_until_frac: f32,
-    /// Percentile of the viewspace gradient norm used as the dynamic
-    /// densification threshold (max over the recent 5 refine steps).
-    pub densify_grad_percentile: f32,
-    /// If `Some`, use a fixed threshold instead of the dynamic percentile.
-    pub fixed_grad_threshold: Option<f32>,
+    /// Fixed or dynamic (recent-5 max percentile) grad threshold.
+    pub grad_threshold: XRayRefineGradThreshold,
     /// Prune splats whose density is below this.
     pub cull_density_threshold: f32,
     /// Signed (FDK-residual) opacity mode: density = `MU_WATER · raw` (can be
@@ -117,8 +120,7 @@ impl Default for XRayRefineConfig {
             total_iters: 30_000,
             densify_from_iter: 500,
             densify_until_frac: 0.8,
-            densify_grad_percentile: 0.98,
-            fixed_grad_threshold: None,
+            grad_threshold: XRayRefineGradThreshold::Dynamic(0.98),
             // Activated density = MU_WATER·softplus(raw) ≈ 0.002 mm⁻¹ at
             // water level. 5e-5 ≈ 2.5% of water — prune splats that have
             // essentially decayed to zero (matches the Python project's
@@ -183,9 +185,9 @@ pub struct XRayRefiner {
     denom: Tensor<1>,
     /// Accumulated per-splat max screen radius in pixels (screen-size prune).
     #[allow(non_snake_case)]
-    max_radii2D: Tensor<1>,
+    max_radii_2d: Tensor<1>,
     recent_grad_percentile: VecDeque<f32>,
-    grad_threshold: Option<f32>,
+    /// The current gradient threshold.
     rng: StdRng,
 }
 
@@ -194,9 +196,8 @@ impl XRayRefiner {
         Self {
             xyz_gradient_accum: Tensor::<1>::zeros([num_points as usize], device),
             denom: Tensor::<1>::zeros([num_points as usize], device),
-            max_radii2D: Tensor::<1>::zeros([num_points as usize], device),
+            max_radii_2d: Tensor::<1>::zeros([num_points as usize], device),
             recent_grad_percentile: VecDeque::with_capacity(5),
-            grad_threshold: config.fixed_grad_threshold,
             rng: StdRng::seed_from_u64(config.seed),
             config,
         }
@@ -217,8 +218,8 @@ impl XRayRefiner {
         self.denom = self.denom.clone() + visible;
         if let Some(r) = max_radius_px {
             // 累积每 splat 见过的最大屏幕半径 (px): max_radii2D = max(·, r)。
-            let grow = r.clone().greater(self.max_radii2D.clone());
-            self.max_radii2D = self.max_radii2D.clone().mask_where(grow, r);
+            let grow = r.clone().greater(self.max_radii_2d.clone());
+            self.max_radii_2d = self.max_radii_2d.clone().mask_where(grow, r);
         }
     }
 
@@ -233,35 +234,40 @@ impl XRayRefiner {
     }
 
     /// Fixed or dynamic (recent-5 max percentile) grad threshold.
-    async fn compute_threshold(&mut self, grads: &Tensor<1>) -> Option<f32> {        if let Some(t) = self.config.fixed_grad_threshold {
-            return Some(t);
+    async fn compute_threshold(&mut self, grads: &Tensor<1>) -> f32 {
+        match self.config.grad_threshold {
+            XRayRefineGradThreshold::Fixed(t) => t,
+            XRayRefineGradThreshold::Dynamic(pct) => {
+                if pct <= 0.0 || pct >= 1.0 {
+                    panic!("grad_threshold percentile must be in (0,1)");
+                }
+                let values = grads
+                    .clone()
+                    .into_data_async()
+                    .await
+                    .expect("read grads")
+                    .into_vec::<f32>()
+                    .expect("grads f32");
+                let mut finite: Vec<f32> = values.into_iter().filter(|v| v.is_finite()).collect();
+                if finite.is_empty() {
+                    return f32::NEG_INFINITY;
+                }
+                finite.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let n = finite.len();
+                let idx = ((pct * (n - 1) as f32) as usize).min(n - 1);
+                let pct = finite[idx];
+                self.recent_grad_percentile.push_back(pct);
+                while self.recent_grad_percentile.len() > 5 {
+                    self.recent_grad_percentile.pop_front();
+                }
+                let threshold = self
+                    .recent_grad_percentile
+                    .iter()
+                    .copied()
+                    .fold(f32::NEG_INFINITY, f32::max);
+                threshold
+            }
         }
-        let values = grads
-            .clone()
-            .into_data_async()
-            .await
-            .expect("read grads")
-            .into_vec::<f32>()
-            .expect("grads f32");
-        let mut finite: Vec<f32> = values.into_iter().filter(|v| v.is_finite()).collect();
-        if finite.is_empty() {
-            return self.grad_threshold;
-        }
-        finite.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let n = finite.len();
-        let idx = ((self.config.densify_grad_percentile * (n - 1) as f32) as usize).min(n - 1);
-        let pct = finite[idx];
-        self.recent_grad_percentile.push_back(pct);
-        while self.recent_grad_percentile.len() > 5 {
-            self.recent_grad_percentile.pop_front();
-        }
-        let threshold = self
-            .recent_grad_percentile
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
-        self.grad_threshold = Some(threshold);
-        Some(threshold)
     }
 
     /// Value at `cull_contribution_percentile` of the contribution scores
@@ -304,7 +310,7 @@ impl XRayRefiner {
 
         let grads = self.mean_grads();
         let threshold = if densifying {
-            self.compute_threshold(&grads).await
+            Some(self.compute_threshold(&grads).await)
         } else {
             None
         };
@@ -342,7 +348,7 @@ impl XRayRefiner {
         if self.config.max_screen_size > 0.0 {
             // 屏幕上过大的点 (参考项目 max_radii2D > max_screen_size)。
             let screen_big = self
-                .max_radii2D
+                .max_radii_2d
                 .clone()
                 .greater_elem(self.config.max_screen_size);
             prune_mask = prune_mask.bool_or(screen_big);
@@ -352,7 +358,7 @@ impl XRayRefiner {
         // radius 0 → score 0 → culled). Cull only splats below BOTH the
         // absolute floor AND the bottom percentile (bounds the count).
         if self.config.cull_contribution && !reset_step {
-            let r2 = self.max_radii2D.clone().powi_scalar(2);
+            let r2 = self.max_radii_2d.clone().powi_scalar(2);
             let score = density.clone() * r2;
             let pct = self.contribution_percentile(&score).await;
             let thr = pct.min(self.config.cull_contribution_floor);
@@ -641,7 +647,7 @@ impl XRayRefiner {
         let new_n = splats.num_splats() as usize;
         self.xyz_gradient_accum = Tensor::<1>::zeros([new_n], &device);
         self.denom = Tensor::<1>::zeros([new_n], &device);
-        self.max_radii2D = Tensor::<1>::zeros([new_n], &device);
+        self.max_radii_2d = Tensor::<1>::zeros([new_n], &device);
 
         // Appended index list = clones then splits (each appends exactly one).
         let mut appended = clone_inds.clone();
@@ -715,7 +721,7 @@ mod tests {
             total_iters: 1000,
             densify_from_iter: 0,
             densify_until_frac: 1.0,
-            fixed_grad_threshold: Some(5.0),
+            grad_threshold: XRayRefineGradThreshold::Dynamic(0.5),
             growth_select_fraction: 0.25,
             max_splats: 100_000,
             ..Default::default()

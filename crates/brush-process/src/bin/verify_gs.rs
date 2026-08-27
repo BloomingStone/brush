@@ -9,7 +9,6 @@
 
 use brush_deform::{HexPlaneConfig, HexPlaneDeformConfig, HexPlaneDeformModel, deform_splats};
 use brush_render::camera::Camera;
-use brush_render::kernels::camera_model::CameraModel;
 use brush_serde::import::load_splat_from_ply;
 use brush_train::xray_train::DeformNetwork;
 use brush_xray::XRaySplats;
@@ -87,7 +86,7 @@ fn sample_deform_field(field: &[f32], n: [usize; 3], ext: f32, p: glam::Vec3) ->
 fn psnr(a: &[f32], b: &[f32]) -> f32 {
     let mut se = 0.0f64;
     for (x, y) in a.iter().zip(b.iter()) {
-        let d = (*x as f64 - *y as f64);
+        let d = *x as f64 - *y as f64;
         se += d * d;
     }
     let mse = se / a.len().max(1) as f64;
@@ -261,7 +260,7 @@ async fn main() -> anyhow::Result<()> {
         let time = view.time;
         let mut line = format!("view {vi}: phase={phase:.3} time={time:.4}");
 
-        async fn render(splats: &XRaySplats, cam: &Camera, img_size: glam::UVec2, device_ad: &Device) -> Tensor<2> {
+        async fn render(splats: &XRaySplats, cam: &Camera, img_size: glam::UVec2) -> Tensor<2> {
             // 与训练 eval_view 一致: lift 到 autodiff + render_xray (Backward pass)。
             let ad = brush_xray_bwd::lift_xray_splats_to_autodiff(splats.clone());
             let out = render_xray(ad, cam, img_size, 1.0, false).await;
@@ -269,23 +268,22 @@ async fn main() -> anyhow::Result<()> {
         }
 
         // canonical (未变形)
-        let proj_c = render(&canonical, cam, img_size, &device_ad).await;
+        let proj_c = render(&canonical, cam, img_size).await;
         let int_c: Vec<f32> = proj_c.into_data().to_vec::<f32>()?.iter()
             .map(|&p| (-(p as f64).clamp(1e-3, 14.0)).exp() as f32).collect();
         line.push_str(&format!(" | canonical_psnr={:.2}", psnr(&int_c, &gt)));
 
         // deformed (phase0 形变场网格)
-        let mut int_d: Option<Vec<f32>> = None;
         if let Some(def) = &deformed {
-            let proj_d = render(def, cam, img_size, &device_ad).await;
-            int_d = Some(proj_d.into_data().to_vec::<f32>()?.iter()
+            let proj_d = render(def, cam, img_size).await;
+            let int_d: Option<Vec<f32>> = Some(proj_d.into_data().to_vec::<f32>()?.iter()
                 .map(|&p| (-(p as f64).clamp(1e-3, 14.0)).exp() as f32).collect());
             line.push_str(&format!(" | def_grid_psnr={:.2}", psnr(int_d.as_ref().unwrap(), &gt)));
         }
         // deformed (网络精确)
         let mut int_n: Option<Vec<f32>> = None;
         if let Some(def) = &net_deformed {
-            let proj_d = render(def, cam, img_size, &device_ad).await;
+            let proj_d = render(def, cam, img_size).await;
             int_n = Some(proj_d.into_data().to_vec::<f32>()?.iter()
                 .map(|&p| (-(p as f64).clamp(1e-3, 14.0)).exp() as f32).collect());
             line.push_str(&format!(" | def_net_psnr={:.2}", psnr(int_n.as_ref().unwrap(), &gt)));
@@ -307,7 +305,7 @@ async fn main() -> anyhow::Result<()> {
             let dmeans: Vec<f32> = def_ad.means().into_data_async().await?.to_vec()?;
             let drots: Vec<f32> = def_ad.rotations().into_data_async().await?.to_vec()?;
             let def_sp = XRaySplats::from_raw(dmeans, drots, log_scales.clone(), raw.clone(), &device);
-            let proj_d = render(&def_sp, cam, img_size, &device_ad).await;
+            let proj_d = render(&def_sp, cam, img_size).await;
             let int_p = proj_d.into_data().to_vec::<f32>()?.iter()
                 .map(|&p| (-(p as f64).clamp(1e-3, 14.0)).exp() as f32).collect::<Vec<_>>();
             line.push_str(&format!(" | def_phase_psnr={:.2}", psnr(&int_p, &gt)));
@@ -338,8 +336,8 @@ async fn main() -> anyhow::Result<()> {
             save("verify", &int_n)?;
             // 也存 NRRD (pred vs GT)
             use brush_train::xray_eval::save_gray_nrrd_f32;
-            let mut pred_td = TensorData::new::<f32, _>(int_n.clone(), [h, w]);
-            let mut gt_td = TensorData::new::<f32, _>(gt.clone(), [h, w]);
+            let pred_td = TensorData::new::<f32, _>(int_n.clone(), [h, w]);
+            let gt_td = TensorData::new::<f32, _>(gt.clone(), [h, w]);
             save_gray_nrrd_f32(&out.join(format!("pred_v{vi:02}.nrrd")), &pred_td)?;
             save_gray_nrrd_f32(&out.join(format!("gt_v{vi:02}.nrrd")), &gt_td)?;
         }

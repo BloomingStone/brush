@@ -423,7 +423,7 @@ fn lsq_calibrate(
     let b = (sy - s * sx) / n;
     let mut err = 0.0f64;
     for (&p, &g) in proj_fdk.iter().zip(gts[0].iter()) {
-        let y = s as f64 * p as f64 + b as f64;
+        let y = s * p as f64 + b;
         err += (y - g as f64).abs();
     }
     (s as f32, b as f32, (err / n_pix.max(1) as f64) as f32)
@@ -589,7 +589,7 @@ async fn main() -> anyhow::Result<()> {
     // FDK 先验强度 PSNR。
     let mut se = 0.0f64;
     let mut n = 0u64;
-    for (i, (&p, &g)) in projs[0].iter().zip(gts[0].iter()).enumerate() {
+    for (_i, (&p, &g)) in projs[0].iter().zip(gts[0].iter()).enumerate() {
         let y = s as f64 * p as f64 + b as f64;
         let pred = (-y).exp().clamp(0.0, 1.0);
         let gi = (-(g as f64)).exp().clamp(0.0, 1.0);
