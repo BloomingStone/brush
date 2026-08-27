@@ -1,0 +1,16 @@
+view00_idx000_ang+119°
+view01_idx025_ang+104°
+view02_idx050_ang+89°
+view03_idx075_ang+74°
+view04_idx100_ang+59°
+view05_idx125_ang+44°
+view06_idx150_ang+29°
+view07_idx175_ang+14°
+view08_idx201_ang-1°
+view09_idx226_ang-16°
+view10_idx251_ang-31°
+view11_idx276_ang-46°
+view12_idx301_ang-61°
+view13_idx326_ang-76°
+view14_idx351_ang-91°
+view15_idx376_ang-106°

@@ -34,6 +34,47 @@ fn read_nifti_volume(path: &Path) -> anyhow::Result<(Vec<f32>, usize, usize, usi
     Ok((data, vx, vy, vz))
 }
 
+/// 沿 `y=-x` 反射体积 (诊断 FDK 世界系镜像): `(x,y,z) → (-y,-x,z)`。
+/// 索引: new(ix'=vol_y-1-iy, iz, iy'=vol_x-1-ix) = old(ix, iy, iz) (方网格
+/// vol_x==vol_y 下无插值)。布局 `idx = iy*vol_x*vol_z + iz*vol_x + ix`。
+fn mirror_volume_negxy(vol: &mut Vec<f32>, vol_x: usize, vol_y: usize, vol_z: usize) {
+    assert_eq!(vol_x, vol_y, "y=-x mirror needs square xy grid");
+    let sy = vol_x * vol_z;
+    let sz = vol_x;
+    let mut out = vec![0.0f32; vol.len()];
+    for iy in 0..vol_y {
+        for iz in 0..vol_z {
+            for ix in 0..vol_x {
+                let src = iy * sy + iz * sz + ix;
+                let (ix2, iy2) = (vol_y - 1 - iy, vol_x - 1 - ix);
+                let dst = iy2 * sy + iz * sz + ix2;
+                out[dst] = vol[src];
+            }
+        }
+    }
+    *vol = out;
+}
+
+/// XY 平面转置 (x↔y 交换, 反射跨 y=x): `(x,y,z) → (y,x,z)`。
+/// 索引: new(ix2, iy2, iz) = old(iy2, ix2, iz) — 方网格下无插值。
+/// FDK 重建世界系与训练/GT 差了跨 y=x 的反射 → 转置修正。
+fn transpose_volume_xy(vol: &mut Vec<f32>, vol_x: usize, vol_y: usize, vol_z: usize) {
+    assert_eq!(vol_x, vol_y, "xy transpose needs square xy grid");
+    let sy = vol_x * vol_z;
+    let sz = vol_x;
+    let mut out = vec![0.0f32; vol.len()];
+    for iy in 0..vol_y {
+        for iz in 0..vol_z {
+            for ix in 0..vol_x {
+                let src = iy * sy + iz * sz + ix;
+                let dst = ix * sy + iz * sz + iy;
+                out[dst] = vol[src];
+            }
+        }
+    }
+    *vol = out;
+}
+
 /// 写 3D 体积为 .nii.gz (nifti-rs, sform_code=2)。世界范围 `[-half_r, half_r]^3`。
 fn write_nifti_volume(
     path: &Path,
@@ -202,6 +243,11 @@ async fn main() -> anyhow::Result<()> {
     let mut out = PathBuf::from("experiments/output/fdk-residual/fit_volume");
     let mut selftest = false;
     let mut eval_only = false;
+    let mut dump_drr: Option<PathBuf> = None;
+    let mut dump_views = 8usize;
+    let mut volume_mirror = false;
+    let mut volume_transpose = false;
+    let mut save_volume: Option<PathBuf> = None;
     let mut tv = 0.0f32;
     let mut tv_type = "l1".to_string();
     let mut tv_eps = 0.01f32;
@@ -243,6 +289,16 @@ async fn main() -> anyhow::Result<()> {
             selftest = true;
         } else if a == "--eval-only" {
             eval_only = true;
+        } else if let Some(v) = a.strip_prefix("--dump-drr=") {
+            dump_drr = Some(PathBuf::from(v));
+        } else if let Some(v) = a.strip_prefix("--dump-views=") {
+            dump_views = v.parse()?;
+        } else if a == "--volume-mirror" {
+            volume_mirror = true;
+        } else if a == "--volume-transpose" {
+            volume_transpose = true;
+        } else if let Some(v) = a.strip_prefix("--save-volume=") {
+            save_volume = Some(PathBuf::from(v));
         } else if dcm.is_none() {
             dcm = Some(PathBuf::from(a));
         }
@@ -284,7 +340,7 @@ async fn main() -> anyhow::Result<()> {
     let rx = meta["rx"].as_f64().unwrap_or(118.6) as f32;
     let ry = meta["ry"].as_f64().unwrap_or(rx as f64) as f32;
     let rz = meta["rz"].as_f64().unwrap_or(84.7) as f32;
-    let (vol_vec, _hx, _hy, _hz) = read_nifti_volume(&volume_path)?;
+    let (mut vol_vec, _hx, _hy, _hz) = read_nifti_volume(&volume_path)?;
     // 维度以 meta.json 为准 (nii header dims 是置换后的 [y,z,x])。
     let vol_x = meta["vol_x"].as_u64().unwrap_or(_hx as u64) as usize;
     let vol_y = meta["vol_y"].as_u64().unwrap_or(_hy as u64) as usize;
@@ -385,6 +441,23 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ---- 体积 + Adam 状态 (全程 GPU) ----
+    // 诊断: 沿 y=-x 反射体积 (修正 FDK 世界系镜像)。
+    if volume_mirror {
+        mirror_volume_negxy(&mut vol_vec, vol_x, vol_y, vol_z);
+        println!("volume mirrored across y=-x (FDK world-frame fix)");
+    }
+    if volume_transpose {
+        transpose_volume_xy(&mut vol_vec, vol_x, vol_y, vol_z);
+        println!("volume transposed in xy (x<->y, FDK y=x-reflection fix)");
+    }
+    if let Some(sp) = &save_volume {
+        if let Some(parent) = sp.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        write_nifti_volume(sp, &vol_vec, vol_x, vol_y, vol_z, rx, ry, rz)?;
+        println!("saved volume (after transform) -> {sp:?}");
+        return Ok(());
+    }
     let mut volume = Tensor::<3>::from_data(
         TensorData::new::<f32, _>(vol_vec, [vol_x, vol_y, vol_z]),
         &device,
@@ -395,8 +468,20 @@ async fn main() -> anyhow::Result<()> {
         let mut se = 0.0f64;
         let mut sei = 0.0f64;
         let mut n = 0u64;
-        for k in 0..8 {
-            let vi = (k * views.len() / 8) % views.len();
+        // 跨所有帧均匀采样 (每个旋转角度一段); --dump-views=0 = 全部帧。
+        let n_eval = if dump_views == 0 {
+            views.len()
+        } else {
+            dump_views.max(1)
+        };
+        // 一次性输出多帧序列: 所有采样视角叠成一个 [N,H,W] 3D NRRD。
+        let mut stack_fdk: Vec<f32> = Vec::new();
+        let mut stack_gt: Vec<f32> = Vec::new();
+        let mut stack_info: Vec<String> = Vec::new();
+        for k in 0..n_eval {
+            let vi = (k * views.len() / n_eval) % views.len();
+            let p = views[vi].camera.position;
+            let ang = p.x.atan2(p.y).to_degrees();
             let proj = drr_forward_t(&settings[vi], volume.clone()).await;
             let pred: Vec<f32> = proj.into_data().into_vec::<f32>().unwrap();
             for (p, &g) in pred.iter().zip(gts[vi].iter()) {
@@ -407,6 +492,26 @@ async fn main() -> anyhow::Result<()> {
                 sei += (pi - gi) * (pi - gi);
                 n += 1;
             }
+            if let Some(dir) = &dump_drr {
+                stack_fdk.extend(pred.iter().map(|p| (-(*p as f64)).exp().clamp(0.0, 1.0) as f32));
+                stack_gt.extend(gts[vi].iter().map(|&g| (-(g as f64)).exp().clamp(0.0, 1.0) as f32));
+                stack_info.push(format!("view{k:02}_idx{vi:03}_ang{ang:+.0}°"));
+            }
+        }
+        // 写 3D 多帧 NRRD (一次输出整个序列)。
+        if let Some(dir) = &dump_drr {
+            use brush_train::xray_eval::save_gray_nrrd_f32_stack;
+            std::fs::create_dir_all(dir)?;
+            let (w, h) = (img_w as usize, img_h as usize);
+            let mut info_path = dir.join("stack_views.txt");
+            std::fs::write(&info_path, stack_info.join("\n") + "\n")?;
+            let fm = TensorData::new::<f32, _>(stack_fdk, [n_eval, h, w]);
+            let gm = TensorData::new::<f32, _>(stack_gt, [n_eval, h, w]);
+            save_gray_nrrd_f32_stack(&dir.join("fdk_drr_gpu_stack.nrrd"), &fm)?;
+            save_gray_nrrd_f32_stack(&dir.join("gt_drr_stack.nrrd"), &gm)?;
+            println!(
+                "dumped {n_eval}-frame NRRD stack -> {dir:?} (fdk_drr_gpu_stack.nrrd / gt_drr_stack.nrrd), view list in stack_views.txt"
+            );
         }
         let mse = se / n.max(1) as f64;
         let msei = sei / n.max(1) as f64;
