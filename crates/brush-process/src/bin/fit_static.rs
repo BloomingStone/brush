@@ -1,21 +1,21 @@
-//! 临时验证: 随机点云初始化 + 启用 density control(refine), 拟合
-//! `images/RXA_brain.dcm`(静态旋转扫描)。
+//! 静态 X-ray 重建 (与 `fit_deform` 逻辑一致, 仅删除形变场部分):
+//! 拟合 `images/RXA_chest.dcm` 等纯静态数据。
 //!
-//! 与 fit_centerline 的区别:
-//!   1. 纯随机点云初始化(复用 `create_xray_trainer`: 球内随机点 + KNN scale +
-//!      μ_water 密度), 没有中心线先验。
-//!   2. **启用 refine**(densify/prune, `refine_every` 可配)——验证密度控制
-//!      在静态脑部重建中的效果。
-//! 每 `eval_every` 步对固定视图(frame 0)做一次 eval, 打印 PSNR/SSIM 并保存
-//! GT|pred 拼接图(**float32 NRRD**, 无损, 可在 3D Slicer/ParaView/napari 中
-//! 调窗宽窗位); 训练结束导出最终 canonical splats 的 PLY。
+//! 与 `fit_deform` 的差异: 只有形变相关部分被删除 —
+//!   - 无 deform 网络 (`enable_deform=false`): canonical splats 直接渲染
+//!   - 无 phase/time 条件化、无 AST/warm-up、无时间编码
+//!   - 无 deform ckpt / deform_field 导出
+//! 其余 (初始化/圆柱、loss、refine、eval、PLY 导出) 与 fit_deform 一致。
 //!
-//! 用法(默认参数对齐之前 rxa8 最好结果: 30000 点 / scene_extent=50mm /
-//! refine_every=400 / 4000 步, PSNR ≈ 20.1dB):
+//! 每 `eval_every` 步对 held-out 视图做 eval, 打印 PSNR/SSIM/LPIPS 并保存
+//! GT|pred 拼接 NRRD stack; 训练结束导出 canonical splats 的 PLY。
+//!
+//! 用法:
 //!   cargo run -p brush-process --bin fit_static -- \
-//!     images/RXA_brain.dcm \
-//!     --iters=4000 --points=30000 --scene-extent=50 \
-//!     --refine-every=400 --eval-every=100 --out=target/fit_static
+//!     images/RXA_chest.dcm \
+//!     --iters=20000 --points=5000 --refine-every=400 \
+//!     --eval-split-every=5 --eval-views=8 --eval-every=1000 \
+//!     --fixed-grad-thr=5e-6 --split --out=target/fit_static
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,6 +24,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use brush_dataset::config::{DicomNormalization, LoadDatasetConfig, XRayOrientation};
 use brush_dataset::scene::SceneView;
 use brush_dataset::scene_loader::SceneLoader;
+
 use brush_render::gaussian_splats::{SplatRenderMode, Splats};
 use brush_train::xray_eval::save_gray_nrrd_f32_stack;
 use brush_train::xray_refine::XRayRefineConfig;
@@ -34,7 +35,6 @@ use burn::tensor::{Device, TensorData};
 
 /// Convert canonical [`brush_xray::XRaySplats`] into a viewer-able
 /// [`Splats`] (SH degree 0 → grayscale; the X-ray renderer is SH-free).
-/// Same helper as `xray_stream::xray_to_splats` (private there).
 fn xray_to_splats(canonical: &XRaySplats, device: &burn::tensor::Device) -> Splats {
     let n = canonical.num_splats() as usize;
     let means = canonical.means();
@@ -46,7 +46,7 @@ fn xray_to_splats(canonical: &XRaySplats, device: &burn::tensor::Device) -> Spla
 }
 
 /// Sample up to `count` views, spread evenly across the sequence (for eval on
-/// held-out sets, covering a range of C-arm angles).
+/// held-out sets, covering a range of C-arm angles + cardiac phases).
 fn sample_eval_views(views: &[SceneView], count: usize) -> Vec<&SceneView> {
     let n = views.len();
     if count >= n {
@@ -88,6 +88,17 @@ fn save_stack(dir: &Path, iter: u32, pairs: &[TensorData]) {
     let p = dir.join(format!("gt_pred_{iter:05}.nrrd"));
     save_gray_nrrd_f32_stack(&p, &td).expect("save GT|pred NRRD stack");
     println!("{} saved {} ({} views stacked)", ts(), p.display(), pairs.len());
+}
+
+/// 读 3D 体积为 .nii.gz → (vol_vec, vx, vy, vz)。与 fit_volume 相同。
+fn read_nifti_volume(path: &Path) -> anyhow::Result<(Vec<f32>, usize, usize, usize)> {
+    use nifti::{NiftiObject, ReaderOptions};
+    let obj = ReaderOptions::new().read_file(path)?;
+    let dims = obj.header().dim;
+    let (vx, vy, vz) = (dims[1] as usize, dims[2] as usize, dims[3] as usize);
+    let volume = obj.into_volume();
+    let data: Vec<f32> = volume.into_nifti_typed_data()?;
+    Ok((data, vx, vy, vz))
 }
 
 /// `[HH:MM:SS]` 北京时间 (UTC+8, 固定偏移; 轻量, 无 chrono 依赖)。
@@ -142,33 +153,58 @@ fn log_metrics_row(
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut dcm: Option<PathBuf> = None;
-    let mut iters = 4_000u32;
-    let mut points = 30_000u32;
+    let mut iters = 10_000u32;
+    // 初始化点数: 5000 (2026-08-21 扫描最优: 比 30000 少, PSNR 反而更高
+    // 41.12 vs 40.63, 且快 ~1.5×)。densify 会按梯度阈值补足, 初始种子少
+    // → 空气区噪声少、放置更高效。
+    let mut points = 5_000u32;
+    // 初始化采样区域: ball (球, 默认) | cylinder (绕 Z 圆柱, 匹配锥束 FOV)。
+    let mut init_shape = "ball".to_string();
+    // 圆柱半径 = R0(=half_w=W/2 世界) × scale; 高度自动 = 2·half_h·(1+R/SOD)。
+    let mut init_radius_scale = 1.0f32;
+    let mut init_density_base = 5_000u32; // R0 时的标准点数 (密度基准)
+    let mut init_height_factor = 0.0f32; // >0 覆盖自动高度 = F × (2·half_h)
+    let mut no_fov_filter = false;
     // None → 从相机几何自动计算(等中心 FOV 半径), 保证点云覆盖整个视野。
     let mut scene_extent: Option<f32> = None;
     // 自动 gamma: 让全局强度中位数映射到该目标灰度(0.5 = 中灰)。
     let mut gamma_target: Option<f32> = Some(0.5);
-    let mut init_density = 0.02f32;
+    // 初始密度 = 0.01 mm⁻¹ (5×水): 2026-08-21 扫描 points=5000 下甜点
+    // (PSNR 41.32)。之前 0.02 (10×水) 让初始球成高密度雾, 空气 splat 密度
+    // 饱和永不衰减 → pruned≈0; 降到 0.01 后空气点可衰减并被密度裁剪。
+    let mut init_density = 0.01f32;
     let mut lr_mean = 2e-5f64;
     // 末期不冻结: 默认 2e-6 (cosine min / 指数末段)。
     let mut lr_mean_end = 2e-6f64;
     let mut lr_scale = 5e-3f64;
     let mut lr_opac = 0.012f64;
+    // Deform 网络 LR (线性衰减到 lr_deform_end)。
     let mut growth_frac = 0.25f32;
     let mut refine_every = 400u32;
+    // 硬性 splat 数上限: 到顶后只 prune 不再增 (原 1M, 10k 步中期就可能顶到)。
+    let mut max_splats = 300_000u32;
     let mut eval_every = 100u32;
+    // 保存形变场: deform 网络 ckpt (.bin) + 4D 形变场 NIfTI (d_xyz over
+    // [x,y,z,phase,3])。0 = 不保存 (诊断用)。
     // 验证集: `--eval-split-every=N` 每 N 帧扣一个 held-out 视图;
     // `--eval-views=M` 每次 eval 采 M 个验证视图(均匀)。
     let mut eval_split_every: Option<usize> = None;
     let mut eval_views_count = 8usize;
-    // 固定 densify 梯度阈值(替代动态百分位); None = 用 densify_grad_percentile。
-    let mut fixed_grad_thr: Option<f32> = None;
+    // 固定 densify 梯度阈值 (默认 5e-6 = 2026-08-24 修正: 1e-5 质量过差,
+    // 5e-6 ~40k splats, LPIPS 0.192 vs 1e-5 的 0.222, 性价比甜点);
+    // None = 动态百分位 (0.98pct 仅 ~16k)。
+    let mut fixed_grad_thr: Option<f32> = Some(5e-6);
     // 启用 oversized 高梯度点拆分(clone-only → clone+split, 参考 RGB refine_splats)。
     let mut enable_split = false;
     // proj 域损失权重 (在 -ln(intensity) 域比较; 默认 1.0 已作为最优默认)。
     let mut proj_weight = 1.0f32;
     // proj 域 SSIM 权重 (0 = 关闭, proj 损失保持纯 L1)。
     let mut proj_ssim_weight = 0.0f32;
+    // 像素级损失类型: l1 | charbonnier | huber | l2。Charbonnier 最优
+    // (2026-08-21: PSNR +0.20dB, LPIPS -0.007 vs L1), X-ray 噪声更稳。
+    let mut loss_type = brush_loss::gray::GrayLossType::Charbonnier;
+    let mut loss_eps = 1e-3f32; // Charbonnier ε
+    let mut loss_delta = 0.1f32; // Huber δ
     // 使用 cosine LR (默认指数衰减)。
     let mut cosine_lr = false;
     // clone/split 分界阈值系数 (默认 0.0005)。
@@ -179,17 +215,48 @@ async fn main() -> anyhow::Result<()> {
     let mut bound_factor: Option<f32> = None;
     // prune 密度阈值 (默认 5e-5)。
     let mut cull_density: Option<f32> = None;
+    // FDK 静态先验 (残差 GS): --fdk-volume=<nii.gz> --fdk-meta=<json> --fdk-calib=<json>。
+    // 开启后有符号渲染 + 残差初始化 + proj = splat + fdk DRR。
+    let mut fdk_volume: Option<PathBuf> = None;
+    let mut fdk_meta: Option<PathBuf> = None;
+    let mut fdk_calib: Option<PathBuf> = None;
+    let mut fdk_steps = 256u32;
+    let mut fdk_residual_init_density = 1e-5f32;
+    // nifti-rs 读写有 data.t() 转置: FDK 体积从 nii.gz 读回后 x<->y 被交换,
+    // DRR 渲染出来是转置的镜像。--fdk-transpose 在加载时转置修正。
+    let mut fdk_transpose = false;
+    // 独立 --signed: 有符号渲染 (opac=MU_WATER·raw, 可负) 但不要求 FDK 体积。
+    // 用于剪影等数据: 前景可建模为负密度高斯 (图像变亮 = 低密度积分)。
+    let mut signed_only = false;
+    let mut resid_sparse_weight = 0.0f32;
     // screen-size prune 阈值 (px, 0 = 关闭)。
     let mut max_screen_size: Option<f32> = None;
+    // 贡献裁剪 (默认关): 剪掉 density×屏幕面积×可见性 都低且处于最低百分位
+    // 的 splat (微小/永不可见废点, 密度裁剪剪不掉)。
+    let mut cull_contribution = false;
+    let mut cull_percentile = 0.05f32;
+    let mut cull_floor = 1e-3f32;
+    let mut min_splats = 0u32;
     // 多尺度(金字塔)损失权重 (默认 0.5, 最强项)。
     let mut multiscale_weight = 0.5f32;
     // 多窗宽窗位损失权重 (默认 0.5, LPIPS 感知增强)。
     let mut window_weight = 0.5f32;
     // 梯度(Sobel 差分)损失权重 (0 = 关闭)。
     let mut grad_weight = 0.0f32;
+    // 边缘加权梯度损失 ramp: [from,to] 内权重 0→grad_weight (smoothstep)。
+    // 默认 3000 起步、到训练末全权 → 前期 L1/SSIM 主导, 后期集中推边缘。
+    let mut grad_ramp_from = 3_000u32;
+    let mut grad_ramp_to = 0u32; // 0 = total_iters
+    // GT 边缘幅度加权: clamp(|∇gt|/scale, 0, 1); 0 = 纯梯度损失。
+    // 默认 0.03: 高于平坦区噪声底(~0.002) ~10x, 强边缘(p99 0.02-0.05)满权。
+    let mut grad_edge_scale = 0.03f32;
+    // 分阶段双场训练: N 步后开训时间条件呼吸场 (学残差运动), 心电场纯相位。
     // 密度软重置间隔 (0 = 关闭; 参考项目用 2000)。
     let mut density_reset_interval = 0u32;
     let mut out = PathBuf::from("target/fit_static");
+    // ROI 截取 (默认四边各裁 20px 去 FOV 暗边; `--roi=no` 关闭, `--roi=N`
+    // 四边各裁 N, `--roi=x0,y0,w,h` 显式矩形)。像素与相机内参同步调整。
+    let mut roi: brush_dataset::config::RoiSpec = brush_dataset::config::RoiSpec::Inset(20);
     // 指标 CSV 记录器: 默认 <out>/metrics.csv, `--log-csv=FILE` 覆盖,
     // `--log-csv=off` 关闭。每次 eval 追加一行(含时间戳 + 各指标)。
     let mut log_csv: Option<PathBuf> = None;
@@ -200,6 +267,16 @@ async fn main() -> anyhow::Result<()> {
             iters = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--points=") {
             points = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--init-shape=") {
+            init_shape = v.to_string();
+        } else if let Some(v) = a.strip_prefix("--init-radius-scale=") {
+            init_radius_scale = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--init-density-base=") {
+            init_density_base = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--init-height-factor=") {
+            init_height_factor = v.parse()?;
+        } else if a == "--no-fov-filter" {
+            no_fov_filter = true;
         } else if let Some(v) = a.strip_prefix("--scene-extent=") {
             scene_extent = Some(v.parse()?);
         } else if let Some(v) = a.strip_prefix("--gamma-target=") {
@@ -216,12 +293,6 @@ async fn main() -> anyhow::Result<()> {
             lr_scale = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--lr-opac=") {
             lr_opac = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--growth-frac=") {
-            growth_frac = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--refine-every=") {
-            refine_every = v.parse()?;
-        } else if let Some(v) = a.strip_prefix("--eval-every=") {
-            eval_every = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--eval-split-every=") {
             eval_split_every = Some(v.parse()?);
         } else if let Some(v) = a.strip_prefix("--eval-views=") {
@@ -234,6 +305,18 @@ async fn main() -> anyhow::Result<()> {
             proj_weight = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--proj-ssim-weight=") {
             proj_ssim_weight = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--loss=") {
+            loss_type = match v {
+                "l1" => brush_loss::gray::GrayLossType::L1,
+                "charbonnier" => brush_loss::gray::GrayLossType::Charbonnier,
+                "huber" => brush_loss::gray::GrayLossType::Huber,
+                "l2" => brush_loss::gray::GrayLossType::L2,
+                _ => anyhow::bail!("invalid --loss '{v}' (l1|charbonnier|huber|l2)"),
+            };
+        } else if let Some(v) = a.strip_prefix("--loss-eps=") {
+            loss_eps = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--loss-delta=") {
+            loss_delta = v.parse()?;
         } else if a == "--cosine-lr" {
             cosine_lr = true;
         } else if let Some(v) = a.strip_prefix("--percent-dense=") {
@@ -244,20 +327,56 @@ async fn main() -> anyhow::Result<()> {
             bound_factor = Some(v.parse()?);
         } else if let Some(v) = a.strip_prefix("--cull-density=") {
             cull_density = Some(v.parse()?);
+        } else if let Some(v) = a.strip_prefix("--fdk-volume=") {
+            fdk_volume = Some(PathBuf::from(v));
+        } else if let Some(v) = a.strip_prefix("--fdk-meta=") {
+            fdk_meta = Some(PathBuf::from(v));
+        } else if let Some(v) = a.strip_prefix("--fdk-calib=") {
+            fdk_calib = Some(PathBuf::from(v));
+        } else if let Some(v) = a.strip_prefix("--fdk-steps=") {
+            fdk_steps = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--fdk-resid-init-density=") {
+            fdk_residual_init_density = v.parse()?;
+        } else if a == "--fdk-transpose" {
+            fdk_transpose = true;
+        } else if a == "--signed" {
+            signed_only = true;
+        } else if let Some(v) = a.strip_prefix("--resid-sparse-weight=") {
+            resid_sparse_weight = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--max-screen-size=") {
             max_screen_size = Some(v.parse()?);
+        } else if a == "--cull-contribution" {
+            cull_contribution = true;
+        } else if a == "--no-cull-contribution" {
+            cull_contribution = false;
+        } else if let Some(v) = a.strip_prefix("--cull-percentile=") {
+            cull_percentile = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--cull-floor=") {
+            cull_floor = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--min-splats=") {
+            min_splats = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--multiscale-weight=") {
             multiscale_weight = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--window-weight=") {
             window_weight = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--grad-weight=") {
             grad_weight = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--grad-ramp-from=") {
+            grad_ramp_from = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--grad-ramp-to=") {
+            grad_ramp_to = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--grad-edge-scale=") {
+            grad_edge_scale = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--density-reset=") {
             density_reset_interval = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--log-csv=") {
             log_csv = Some(PathBuf::from(v));
         } else if let Some(v) = a.strip_prefix("--out=") {
             out = PathBuf::from(v);
+        } else if let Some(v) = a.strip_prefix("--roi=") {
+            // --roi=no | N | x0,y0,w,h (像素): 截取图像 ROI 并同步调整相机内参
+            // (fov/主点), 用于去除 FOV 暗边或局部区域重建。默认四边各裁 20。
+            roi = brush_dataset::config::parse_roi(v).map_err(anyhow::Error::msg)?;
         } else if dcm.is_none() {
             dcm = Some(PathBuf::from(a));
         }
@@ -266,13 +385,16 @@ async fn main() -> anyhow::Result<()> {
     let dcm = dcm.expect(
         "usage: fit_static <dcm> [--iters=N] [--points=N] [--scene-extent=MM] \
          [--gamma-target=G] [--init-density=MU] [--lr-mean=LR] \
-         [--lr-mean-end=LR] [--lr-scale=LR] [--lr-opac=LR] [--growth-frac=F] \
-         [--refine-every=N] [--eval-split-every=N] [--eval-views=M] \
-         [--fixed-grad-thr=F] [--split] [--proj-weight=W] [--proj-ssim-weight=S]
-         [--cosine-lr] [--percent-dense=F] [--split-scale=F] [--bound-factor=F]
-         [--cull-density=MU] [--max-screen-size=PX] [--multiscale-weight=W]
-         [--window-weight=W] [--grad-weight=W]
-         [--density-reset=N] [--eval-every=N] [--log-csv=FILE] [--out=DIR]",
+         [--lr-mean-end=LR] [--lr-scale=LR] [--lr-opac=LR] \
+         [--growth-frac=F] [--refine-every=N] [--max-splats=N] \
+         [--eval-split-every=N] \
+         [--eval-views=M] [--fixed-grad-thr=F] [--split] [--proj-weight=W] \
+         [--proj-ssim-weight=S] [--cosine-lr] [--percent-dense=F] \
+         [--split-scale=F] [--bound-factor=F] [--cull-density=MU] \
+         [--max-screen-size=PX] [--multiscale-weight=W] [--window-weight=W] \
+         [--grad-weight=W] [--grad-ramp-from=N] [--grad-ramp-to=N] \
+         [--grad-edge-scale=S] [--density-reset=N] [--eval-every=N] \
+         [--export-npy] [--roi=no|N|x0,y0,w,h] [--log-csv=FILE] [--out=DIR]",
     );
 
     // ---- 后端 + 数据集 ---------------------------------------------------
@@ -304,11 +426,15 @@ async fn main() -> anyhow::Result<()> {
         dicom_normalization: DicomNormalization::Minmax,
         dicom_gamma: None,
         dicom_gamma_target: gamma_target,
-        roi: brush_dataset::config::RoiSpec::None,
+        roi,
         max_scene_batch_cache_size: 1 << 30,
     };
     let result = brush_dataset::load_dataset(vfs, &load_config).await?;
     let dataset = result.dataset;
+    // 从 DICOM header 取 SDD (源到探测器距离), 用于场景尺度定义。
+    let bytes = std::fs::read(&dcm)?;
+    let dcm_meta = brush_dicom::parse_dicom(&bytes)?;
+    let sdd = dcm_meta.geometry.sdd as f32;
     let g0 = dataset.train.views[0].gray_image.as_ref().expect("gray");
     println!(
         "{} loaded {} views, frame0 {}x{}",
@@ -318,13 +444,69 @@ async fn main() -> anyhow::Result<()> {
         g0.height
     );
 
+    // 心动相位诊断: 打印 train 视图的 phase 范围, 确认 (0071,1010) 数据有效。
+    {
+        let phases: Vec<f32> = dataset.train.views.iter().map(|v| v.phase).collect();
+        let (min_p, max_p) = phases
+            .iter()
+            .copied()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), p| {
+                (lo.min(p), hi.max(p))
+            });
+        let n_uniq = {
+            let mut s: Vec<f32> = phases.clone();
+            s.sort_by(|a, b| a.total_cmp(b));
+            s.dedup();
+            s.len()
+        };
+        println!(
+            "{} cardiac phase: {} views, range [{:.3}, {:.3}], {} unique values",
+            ts(),
+            phases.len(),
+            min_p,
+            max_p,
+            n_uniq
+        );
+        if n_uniq <= 1 {
+            log::warn!(
+                "phase appears constant ({} unique) — check the (0071,1010) private tag",
+                n_uniq
+            );
+        }
+    }
+
+    // 物理时间诊断: 帧时间应随帧号递增 (t = f/fps 或 FrameTimeVector)。
+    {
+        let t0 = dataset.train.views[0].time;
+        let t1 = dataset.train.views.last().map(|v| v.time).unwrap_or(t0);
+        println!(
+            "{} real time: [{:.3}, {:.3}] s ({} frames, {} s total)",
+            ts(),
+            t0,
+            t1,
+            dataset.train.views.len(),
+            t1 - t0
+        );
+        if t1 - t0 <= 1e-6 {
+            log::warn!("time is constant — check FrameTimeVector / fps fallback");
+        }
+    }
+
     // 球半径: 显式 `--scene-extent` 优先, 否则按相机几何自动计算等中心 FOV
     // 半径 (半 FOV = (W/2)·SOD/fx), 乘 1.05 留边距 —— 保证点云覆盖整个视野。
     let scene_extent = match scene_extent {
         Some(r) => r,
         None => {
-            let r = dataset.train.isocenter_fov_radius() * 1.05;
-            println!("{} auto scene_extent = {r:.1} mm (isocenter FOV radius x1.05)", ts());
+            // 物理上界: C-arm 旋转所能容纳的最大长度 = min(SOD, SDD-SOD),
+            // x0.6 安全冗余 + deform 网格分辨率折中 (0.8→11mm/单元过粗,
+            // 0.6→8.3mm/单元)。SOD = 源到等中心, SDD-SOD = 等中心到探测器。
+            let sod = dataset.train.views[0].camera.position.length();
+            let r = sod.min(sdd - sod) * 0.6;
+            println!(
+                "{} auto scene_extent = {r:.1} mm (min(SOD {sod:.0}, SDD-SOD {:.0}) x 0.6)",
+                ts(),
+                sdd - sod
+            );
             r
         }
     };
@@ -335,25 +517,27 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // ---- Trainer: 随机初始化 + 启用 refine -------------------------------
+    // ---- Trainer: 随机初始化 + deform 模式 + 启用 refine -----------------
     // `create_xray_trainer` 做随机球内点云(KNN scale + μ_water 密度初始化),
-    // 并把 config.refine.scene_extent 设为 scene_extent。
+    // 并把 config.refine.scene_extent 设为 scene_extent; `enable_deform=true`
+    // 时按 `deform_backend` 创建 HexPlane (默认) 或 hash-grid 形变网络
+    // (coord_scale = scene_extent)。
     let mut cfg = XRayTrainConfig::default();
     cfg.total_iters = iters;
-    cfg.enable_deform = false; // 静态重建
-    cfg.enable_ast = false;
-    cfg.warm_up = 0;
-    cfg.init_density = init_density;
-    cfg.lr_mean = lr_mean;
-    cfg.lr_mean_end = lr_mean_end;
     cfg.lr_scale = lr_scale;
     cfg.lr_opac = lr_opac;
     cfg.proj_weight = proj_weight;
     cfg.proj_ssim_weight = proj_ssim_weight;
+    cfg.loss_type = loss_type;
+    cfg.loss_eps = loss_eps;
+    cfg.loss_delta = loss_delta;
     cfg.cosine_lr = cosine_lr;
     cfg.multiscale_weight = multiscale_weight;
     cfg.window_weight = window_weight;
     cfg.grad_weight = grad_weight;
+    cfg.grad_ramp_from = grad_ramp_from;
+    cfg.grad_ramp_to = grad_ramp_to;
+    cfg.grad_edge_scale = grad_edge_scale;
     cfg.refine = XRayRefineConfig {
         refine_every,
         scene_extent,
@@ -361,36 +545,125 @@ async fn main() -> anyhow::Result<()> {
         fixed_grad_threshold: fixed_grad_thr,
         enable_split,
         density_reset_interval,
-        percent_dense: percent_dense.unwrap_or(0.0005),
+        percent_dense: percent_dense.unwrap_or(0.0003),
         split_scale_factor: split_scale.unwrap_or(std::f32::consts::FRAC_1_SQRT_2),
-        max_bound_factor: bound_factor.unwrap_or(3.0),
-        cull_density_threshold: cull_density.unwrap_or(5e-5),
+        max_bound_factor: bound_factor.unwrap_or(1.0),
+        // prune 阈值 5e-4 (25% 水密度): 2026-08-21 高阈值扫描 LPIPS 最优
+        // (0.4658 vs 2e-4 的 0.4719), PSNR 持平, 且剪掉更多空气废点。
+        cull_density_threshold: cull_density.unwrap_or(5e-4),
+        max_splats,
         max_screen_size: max_screen_size.unwrap_or(0.0),
+        cull_contribution,
+        cull_contribution_percentile: cull_percentile,
+        cull_contribution_floor: cull_floor,
+        min_splats,
         ..XRayRefineConfig::default()
     };
-    // FOV 过滤初始化: 只保留至少在一个视角内投影的点, 消除 FOV 外的高
-    // opacity 离群点 (无梯度 → 密度永不下降)。
+    // 相机几何: R0 = half_w (W/2 世界), half_h, sod。
+    let img_size = glam::uvec2(g0.width, g0.height);
+    let cam0 = &dataset.train.views[0].camera;
+    let focal = cam0.focal(img_size);
+    let sod = cam0.position.length();
+    let half_w = (g0.width as f32 * 0.5) * sod / focal.x;
+    let half_h = (g0.height as f32 * 0.5) * sod / focal.y;
+    // R0 = W/2 世界 (FOV 圆柱半径): 追踪 >R0 的点 (应是空气, refine 后大量 prune)。
+    let r0 = half_w;
+    // 初始采样区域: ball (球, scene_extent) 或 cylinder (绕 Z, R=half_w×scale,
+    // 高度=可视高度上界 2·half_h·(1+R/SOD), 密度恒定 → 点数按体积比缩放)。
+    let init = if init_shape == "cylinder" {
+        let r0 = half_w;
+        let r = r0 * init_radius_scale;
+        let half_h_cyl = if init_height_factor > 0.0 {
+            half_h * init_height_factor
+        } else {
+            half_h * (1.0 + r / sod)
+        };
+        let h0 = 2.0 * half_h * (1.0 + r0 / sod);
+        let vol_ratio = (r / r0).powi(2) * (2.0 * half_h_cyl) / h0;
+        points = (init_density_base as f32 * vol_ratio).round().max(1.0) as u32;
+        println!(
+            "{} cylinder init: R={r:.1} (R0 {r0:.1} x {init_radius_scale}), half_h={half_h_cyl:.1}, N={points} (density base {init_density_base} @ R0)",
+            ts()
+        );
+        brush_train::xray_train::InitRegion::Cylinder {
+            radius: r,
+            half_height: half_h_cyl,
+        }
+    } else {
+        brush_train::xray_train::InitRegion::Ball { radius: scene_extent }
+    };
+    // FOV 过滤初始化: 默认只保留至少在一个视角内投影的点 (消离群点);
+    // --no-fov-filter 关闭 (圆柱旋转中会重新入视野, 见实验)。
     let train_cams: Vec<_> = dataset.train.views.iter().map(|v| v.camera).collect();
-    let mut trainer = create_xray_trainer(
-        cfg,
-        points,
-        scene_extent,
-        brush_train::xray_train::InitRegion::Ball { radius: scene_extent },
-        &device,
-        Some((&train_cams, glam::uvec2(g0.width, g0.height))),
-        None,
-    );
+    let fov = if no_fov_filter {
+        None
+    } else {
+        Some((train_cams.as_slice(), glam::uvec2(g0.width, g0.height)))
+    };
+    // FDK 静态先验 (残差 GS): 加载校准体积 + 元数据, 有符号渲染 + 残差初始化。
+    let mut fdk_prior = None;
+    if let Some(vol_path) = fdk_volume {
+        let meta_path = fdk_meta.unwrap_or_else(|| {
+            vol_path.with_file_name("meta.json")
+        });
+        let calib_path = fdk_calib.unwrap_or_else(|| {
+            vol_path.with_file_name("calib.json")
+        });
+        use brush_train::fdk_prior::FdkPrior;
+        let (mut vol_vec, _vx, _vy, _vz) = read_nifti_volume(&vol_path)?;
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
+        let rx = meta["rx"].as_f64().unwrap_or(118.6) as f32;
+        let ry = meta["ry"].as_f64().unwrap_or(rx as f64) as f32;
+        let rz = meta["rz"].as_f64().unwrap_or(84.7) as f32;
+        let vol_x = meta["vol_x"].as_u64().unwrap_or(_vx as u64) as usize;
+        let vol_y = meta["vol_y"].as_u64().unwrap_or(_vy as u64) as usize;
+        let vol_z = meta["vol_z"].as_u64().unwrap_or(_vz as u64) as usize;
+        assert_eq!(vol_vec.len(), vol_x * vol_y * vol_z, "FDK volume size mismatch");
+        // nifti-rs data.t() 转置修正: 读取回的体积 x<->y 交换 (世界系转置)。
+        if fdk_transpose {
+            let sy = vol_x * vol_z;
+            let sz = vol_x;
+            let mut out = vec![0.0f32; vol_vec.len()];
+            for iy in 0..vol_y {
+                for iz in 0..vol_z {
+                    for ix in 0..vol_x {
+                        let src = iy * sy + iz * sz + ix;
+                        let dst = ix * sy + iz * sz + iy;
+                        out[dst] = vol_vec[src];
+                    }
+                }
+            }
+            vol_vec = out;
+            println!("{} FDK volume transposed in xy (nifti data.t() fix)", ts());
+        }
+        let calib: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&calib_path)?)?;
+        let scale = calib["s"].as_f64().unwrap_or(1.0) as f32;
+        let bias = calib["b"].as_f64().unwrap_or(0.0) as f32;
+        println!(
+            "{} FDK prior: {vol_x}x{vol_y}x{vol_z} (rx={rx:.1} ry={ry:.1} rz={rz:.1}mm), calib s={scale:.5} b={bias:.5}, resid-init-density={fdk_residual_init_density:e}, signed render",
+            ts()
+        );
+        cfg.fdk_residual = true;
+        cfg.fdk_residual_init_density = fdk_residual_init_density;
+        cfg.resid_sparse_weight = resid_sparse_weight;
+        fdk_prior = Some(FdkPrior::new(
+            vol_vec, vol_x, vol_y, vol_z, rx, ry, rz, fdk_steps, scale, bias,
+            &device.clone().autodiff(),
+        ));
+    }
+    // 独立 --signed (无 FDK): 有符号渲染 + 有符号 init。
+    if signed_only {
+        if !cfg.fdk_residual {
+            println!("{} signed-only mode (no FDK prior): signed render, raw=±{} init", ts(), fdk_residual_init_density);
+        }
+        cfg.fdk_residual = true;
+        cfg.fdk_residual_init_density = fdk_residual_init_density;
+        cfg.resid_sparse_weight = resid_sparse_weight;
+    }
+    let mut trainer = create_xray_trainer(cfg, points, scene_extent, init, &device, fov, fdk_prior);
     // 梯度诊断只在 eval 步收集(打印 + CSV 用), 见训练循环。
-    println!(
-        "{} init splats: {} (random ball r={}mm, init μ={} mm⁻¹, lr_mean={}->{}), refine every {}",
-        ts(),
-        trainer.num_splats(),
-        scene_extent,
-        init_density,
-        lr_mean,
-        lr_mean_end,
-        refine_every
-    );
 
     let mut dataloader = SceneLoader::new(&dataset.train, 42, &load_config);
 
@@ -479,12 +752,14 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // ---- 训练循环(与标准流程一致, 含 density control) -------------------
+    // ---- 训练循环(与标准流程一致, 含 density control + deform) -----------
     for iter in 0..iters {
         let step = iter + 1;
         // 梯度诊断只在 eval 步需要(打印 + CSV): 其余步关闭, 省掉每步 4 次
         // GPU→CPU readback(原先硬编码开启时的固定开销)。
         trainer.set_collect_grads(step % eval_every == 0 || step == iters);
+        // loss 标量同样只在 eval 步读回: 关闭时 CPU 提交可与 GPU 执行重叠。
+        trainer.set_collect_loss(step % eval_every == 0 || step == iters);
         let batch = dataloader.next_batch().await;
         let stats = trainer.step(&batch).await;
 
@@ -492,8 +767,9 @@ async fn main() -> anyhow::Result<()> {
         if step > 1
             && let Some(refine_stats) = trainer.maybe_refine(step).await
         {
+            let (beyond, total, md) = trainer.splats_beyond_radius(r0).await;
             println!(
-                "{} refine iter {step}: {} splats (added {}, split {}, pruned {}) grad_thr={}",
+                "{} refine iter {step}: {} splats (added {}, split {}, pruned {}) grad_thr={} | >R0={beyond}/{total} ({:.1}%), meanμ={md:.5}",
                 ts(),
                 refine_stats.total_splats,
                 refine_stats.num_added,
@@ -502,6 +778,7 @@ async fn main() -> anyhow::Result<()> {
                 refine_stats
                     .grad_threshold
                     .map_or(-1.0f32, |t| t),
+                beyond as f32 / total.max(1) as f32 * 100.0,
             );
         }
 
