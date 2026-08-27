@@ -44,3 +44,15 @@
   - dsa_cyl15: `dsa_cyl15/phase0_vol/gs_uns.nrrd` (μ[0,0.157], 相关 0.857)
   - dsa_cyl15_gamma: `dsa_cyl15_gamma/phase0_vol/gs_uns.nrrd` (μ[0,0.085])
 - sub 剪影两个实验 (unsigned + signed) 都有建模/优化问题, 暂停, 后续再优化。
+
+## 形变/体素化验证总结 (2026-08-27 晚)
+- **verify_gs**: ply + deform_final.bin (网络权重) 精确复现训练 eval (42.09dB)。
+  每视图用正确 phase/time; Forward/Backward 渲染无差异; raw logit 激活一致。
+- **dump_deform 网格导出有 3 个问题**: ① 轴序 (数据 z-major 但声明
+  [nx,ny,nz,3]) ② 缺 d_rotation (只存 3 分量位移) ③ gs2volume 插值索引 bug
+  (ix-major 用了错误的 at 索引, 已修 → z-major)。
+- **体素化器交叉验证通过**: brush-voxel vs R2Gaussian 单 splat corr=1.0,
+  全量 corr=0.995, 比值中位 1.000。差异全来自 Rust 插值 bug。
+- **正确做法**: 形变用 deform_final.bin (网络权重, --ckpt, 含旋转),
+  不用网格场。phase0 体积: `dsa_cyl15/phase0_vol_net/gs_uns.nrrd`
+  (μ[0,0.251], 非零 ~, 相邻切片相关)。

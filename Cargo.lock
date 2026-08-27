@@ -1134,6 +1134,7 @@ dependencies = [
  "brush-vfs",
  "brush-voxel",
  "brush-xray",
+ "brush-xray-bwd",
  "burn",
  "burn-cubecl",
  "burn-wgpu",

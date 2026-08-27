@@ -7,9 +7,13 @@
 //! (x 最快, 同 DRR 内核 / FDK)。
 
 use brush_cube::{MU_WATER, silu};
+use brush_deform::{HexPlaneConfig, HexPlaneDeformConfig, HexPlaneDeformModel, deform_splats};
+use brush_train::xray_train::DeformNetwork;
 use brush_serde::import::load_splat_from_ply;
 use brush_voxel::{VoxelSettings, voxelize_forward};
 use brush_xray::XRaySplats;
+use burn::module::Module;
+use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 use burn::tensor::{Device, Tensor, TensorData};
 use std::path::{Path, PathBuf};
 
@@ -122,7 +126,9 @@ fn sample_deform_field(field: &[f32], n: [usize; 3], ext: f32, p: glam::Vec3) ->
     let (ty, iy0, iy1) = f(p.y, ny);
     let (tz, iz0, iz1) = f(p.z, nz);
     let at = |ix: usize, iy: usize, iz: usize, a: usize| -> f32 {
-        field[((ix * ny + iy) * nz + iz) * 3 + a]
+        // dump_deform 实际布局: pts 按 z 最慢、x 最快 (for iz { for iy { for ix }}),
+        // flat = (iz*ny + iy)*nx + ix (尽管 npy 声明 [nx,ny,nz,3] 是误导的)。
+        field[((iz * ny + iy) * nx + ix) * 3 + a]
     };
     let mut d = glam::Vec3::ZERO;
     for a in 0..3 {
@@ -157,7 +163,9 @@ async fn main() -> anyhow::Result<()> {
     let mut signed = false;
     let mut deform_field: Option<PathBuf> = None;
     let mut deform_extent = 264.0f32;
+    let mut ckpt: Option<PathBuf> = None; // HexPlane 网络权重 (deform_final.bin)
     let mut no_fdk = false;
+    let mut raw_domain = false; // 跳过 μ 映射, 用 raw 直接 (sigmoid 域, R2Gaussian 对照)
     let mut i = 1;
     while i < args.len() {
         let a = &args[i];
@@ -177,10 +185,14 @@ async fn main() -> anyhow::Result<()> {
             signed = true;
         } else if let Some(v) = a.strip_prefix("--deform-field=") {
             deform_field = Some(PathBuf::from(v));
+        } else if let Some(v) = a.strip_prefix("--ckpt=") {
+            ckpt = Some(PathBuf::from(v));
         } else if let Some(v) = a.strip_prefix("--deform-extent=") {
             deform_extent = v.parse()?;
         } else if a == "--no-fdk" {
             no_fdk = true;
+        } else if a == "--raw-domain" {
+            raw_domain = true;
         }
         i += 1;
     }
@@ -209,12 +221,65 @@ async fn main() -> anyhow::Result<()> {
     println!("loaded {} splats from {ply:?}", n);
     // 形变场 (phase 0, time 0): canonical → deformed (实际渲染位置)。
     let mut means = means;
-    if let Some(df) = &deform_field {
+    let mut rots = rots;
+    // 形变: 优先用网络权重 (--ckpt, 含 d_xyz+d_rotation, 精确); 否则用网格场 (有损)。
+    if let Some(cp) = &ckpt {
+        let device_ad = device.clone().autodiff();
+        let cfg = HexPlaneDeformConfig {
+            hex_plane: HexPlaneConfig {
+                n_feature_dim: 16,
+                spatial_resolution: 64,
+                time_resolution: 32,
+                coord_scale: deform_extent,
+                ..HexPlaneConfig::default()
+            },
+            mlp_hidden: 128,
+            mlp_layers: 2,
+            predict_scaling: false,
+            enable_time: true,
+            time_enc: brush_deform::TimeEncodingConfig {
+                n_freqs: 10,
+                min_freq: 0.2,
+                max_freq: 1.5,
+                ..Default::default()
+            },
+            plane_tv_weight: 0.0,
+            rigid_anchor_weight: 0.0,
+        };
+        let model = HexPlaneDeformModel::new(cfg, &device_ad);
+        type DeformRec = <DeformNetwork as burn::module::Module>::Record;
+        let rec: DeformRec =
+            BinFileRecorder::<FullPrecisionSettings>::new().load(cp.clone(), &device_ad)
+                .map_err(|e| anyhow::anyhow!("load {cp:?}: {e}"))?;
+        let hex_rec = match rec {
+            DeformRec::HexPlane(r) => r,
+            _ => anyhow::bail!("ckpt is not a HexPlane deform (got HashGrid)"),
+        };
+        let model = model.load_record(hex_rec);
+        let n_s = means.len() / 3;
+        let xyz = Tensor::<2>::from_data(TensorData::new::<f32, _>(means.clone(), [n_s, 3]), &device_ad);
+        let phase_t = Tensor::<2>::from_data(TensorData::new::<f32, _>(vec![0.0; n_s], [n_s, 1]), &device_ad);
+        let time_t = Tensor::<2>::from_data(TensorData::new::<f32, _>(vec![0.0; n_s], [n_s, 1]), &device_ad);
+        let deforms = model.forward(xyz.clone(), phase_t, time_t);
+        let canonical_ad = XRaySplats::from_raw(means.clone(), rots.clone(), log_scales.clone(), raw.clone(), &device_ad);
+        let def_ad = deform_splats(&canonical_ad, &deforms);
+        let dmeans: Vec<f32> = def_ad.means().into_data_async().await?.to_vec()?;
+        let drots: Vec<f32> = def_ad.rotations().into_data_async().await?.to_vec()?;
+        let dv: Vec<f32> = deforms.d_xyz.into_data_async().await?.to_vec()?;
+        let mut dmax = 0.0f32;
+        for k in 0..n_s {
+            dmax = dmax.max(glam::Vec3::new(dv[k*3], dv[k*3+1], dv[k*3+2]).length());
+        }
+        println!("deform via network ckpt {cp:?}: max|d|={dmax:.2}mm (含 d_rotation)");
+        means = dmeans;
+        rots = drots;
+    } else if let Some(df) = &deform_field {
         let (field, shape) = read_npy_f32(df)?;
         let n3 = [shape[0], shape[1], shape[2]];
         assert_eq!(shape.len(), 4, "deform field must be [nx,ny,nz,3]");
         assert_eq!(field.len(), n3[0] * n3[1] * n3[2] * 3, "deform field size");
         let mut dmax = 0.0f32;
+        let canon0 = if n > 0 { [means[0], means[1], means[2]] } else { [0.0; 3] };
         for i in 0..n {
             let p = glam::Vec3::new(means[i * 3], means[i * 3 + 1], means[i * 3 + 2]);
             let d = sample_deform_field(&field, n3, deform_extent, p);
@@ -223,21 +288,30 @@ async fn main() -> anyhow::Result<()> {
             means[i * 3 + 2] = p.z + d.z;
             dmax = dmax.max(d.length());
         }
+        if n > 0 {
+            println!("deform sample0: canon=({:.4},{:.4},{:.4}) -> def=({:.4},{:.4},{:.4})",
+                canon0[0], canon0[1], canon0[2], means[0], means[1], means[2]);
+        }
         println!("applied deform field {df:?} (extent {deform_extent}mm), max |d|={dmax:.2}mm");
     }
 
-    // ---- raw → sigmoid 域 (让 voxelizer 输出 = μ 场) ----
+    // ---- raw → sigmoid 域 (让 voxelizer 输出 = μ 场); --raw-domain 跳过 ----
     // voxelizer opac = sigmoid(raw2); 我们想要 opac = μ = MU_WATER·(silu(raw) 或 raw)。
     let mut raw2 = Vec::with_capacity(n);
-    for &r in &raw {
-        let mu = if signed {
-            MU_WATER * r
-        } else {
-            MU_WATER * silu(r)
-        };
-        // sigmoid(raw2) = mu → raw2 = ln(mu/(1-mu)); 负值 (signed) 无法表示 → clamp。
-        let mu = mu.max(1e-7).min(1.0 - 1e-7);
-        raw2.push((mu / (1.0 - mu)).ln());
+    if raw_domain {
+        raw2 = raw.clone();
+        println!("raw-domain mode: 直接用 raw (sigmoid 域, R2Gaussian 对照)");
+    } else {
+        for &r in &raw {
+            let mu = if signed {
+                MU_WATER * r
+            } else {
+                MU_WATER * silu(r)
+            };
+            // sigmoid(raw2) = mu → raw2 = ln(mu/(1-mu)); 负值 (signed) 无法表示 → clamp。
+            let mu = mu.max(1e-7).min(1.0 - 1e-7);
+            raw2.push((mu / (1.0 - mu)).ln());
+        }
     }
 
     // ---- FDK 体积 + meta + 转置修正 ----
@@ -292,6 +366,15 @@ async fn main() -> anyhow::Result<()> {
     let v_vol = voxelize_forward(&splats, &settings).await; // [n_x, n_y, n_z], z 最快
     let gs_vol: Vec<f32> = v_vol.into_data().to_vec()?;
 
+    // dump 原生布局 (x,y,z, z 最快) 供对照
+    {
+        let mut payload = Vec::with_capacity(gs_vol.len() * 4);
+        for v in &gs_vol { payload.extend_from_slice(&v.to_le_bytes()); }
+        let hdr = "NRRD0004\ntype: float\ndimension: 3\nsizes: 326 326 183\nencoding: raw\nendian: little\n\n";
+        let mut f = Vec::with_capacity(hdr.len() + payload.len());
+        f.extend_from_slice(hdr.as_bytes()); f.append(&mut payload);
+        std::fs::write(out.join("gs_native_raw.nrrd"), f)?;
+    }
     // 公共布局 [y][z][x] (x 最快): gs_common[y][z][x] = gs[x][y][z]
     let mut gs_common = vec![0.0f32; n_xy * n_xy * n_z];
     for ix in 0..n_xy {
