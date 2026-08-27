@@ -160,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
     let mut fdk_calib: Option<PathBuf> = None;
     let mut out = PathBuf::from("target/gs2volume");
     let mut n_xy = 326usize;
+    let mut n_z = 0usize; // 0 = 用 FDK z (183); >0 覆盖
     let mut signed = false;
     let mut deform_field: Option<PathBuf> = None;
     let mut deform_extent = 264.0f32;
@@ -181,6 +182,8 @@ async fn main() -> anyhow::Result<()> {
             out = PathBuf::from(v);
         } else if let Some(v) = a.strip_prefix("--n-xy=") {
             n_xy = v.parse()?;
+        } else if let Some(v) = a.strip_prefix("--n-z=") {
+            n_z = v.parse()?;
         } else if a == "--signed" {
             signed = true;
         } else if let Some(v) = a.strip_prefix("--deform-field=") {
@@ -352,8 +355,8 @@ async fn main() -> anyhow::Result<()> {
     // ---- GS 体素化 (网格 = FDK XY padding 到 n_xy, spacing 保持) ----
     let vox_mm = 2.0 * rx0 / fdk_x as f32; // 0.927mm
     let rx = vox_mm * n_xy as f32 / 2.0;   // n_xy 世界半宽
-    let rz = rz0;                          // z 不变 (FDK 183)
-    let n_z = fdk_z;
+    let n_z = if n_z > 0 { n_z } else { fdk_z };
+    let rz = if n_z > 0 { rz0 * n_z as f32 / fdk_z as f32 } else { rz0 };
     let settings = VoxelSettings::new(
         glam::uvec3(n_xy as u32, n_xy as u32, n_z as u32),
         glam::vec3(2.0 * rx, 2.0 * rx, 2.0 * rz),
