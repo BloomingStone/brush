@@ -716,6 +716,17 @@ impl XRayTrainer {
             huber_delta: self.config.loss_delta,
         };
         let mut loss = gray_loss(intensity.clone(), gt.clone(), &loss_cfg);
+        // L1 残差稀疏先验 (FDK-residual): λ·mean(|density|), density=MU_WATER·raw
+        // (signed)。只对残差 splat 生效 (fdk_residual 模式) — 促进残差稀疏。
+        if self.config.resid_sparse_weight > 0.0 {
+            let raw = canonical_ad
+                .raw_opacities
+                .val()
+                .clamp(-20.0, 20.0)
+                .abs()
+                .mul_scalar(brush_cube::MU_WATER);
+            loss = loss.add(raw.mean().mul_scalar(self.config.resid_sparse_weight));
+        }
         // 时间 TV 正则项 (deform 块算好, 这里加入总损失)。
         if let Some(tv) = tv_term {
             loss = loss.add(tv.mul_scalar(self.config.time_tv_weight));

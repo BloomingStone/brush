@@ -284,6 +284,7 @@ async fn main() -> anyhow::Result<()> {
     // nifti-rs 读写有 data.t() 转置: FDK 体积从 nii.gz 读回后 x<->y 被交换,
     // DRR 渲染出来是转置的镜像。--fdk-transpose 在加载时转置修正。
     let mut fdk_transpose = false;
+    let mut resid_sparse_weight = 0.0f32;
     // screen-size prune 阈值 (px, 0 = 关闭)。
     let mut max_screen_size: Option<f32> = None;
     // 贡献裁剪 (默认关): 剪掉 density×屏幕面积×可见性 都低且处于最低百分位
@@ -459,6 +460,8 @@ async fn main() -> anyhow::Result<()> {
             fdk_residual_init_density = v.parse()?;
         } else if a == "--fdk-transpose" {
             fdk_transpose = true;
+        } else if let Some(v) = a.strip_prefix("--resid-sparse-weight=") {
+            resid_sparse_weight = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--max-screen-size=") {
             max_screen_size = Some(v.parse()?);
         } else if a == "--cull-contribution" {
@@ -822,6 +825,7 @@ async fn main() -> anyhow::Result<()> {
         );
         cfg.fdk_residual = true;
         cfg.fdk_residual_init_density = fdk_residual_init_density;
+        cfg.resid_sparse_weight = resid_sparse_weight;
         fdk_prior = Some(FdkPrior::new(
             vol_vec, vol_x, vol_y, vol_z, rx, ry, rz, fdk_steps, scale, bias,
             &device.clone().autodiff(),

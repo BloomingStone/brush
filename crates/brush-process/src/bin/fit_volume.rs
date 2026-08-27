@@ -187,6 +187,7 @@ async fn drr_backward_t(settings: &DrrSettings, v_proj: Tensor<2>) -> Tensor<3> 
 /// (边界自动为 0 项)。加到体积梯度。
 fn tv_grad(v: &Tensor<3>) -> Tensor<3> {
     use burn::tensor::s;
+    let vol_total = v.dims()[0] * v.dims()[1] * v.dims()[2];
     // x 轴 (dim2)
     let prev_x = Tensor::cat(vec![v.clone().slice(s![.., .., 0..1]), v.clone().slice(s![.., .., 0..-1])], 2);
     let next_x = Tensor::cat(vec![v.clone().slice(s![.., .., 1..]), v.clone().slice(s![.., .., -1..])], 2);
@@ -199,12 +200,16 @@ fn tv_grad(v: &Tensor<3>) -> Tensor<3> {
     let prev_z = Tensor::cat(vec![v.clone().slice(s![0..1, .., ..]), v.clone().slice(s![0..-1, .., ..])], 0);
     let next_z = Tensor::cat(vec![v.clone().slice(s![1.., .., ..]), v.clone().slice(s![-1.., .., ..])], 0);
     g.add(v.clone().sub(prev_z).mul_scalar(2.0)).add(v.clone().sub(next_z).mul_scalar(2.0))
+        // 归一化: 变 per-voxel mean (与数据 MSE 的 mean 归一化匹配, 否则 TV
+        // 梯度 O(1) 淹没数据梯度 O(1e-6) → 优化器只抹平体积, loss 上升)。
+        .div_scalar(vol_total as f32)
 }
 
 /// L1 TV 梯度 (边缘保持): TV = Σ|μ_{i+1}-μ_i|, dTV/dμ = sign 差和
-/// (smooth tanh 近似, ε 控制平滑)。
+/// (smooth tanh 近似, ε 控制平滑)。按体素数归一化 (mean)。
 fn tv_l1_grad(v: &Tensor<3>, eps: f32) -> Tensor<3> {
     use burn::tensor::s;
+    let vol_total = v.dims()[0] * v.dims()[1] * v.dims()[2];
     let sn = |t: Tensor<3>| t.clone().mul_scalar(1.0 / eps).tanh();
     // x 轴 (dim2): 前向/后向差分的符号。
     let dx_f = v.clone().slice(s![.., .., 1..]).sub(v.clone().slice(s![.., .., ..-1])); // μ_{i+1}-μ_i
@@ -218,6 +223,7 @@ fn tv_l1_grad(v: &Tensor<3>, eps: f32) -> Tensor<3> {
     let prev_z = Tensor::cat(vec![v.clone().slice(s![0..1, .., ..]), v.clone().slice(s![0..-1, .., ..])], 0);
     let next_z = Tensor::cat(vec![v.clone().slice(s![1.., .., ..]), v.clone().slice(s![-1.., .., ..])], 0);
     g.add(sn(v.clone().sub(prev_z))).add(sn(v.clone().sub(next_z)))
+        .div_scalar(vol_total as f32)
 }
 
 /// 平方 TV 值 (日志用)。
