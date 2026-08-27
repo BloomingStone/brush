@@ -370,13 +370,22 @@ async fn parse_ply<T: AsyncRead + Unpin>(
             }
 
             if let Some(scales) = &mut data.log_scales {
-                scales.extend([gauss.scale_0, gauss.scale_1, gauss.scale_2]);
+                // Standard 3DGS PLY stores σ (activated); brush kernels
+                // consume log σ — invert here (see export.rs).
+                scales.extend([
+                    (gauss.scale_0 as f32).max(1e-6).ln(),
+                    (gauss.scale_1 as f32).max(1e-6).ln(),
+                    (gauss.scale_2 as f32).max(1e-6).ln(),
+                ]);
             }
             if let Some(rotation) = &mut data.rotations {
                 rotation.extend([gauss.rot_0, gauss.rot_1, gauss.rot_2, gauss.rot_3]);
             }
             if let Some(opacity) = &mut data.raw_opacities {
-                opacity.push(gauss.opacity);
+                // Standard PLY stores sigmoid-activated α ∈ (0,1); brush
+                // kernels consume the raw logit — invert here.
+                let a = (gauss.opacity as f32).clamp(1e-6, 1.0 - 1e-6);
+                opacity.push((a / (1.0 - a)).ln());
             }
         })
         .deserialize(&mut *file)?;

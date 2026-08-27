@@ -19,6 +19,11 @@ pub struct VoxelSettings {
     pub center: glam::Vec3,
     /// Scale modifier (like the rasterizer's `scale_modifier`).
     pub scale_modifier: f32,
+    /// Signed (FDK-residual) density mode: `opac = MU_WATER·raw` (raw used
+    /// directly, may be negative) instead of `MU_WATER·silu(raw) ≥ 0` —
+    /// mirrors brush-xray's `signed_opac` flag so the voxelizer consumes
+    /// the same raw logits as the rasterizer.
+    pub signed_opac: bool,
 }
 
 impl VoxelSettings {
@@ -28,7 +33,14 @@ impl VoxelSettings {
             s_voxel,
             center,
             scale_modifier: 1.0,
+            signed_opac: false,
         }
+    }
+
+    /// Builder: signed (FDK-residual) density mode.
+    pub fn with_signed_opac(mut self, signed: bool) -> Self {
+        self.signed_opac = signed;
+        self
     }
 
     /// World-space size of a single voxel along each axis (`sVoxel/nVoxel`).

@@ -24,6 +24,8 @@ use brush_vfs::BrushVfs;
 use burn::tensor::{Tensor, TensorData};
 use brush_render::burn_glue::{unwrap_wgpu_float, wrap_wgpu_float};
 /// 读 3D 体积 .nii.gz (nifti-rs), 返回 (float32 数据, vol)。
+/// 读 3D 体积 .nii.gz (nifti-rs), 返回 (x-major flat, vol)。nifti-rs 读回
+/// 的是磁盘列优先缓冲 (x 最快), 这里用 [`to_xmajor`] 转成内部 x-major 布局。
 fn read_nifti_volume(path: &Path) -> anyhow::Result<(Vec<f32>, usize, usize, usize)> {
     use nifti::{NiftiObject, ReaderOptions};
     let obj = ReaderOptions::new().read_file(path)?;
@@ -31,24 +33,21 @@ fn read_nifti_volume(path: &Path) -> anyhow::Result<(Vec<f32>, usize, usize, usi
     let (vx, vy, vz) = (dims[1] as usize, dims[2] as usize, dims[3] as usize);
     let volume = obj.into_volume();
     let data: Vec<f32> = volume.into_nifti_typed_data()?;
-    Ok((data, vx, vy, vz))
+    Ok((brush_process::volume_layout::to_xmajor(&data, vx, vy, vz), vx, vy, vz))
 }
 
 /// 沿 `y=-x` 反射体积 (诊断 FDK 世界系镜像): `(x,y,z) → (-y,-x,z)`。
 /// 索引: new(ix'=vol_y-1-iy, iz, iy'=vol_x-1-ix) = old(ix, iy, iz) (方网格
-/// vol_x==vol_y 下无插值)。布局 `idx = iy*vol_x*vol_z + iz*vol_x + ix`。
+/// vol_x==vol_y 下无插值)。x-major 布局 `idx = x*(vol_y*vol_z) + y*vol_z + z`。
 fn mirror_volume_negxy(vol: &mut Vec<f32>, vol_x: usize, vol_y: usize, vol_z: usize) {
     assert_eq!(vol_x, vol_y, "y=-x mirror needs square xy grid");
-    let sy = vol_x * vol_z;
-    let sz = vol_x;
+    let xm = |x: usize, y: usize, z: usize| x * (vol_y * vol_z) + y * vol_z + z;
     let mut out = vec![0.0f32; vol.len()];
-    for iy in 0..vol_y {
-        for iz in 0..vol_z {
-            for ix in 0..vol_x {
-                let src = iy * sy + iz * sz + ix;
-                let (ix2, iy2) = (vol_y - 1 - iy, vol_x - 1 - ix);
-                let dst = iy2 * sy + iz * sz + ix2;
-                out[dst] = vol[src];
+    for ix2 in 0..vol_x {
+        for iy2 in 0..vol_y {
+            for iz in 0..vol_z {
+                let (ix, iy) = (vol_y - 1 - iy2, vol_x - 1 - ix2);
+                out[xm(ix2, iy2, iz)] = vol[xm(ix, iy, iz)];
             }
         }
     }
@@ -60,15 +59,12 @@ fn mirror_volume_negxy(vol: &mut Vec<f32>, vol_x: usize, vol_y: usize, vol_z: us
 /// FDK 重建世界系与训练/GT 差了跨 y=x 的反射 → 转置修正。
 fn transpose_volume_xy(vol: &mut Vec<f32>, vol_x: usize, vol_y: usize, vol_z: usize) {
     assert_eq!(vol_x, vol_y, "xy transpose needs square xy grid");
-    let sy = vol_x * vol_z;
-    let sz = vol_x;
+    let xm = |x: usize, y: usize, z: usize| x * (vol_y * vol_z) + y * vol_z + z;
     let mut out = vec![0.0f32; vol.len()];
-    for iy in 0..vol_y {
-        for iz in 0..vol_z {
-            for ix in 0..vol_x {
-                let src = iy * sy + iz * sz + ix;
-                let dst = ix * sy + iz * sz + iy;
-                out[dst] = vol[src];
+    for ix2 in 0..vol_x {
+        for iy2 in 0..vol_y {
+            for iz in 0..vol_z {
+                out[xm(ix2, iy2, iz)] = vol[xm(iy2, ix2, iz)];
             }
         }
     }
@@ -76,6 +72,8 @@ fn transpose_volume_xy(vol: &mut Vec<f32>, vol_x: usize, vol_y: usize, vol_z: us
 }
 
 /// 写 3D 体积为 .nii.gz (nifti-rs, sform_code=2)。世界范围 `[-half_r, half_r]^3`。
+/// 内部布局 x-major (x 最慢), nifti-rs 自动转磁盘列优先; 文件 dims (X,Y,Z)
+/// 自然顺序 + 标准对角 srow。
 fn write_nifti_volume(
     path: &Path,
     data: &[f32],
@@ -88,8 +86,7 @@ fn write_nifti_volume(
 ) -> anyhow::Result<()> {
     use nifti::writer::WriterOptions;
     use nifti::{NiftiHeader, NiftiType};
-    // 内核布局 [y,z,x] (y 最慢, x 最快) → 数组形状必须 (vol_y, vol_z, vol_x)。
-    let arr = ndarray::Array3::from_shape_vec((vol_y, vol_z, vol_x), data.to_vec())
+    let arr = ndarray::Array3::from_shape_vec((vol_x, vol_y, vol_z), data.to_vec())
         .map_err(|e| anyhow::anyhow!("ndarray shape: {e}"))?;
     let sx = 2.0 * rx / vol_x as f32;
     let sy = 2.0 * ry / vol_y as f32;
@@ -99,10 +96,10 @@ fn write_nifti_volume(
     hdr.bitpix = 32;
     hdr.qform_code = 0;
     hdr.sform_code = 2;
-    // 数组轴 = [y,z,x], nifti-rs 视为 [i,j,k] → i→y, j→z, k→x。
-    hdr.srow_x = [0.0, 0.0, sx, -rx];
-    hdr.srow_y = [sy, 0.0, 0.0, -ry];
-    hdr.srow_z = [0.0, sz, 0.0, -rz];
+    // 数组轴 = [x,y,z] (x-major), 对角 srow。
+    hdr.srow_x = [sx, 0.0, 0.0, -rx];
+    hdr.srow_y = [0.0, sy, 0.0, -ry];
+    hdr.srow_z = [0.0, 0.0, sz, -rz];
     WriterOptions::new(path)
         .reference_header(&hdr)
         .write_nifti(&arr)
@@ -363,7 +360,6 @@ async fn main() -> anyhow::Result<()> {
     let mut ry = meta["ry"].as_f64().unwrap_or(rx as f64) as f32;
     let rz = meta["rz"].as_f64().unwrap_or(84.7) as f32;
     let (mut vol_vec, _hx, _hy, _hz) = read_nifti_volume(&volume_path)?;
-    // 维度以 meta.json 为准 (nii header dims 是置换后的 [y,z,x])。
     let mut vol_x = meta["vol_x"].as_u64().unwrap_or(_hx as u64) as usize;
     let mut vol_y = meta["vol_y"].as_u64().unwrap_or(_hy as u64) as usize;
     let vol_z = meta["vol_z"].as_u64().unwrap_or(_hz as u64) as usize;
@@ -375,11 +371,11 @@ async fn main() -> anyhow::Result<()> {
         let mut out = vec![0.0f32; n * n * vol_z];
         let ox = (n - vol_x) / 2;
         let oy = (n - vol_y) / 2;
-        for iy in 0..vol_y {
-            for iz in 0..vol_z {
-                for ix in 0..vol_x {
-                    let src = iy * vol_x * vol_z + iz * vol_x + ix;
-                    let dst = (iy + oy) * n * vol_z + iz * n + (ix + ox);
+        for ix in 0..vol_x {
+            for iy in 0..vol_y {
+                for iz in 0..vol_z {
+                    let src = ix * (vol_y * vol_z) + iy * vol_z + iz;
+                    let dst = (ix + ox) * (n * vol_z) + (iy + oy) * vol_z + iz;
                     out[dst] = vol_vec[src];
                 }
             }

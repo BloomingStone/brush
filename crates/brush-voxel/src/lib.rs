@@ -5,7 +5,11 @@
 //! backend-agnostic cubecl kernels. Independent of any camera: each
 //! voxel accumulates `opacity · exp(power)` over the gaussians whose 3σ
 //! bbox overlaps its cube, where `power` uses the 3D conic in voxel
-//! space. Forward + backward live in this crate (mirroring
+//! space. The `raw_opacities` input carries **raw density logits**, and
+//! the kernel applies the same activation as brush-xray (`MU_WATER·silu`
+//! unsigned / `MU_WATER·raw` signed via [`VoxelSettings::signed_opac`]) —
+//! all brush backends share the "raw logits in, kernel activates"
+//! convention. Forward + backward live in this crate (mirroring
 //! `brush-xray` / `brush-xray-bwd` but without a projection step).
 
 use brush_cube::MainBackend as Wgpu;
@@ -67,8 +71,10 @@ pub trait VoxelOps: Backend {
 /// (no backward bookkeeping). Non-differentiable — see the
 /// `burn_glue::voxelize` path for autodiff.
 ///
-/// Takes [`XRaySplats`] (transforms + raw opacity only): like the X-ray
-/// projection, voxelization is a pure density field and ignores SH.
+/// Takes [`XRaySplats`] (transforms + raw opacity logits only): like the
+/// X-ray projection, voxelization is a pure density field and ignores SH.
+/// The kernel activates the density (`MU_WATER·silu(raw)`, or
+/// `MU_WATER·raw` when `signed_opac`), exactly like brush-xray.
 pub async fn voxelize_forward(
     splats: &XRaySplats,
     settings: &VoxelSettings,

@@ -1,6 +1,7 @@
 //! Backward of the voxelizer preprocess: 3D-conic inverse backward
 //! (`dL/dcov` through `cov_voxel = Mᵀ·Vrk·M`), the covariance → scale /
-//! quaternion backward, the sigmoid opacity VJP, and the (already
+//! quaternion backward, the density VJP (`MU_WATER·silu` or signed
+//! `MU_WATER·raw`, matching brush-xray's `signed_opac`), and the (already
 //! dVoxel-compensated) mean grad. Mirrors R2 `computeCov3DCUDA` +
 //! `preprocessCUDA` backward (voxelizer).
 
@@ -9,7 +10,7 @@
 use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::cube;
 use burn_cubecl::cubecl::prelude::*;
-use brush_cube::{Mat3, Quat, Vec3A, compute_cov3d, dnormvdv4, sigmoid};
+use brush_cube::{MU_WATER, Mat3, Quat, Vec3A, compute_cov3d, dnormvdv4, sigmoid};
 
 use super::helpers::{read_quat, read_scale_mod, read_scale_raw};
 use super::render_bwd::BWD_LANES;
@@ -216,9 +217,17 @@ pub fn preprocess_voxel_bwd_kernel(
     // Mean: R2's `dL_dmeans = dL_dmean3D_norm` (already dVoxel-compensated).
     let v_mean_world = v_mean;
 
-    // Opacity: sigmoid → logit.
-    let opac = sigmoid(raw_opacities[global_gid as usize]);
-    let v_raw = v_opac * opac * (1.0f32 - opac);
+    // Opacity VJP: activated density is `MU_WATER·silu(raw)` (or
+    // `MU_WATER·raw` signed), so d opac/d raw = MU_WATER·silu'(raw) with
+    // silu'(x) = σ(x) + x·σ(x)(1−σ(x)) — identical to brush-xray-bwd.
+    let raw = raw_opacities[global_gid as usize];
+    let v_raw = if u.signed_opac != 0u32 {
+        v_opac * MU_WATER
+    } else {
+        let sig = sigmoid(raw);
+        let silu_deriv = sig + raw * sig * (1.0f32 - sig);
+        v_opac * MU_WATER * silu_deriv
+    };
 
     // log-scale: dL/dlog = dL/dscale · scale.
     let v_log = Vec3A::new(v_scale.x() * scale_raw.x(), v_scale.y() * scale_raw.y(), v_scale.z() * scale_raw.z());

@@ -240,7 +240,8 @@ impl<B: Backend + VoxelBwdOps> Backward<B, NUM_BWD_ARGS> for VoxelizeBackwards {
 
 /// Differentiable high-level voxelization: renders `splats` into a density
 /// volume `[nVoxel_x, nVoxel_y, nVoxel_z]` on an autodiff-enabled device.
-/// The result is differentiable w.r.t. `transforms` and `raw_opacities`.
+/// The result is differentiable w.r.t. `transforms` and `raw_opacities`
+/// (which carries raw density logits, activated in-kernel like brush-xray).
 pub async fn voxelize(splats: XRaySplats, settings: &VoxelSettings) -> Tensor<3> {
     let device = splats.device();
     assert!(

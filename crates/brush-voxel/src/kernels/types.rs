@@ -35,6 +35,8 @@ pub struct VoxelUniforms {
     pub total_splats: u32,
     pub num_visible: u32,
     pub scale_modifier: f32,
+    /// Signed (FDK-residual) density mode: `opac = MU_WATER·raw`.
+    pub signed_opac: u32,
 }
 
 impl VoxelUniforms {
@@ -59,6 +61,7 @@ impl VoxelUniforms {
         total_splats: u32,
         num_visible: u32,
         scale_modifier: f32,
+        signed_opac: u32,
     ) -> Self {
         let grid_x = n_voxel_x.div_ceil(BLOCK3D_X);
         let grid_y = n_voxel_y.div_ceil(BLOCK3D_Y);
@@ -87,6 +90,7 @@ impl VoxelUniforms {
             total_splats,
             num_visible,
             scale_modifier,
+            signed_opac,
         }
     }
 }

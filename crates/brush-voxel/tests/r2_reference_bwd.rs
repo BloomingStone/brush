@@ -1,6 +1,10 @@
 //! Golden-reference backward comparison against R2-Gaussian's voxelizer
 //! (CUDA). The reference grads are `dL/dC` with `L = volume.sum()`
-//! w.r.t. (means, log_scales, raw_opac, quats) — see
+//! w.r.t. (means, log_scales, raw logits, quats) — the R2 CUDA kernel is
+//! activation-neutral, so the reference generator chains the brush
+//! activation `μ = MU_WATER·silu(raw)` through torch autograd and stores
+//! `dL/draw`. This test feeds the same **raw logits**; the kernel's silu
+//! VJP reproduces the chain. See
 //! `brush-voxel/test_cases/generate_reference.py`.
 
 use brush_cube::MainBackendBase;
@@ -76,6 +80,8 @@ async fn matches_r2_voxel_backward() {
         TensorData::new::<f32, _>(transforms_data, [n, 10]),
         &device,
     );
+    // Raw logits — the kernel's silu VJP (`dL/draw`) must match the
+    // reference's autograd-chained `grad_raw_opac = dL/draw`.
     let raw_opac_ft = MainBackendBase::float_from_data(
         TensorData::new::<f32, _>(raw_opac.clone(), [n]),
         &device,

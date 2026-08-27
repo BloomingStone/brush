@@ -145,8 +145,9 @@ fn build_frames(views: &[SceneView], delx: f32) -> Vec<Frame> {
 
 /// 各向异性 FDK 反投影: 网格 `[vol_x, vol_y, vol_z]`, 世界域
 /// `[-rx,rx]x[-ry,ry]x[-rz,rz]`, **只填充全采样圆柱** `x²+y² < mask_r²`
-/// (mask_r = half_w, 部分采样环带置 0)。内存布局 `idx(x,y,z) = (y*vol_x*vol_z) + z*vol_x + x`
-/// (x 最快, 同 DRR 内核)。
+/// (mask_r = half_w, 部分采样环带置 0)。内存布局 x-major:
+/// `idx(x,y,z) = x*(vol_y*vol_z) + y*vol_z + z` (x 最慢, 同 DRR 内核 /
+/// brush-voxel)。
 fn backproject_aniso(
     frames: &[Frame],
     vol_x: usize,
@@ -161,21 +162,21 @@ fn backproject_aniso(
     let dy = 2.0 * ry / vol_y as f32;
     let dz = 2.0 * rz / vol_z as f32;
     let mask_r2 = mask_r * mask_r;
-    let sy = vol_x * vol_z;
+    let sy = vol_y * vol_z;
     let mut volume = vec![0.0f32; vol_x * vol_y * vol_z];
     volume
         .par_chunks_mut(sy)
         .enumerate()
-        .for_each(|(iy, slice)| {
-            let y = -ry + (iy as f32 + 0.5) * dy;
-            for iz in 0..vol_z {
-                let z = -rz + (iz as f32 + 0.5) * dz;
-                let row_base = iz * vol_x;
-                for ix in 0..vol_x {
-                    let x = -rx + (ix as f32 + 0.5) * dx;
-                    if x * x + y * y > mask_r2 {
-                        continue;
-                    }
+        .for_each(|(ix, slice)| {
+            let x = -rx + (ix as f32 + 0.5) * dx;
+            for iy in 0..vol_y {
+                let y = -ry + (iy as f32 + 0.5) * dy;
+                if x * x + y * y > mask_r2 {
+                    continue;
+                }
+                let row_base = iy * vol_z;
+                for iz in 0..vol_z {
+                    let z = -rz + (iz as f32 + 0.5) * dz;
                     let p_w = Vec3::new(x, y, z);
                     let mut acc = 0.0f32;
                     for f in frames {
@@ -208,14 +209,14 @@ fn backproject_aniso(
                         let wgt = f.sod / dzp;
                         acc += wgt * wgt * val;
                     }
-                    slice[row_base + ix] = acc;
+                    slice[row_base + iz] = acc;
                 }
             }
         });
     volume
 }
 
-/// 三线性插值采样各向异性体积 (同 DRR 内核布局)。
+/// 三线性插值采样各向异性体积 (x-major 布局, 同 DRR 内核)。
 #[inline]
 fn sample_vol_aniso(
     volume: &[f32],
@@ -245,17 +246,18 @@ fn sample_vol_aniso(
     let tx = fx - ix as f32;
     let ty = fy - iy as f32;
     let tz = fz - iz as f32;
-    let sz = vol_x;
-    let sy = vol_x * vol_z;
-    let base = iy * sy + iz * sz + ix;
+    // x-major: flat(x,y,z) = x·(vy·vz) + y·vz + z (z fastest).
+    let sx = vol_y * vol_z;
+    let sy = vol_z;
+    let base = ix * sx + iy * sy + iz;
     let c000 = volume[base];
-    let c100 = volume[base + 1];
-    let c010 = volume[base + sz];
-    let c110 = volume[base + sz + 1];
-    let c001 = volume[base + sy];
-    let c101 = volume[base + sy + 1];
-    let c011 = volume[base + sy + sz];
-    let c111 = volume[base + sy + sz + 1];
+    let c100 = volume[base + sx];
+    let c010 = volume[base + sy];
+    let c110 = volume[base + sx + sy];
+    let c001 = volume[base + 1];
+    let c101 = volume[base + sx + 1];
+    let c011 = volume[base + sy + 1];
+    let c111 = volume[base + sx + sy + 1];
     let c00 = c000 * (1.0 - tx) + c100 * tx;
     let c10 = c010 * (1.0 - tx) + c110 * tx;
     let c01 = c001 * (1.0 - tx) + c101 * tx;
@@ -309,7 +311,9 @@ fn forward_project_view(
 }
 
 /// 写 3D 体积 .nii.gz (nifti-rs, sform_code=2)。各向异性 affine:
-/// nifti-rs 内部 data.t() → 文件轴 [X,Z,Y], srow_y 用 k, srow_z 用 j。
+/// 内部布局 x-major `idx(x,y,z) = x*(vol_y*vol_z) + y*vol_z + z`, 数组形状
+/// (vol_x, vol_y, vol_z); nifti-rs 内部 data.t() 转成磁盘列优先 (x 最快),
+/// 文件 dims 即自然 (X,Y,Z), srow 为标准对角。
 fn write_nifti_volume(
     path: &Path,
     data: &[f32],
@@ -322,8 +326,7 @@ fn write_nifti_volume(
 ) -> anyhow::Result<()> {
     use nifti::writer::WriterOptions;
     use nifti::{NiftiHeader, NiftiType};
-    // 内核布局 [y,z,x] (y 最慢, x 最快) → 数组形状必须 (vol_y, vol_z, vol_x)。
-    let arr = ndarray::Array3::from_shape_vec((vol_y, vol_z, vol_x), data.to_vec())
+    let arr = ndarray::Array3::from_shape_vec((vol_x, vol_y, vol_z), data.to_vec())
         .map_err(|e| anyhow::anyhow!("ndarray shape: {e}"))?;
     let sx = 2.0 * rx / vol_x as f32;
     let sy = 2.0 * ry / vol_y as f32;
@@ -333,10 +336,10 @@ fn write_nifti_volume(
     hdr.bitpix = 32;
     hdr.qform_code = 0;
     hdr.sform_code = 2;
-    // 数组轴 = [y,z,x], nifti-rs 视为 [i,j,k] → i→y, j→z, k→x。
-    hdr.srow_x = [0.0, 0.0, sx, -rx];
-    hdr.srow_y = [sy, 0.0, 0.0, -ry];
-    hdr.srow_z = [0.0, sz, 0.0, -rz];
+    // 数组轴 = [x,y,z] (x-major), dim[1..3] = (X,Y,Z) 自然顺序, 对角 srow。
+    hdr.srow_x = [sx, 0.0, 0.0, -rx];
+    hdr.srow_y = [0.0, sy, 0.0, -ry];
+    hdr.srow_z = [0.0, 0.0, sz, -rz];
     WriterOptions::new(path)
         .reference_header(&hdr)
         .write_nifti(&arr)

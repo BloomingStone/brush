@@ -1328,6 +1328,7 @@ version = "0.3.0"
 dependencies = [
  "assert_approx_eq",
  "brush-cube",
+ "brush-drr",
  "brush-prefix-sum",
  "brush-render",
  "brush-sort",

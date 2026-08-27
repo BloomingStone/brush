@@ -155,18 +155,23 @@ async fn read_splat_data(splats: Splats) -> Result<DynamicPly, ExportError> {
                 transforms[t + 6],
             );
             let rn = (r0 * r0 + r1 * r1 + r2 * r2 + r3 * r3).sqrt().max(1e-12);
+            // Standard 3DGS PLY domain (graphdeco / R2): `scale_*` = σ =
+            // exp(log_scale) (activated), `opacity` = sigmoid(raw logit)
+            // ∈ (0,1). brush kernels activate in-kernel from raw logits, so
+            // the export activates and the import inverts — raw domain is
+            // only ever held in-memory.
             DynamicPlyGaussian {
                 x: transforms[t],
                 y: transforms[t + 1],
                 z: transforms[t + 2],
-                scale_0: transforms[t + 7],
-                scale_1: transforms[t + 8],
-                scale_2: transforms[t + 9],
+                scale_0: transforms[t + 7].exp(),
+                scale_1: transforms[t + 8].exp(),
+                scale_2: transforms[t + 9].exp(),
                 rot_0: r0 / rn,
                 rot_1: r1 / rn,
                 rot_2: r2 / rn,
                 rot_3: r3 / rn,
-                opacity: raw_opacities[i],
+                opacity: 1.0 / (1.0 + (-raw_opacities[i]).exp()),
                 f_dc_0: sh_red[0],
                 f_dc_1: sh_green[0],
                 f_dc_2: sh_blue[0],

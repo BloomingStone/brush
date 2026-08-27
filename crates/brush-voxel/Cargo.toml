@@ -32,5 +32,8 @@ serde.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 safetensors.workspace = true
 
+[dev-dependencies]
+brush-drr.path = "../brush-drr"
+
 [lints]
 workspace = true

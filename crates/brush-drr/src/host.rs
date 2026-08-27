@@ -2,7 +2,6 @@
 //! volume geometry. Carried (as a plain struct) across the backend
 //! boundary.
 
-use brush_cube::MainBackend;
 use brush_render::camera::Camera;
 
 use burn_cubecl::cubecl::wgpu::WgpuRuntime;
@@ -60,7 +59,12 @@ impl DrrSettings {
     ) -> Self {
         let size = glam::uvec2(img_w, img_h);
         let f = cam.focal(size);
-        let c = cam.center(size);
+        // Principal point, pixel-center-at-integer convention: `(S-1)` span
+        // matches brush-xray's R2 `ndc2Pix` (center at (S-1)/2 for
+        // center_uv=0.5), so both pipelines sample the same rays. Using
+        // `camera.center()` (`center_uv·S`) would offset every ray by half
+        // a pixel from the rasterizer's.
+        let c = glam::vec2(cam.center_uv.x * (img_w - 1) as f32, cam.center_uv.y * (img_h - 1) as f32);
         let p = cam.position;
         let m = glam::Mat3::from_quat(cam.rotation).to_cols_array();
         Self {

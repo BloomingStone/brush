@@ -64,7 +64,8 @@ pub struct FdkPrior {
 
 impl FdkPrior {
     /// Build from a raw float32 volume `[vol_x*vol_y*vol_z]` (kernel layout
-    /// `[y,z,x]`) + world half extents + projection calibration.
+    /// x-major `idx(x,y,z) = x*(vol_y*vol_z) + y*vol_z + z`) + world half
+    /// extents + projection calibration.
     pub fn new(
         volume: Vec<f32>,
         vol_x: usize,

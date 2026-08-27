@@ -3,10 +3,10 @@
 //! (vs 仅靠投影拟合的条纹)。
 //!
 //! 输出网格: XY padding 到 N (默认 326), z 保持 FDK 的 183, spacing 同 FDK
-//! (0.927mm)。voxelizer 输出布局 [x][y][z] (z 最快) → 转成公共布局 [y][z][x]
-//! (x 最快, 同 DRR 内核 / FDK)。
+//! (0.927mm)。内部统一 x-major 布局 `idx(x,y,z) = x*(ny*nz) + y*nz + z`
+//! (同 voxelizer 输出 / DRR 内核 / R2 fields); nifti/nrrd 写入时转磁盘
+//! 列优先 (x 最快, NIfTI-1/NRRD 标准, 文件 dims 自然 (X,Y,Z))。
 
-use brush_cube::{MU_WATER, silu};
 use brush_deform::{HexPlaneConfig, HexPlaneDeformConfig, HexPlaneDeformModel, deform_splats};
 use brush_train::xray_train::DeformNetwork;
 use brush_serde::import::load_splat_from_ply;
@@ -24,7 +24,8 @@ fn read_nifti_volume(path: &Path) -> anyhow::Result<(Vec<f32>, usize, usize, usi
     let (vx, vy, vz) = (dims[1] as usize, dims[2] as usize, dims[3] as usize);
     let volume = obj.into_volume();
     let data: Vec<f32> = volume.into_nifti_typed_data()?;
-    Ok((data, vx, vy, vz))
+    // nifti-rs 读回磁盘列优先缓冲 (x 最快) → 内部 x-major 布局。
+    Ok((brush_process::volume_layout::to_xmajor(&data, vx, vy, vz), vx, vy, vz))
 }
 
 fn write_nifti_volume(
@@ -39,7 +40,9 @@ fn write_nifti_volume(
 ) -> anyhow::Result<()> {
     use nifti::writer::WriterOptions;
     use nifti::{NiftiHeader, NiftiType};
-    let arr = ndarray::Array3::from_shape_vec((vol_y, vol_z, vol_x), data.to_vec())
+    // 内部 x-major → 数组形状 (vol_x, vol_y, vol_z); nifti-rs 自动转磁盘
+    // 列优先, 文件 dims (X,Y,Z) 自然顺序, 对角 srow。
+    let arr = ndarray::Array3::from_shape_vec((vol_x, vol_y, vol_z), data.to_vec())
         .map_err(|e| anyhow::anyhow!("ndarray shape: {e}"))?;
     let sx = 2.0 * rx / vol_x as f32;
     let sy = 2.0 * ry / vol_y as f32;
@@ -49,9 +52,9 @@ fn write_nifti_volume(
     hdr.bitpix = 32;
     hdr.qform_code = 0;
     hdr.sform_code = 2;
-    hdr.srow_x = [0.0, 0.0, sx, -rx];
-    hdr.srow_y = [sy, 0.0, 0.0, -ry];
-    hdr.srow_z = [0.0, sz, 0.0, -rz];
+    hdr.srow_x = [sx, 0.0, 0.0, -rx];
+    hdr.srow_y = [0.0, sy, 0.0, -ry];
+    hdr.srow_z = [0.0, 0.0, sz, -rz];
     WriterOptions::new(path)
         .reference_header(&hdr)
         .write_nifti(&arr)
@@ -59,18 +62,20 @@ fn write_nifti_volume(
     Ok(())
 }
 
-/// 写 3D NRRD (dimension 3, sizes: x z y, 布局 [y][z][x], x 最快)。
+/// 写 3D NRRD (dimension 3, sizes 自然 (X,Y,Z), 轴0 = x 最快 = 磁盘标准)。
+/// 内部 x-major 缓冲先转磁盘列优先再写。
 fn write_nrrd_3d(path: &Path, data: &[f32], vol_x: usize, vol_y: usize, vol_z: usize) -> anyhow::Result<()> {
-    let mut payload = Vec::with_capacity(data.len() * 4);
-    for v in data {
-        payload.extend_from_slice(&v.to_le_bytes());
+    let payload = brush_process::volume_layout::from_xmajor(data, vol_x, vol_y, vol_z);
+    let mut bytes = Vec::with_capacity(payload.len() * 4);
+    for v in payload {
+        bytes.extend_from_slice(&v.to_le_bytes());
     }
     let header = format!(
         "NRRD0004\n\
-         # GS2volume (float32, 布局 [y][z][x], x 最快)\n\
+         # GS2volume (float32, 磁盘列优先 x 最快, sizes (X,Y,Z))\n\
          type: float\n\
          dimension: 3\n\
-         sizes: {vol_x} {vol_z} {vol_y}\n\
+         sizes: {vol_x} {vol_y} {vol_z}\n\
          encoding: raw\n\
          endian: little\n\
          \n"
@@ -78,9 +83,9 @@ fn write_nrrd_3d(path: &Path, data: &[f32], vol_x: usize, vol_y: usize, vol_z: u
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = Vec::with_capacity(header.len() + payload.len());
+    let mut file = Vec::with_capacity(header.len() + bytes.len());
     file.extend_from_slice(header.as_bytes());
-    file.append(&mut payload);
+    file.append(&mut bytes);
     std::fs::write(path, file)?;
     Ok(())
 }
@@ -165,7 +170,6 @@ async fn main() -> anyhow::Result<()> {
     let mut deform_extent = 264.0f32;
     let mut ckpt: Option<PathBuf> = None; // HexPlane 网络权重 (deform_final.bin)
     let mut no_fdk = false;
-    let mut raw_domain = false; // 跳过 μ 映射, 用 raw 直接 (sigmoid 域, R2Gaussian 对照)
     let mut i = 1;
     while i < args.len() {
         let a = &args[i];
@@ -191,8 +195,6 @@ async fn main() -> anyhow::Result<()> {
             deform_extent = v.parse()?;
         } else if a == "--no-fdk" {
             no_fdk = true;
-        } else if a == "--raw-domain" {
-            raw_domain = true;
         }
         i += 1;
     }
@@ -295,27 +297,11 @@ async fn main() -> anyhow::Result<()> {
         println!("applied deform field {df:?} (extent {deform_extent}mm), max |d|={dmax:.2}mm");
     }
 
-    // ---- raw → sigmoid 域 (让 voxelizer 输出 = μ 场); --raw-domain 跳过 ----
-    // voxelizer opac = sigmoid(raw2); 我们想要 opac = μ = MU_WATER·(silu(raw) 或 raw)。
-    let mut raw2 = Vec::with_capacity(n);
-    if raw_domain {
-        raw2 = raw.clone();
-        println!("raw-domain mode: 直接用 raw (sigmoid 域, R2Gaussian 对照)");
-    } else {
-        for &r in &raw {
-            let mu = if signed {
-                MU_WATER * r
-            } else {
-                MU_WATER * silu(r)
-            };
-            // sigmoid(raw2) = mu → raw2 = ln(mu/(1-mu)); 负值 (signed) 无法表示 → clamp。
-            let mu = mu.max(1e-7).min(1.0 - 1e-7);
-            raw2.push((mu / (1.0 - mu)).ln());
-        }
-    }
+    // ---- 密度域: raw logits 直通 —— voxelizer 内核激活 (与 brush-xray
+    //      同约定: unsigned = MU_WATER·silu(raw), --signed = MU_WATER·raw) ----
+    // (旧绕行在 host 反解 logit, 对 μ>1 / 负密度有损 clamp; 现已移除。)
 
-    // ---- FDK 体积 + meta + 转置修正 ----
-    // FDK 体积 + meta + 转置修正 (--no-fdk 时跳过, 输出纯 GS 体积)。
+    // ---- FDK 体积 + meta (read_nifti_volume 已转内部 x-major 布局) ----
     let mut rx0 = 118.6f32;
     let mut rz0 = 84.7f32;
     let mut fdk_x = 256usize;
@@ -328,25 +314,12 @@ async fn main() -> anyhow::Result<()> {
         let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
         rx0 = meta["rx"].as_f64().unwrap_or(118.6) as f32;
         rz0 = meta["rz"].as_f64().unwrap_or(84.7) as f32;
-        let (mut fdk_vec0, _hx, _hy, _hz) = read_nifti_volume(&fdk_vol)?;
+        let (fdk_vec0, _hx, _hy, _hz) = read_nifti_volume(&fdk_vol)?;
         fdk_x = meta["vol_x"].as_u64().unwrap_or(_hx as u64) as usize;
         fdk_y = meta["vol_y"].as_u64().unwrap_or(_hy as u64) as usize;
         fdk_z = meta["vol_z"].as_u64().unwrap_or(_hz as u64) as usize;
         assert_eq!(fdk_vec0.len(), fdk_x * fdk_y * fdk_z, "FDK size mismatch");
-        // nifti data.t() 转置修正 (x<->y)。
-        let sy = fdk_x * fdk_z;
-        let sz = fdk_x;
-        let mut out_v = vec![0.0f32; fdk_vec0.len()];
-        for iy in 0..fdk_y {
-            for iz in 0..fdk_z {
-                for ix in 0..fdk_x {
-                    let src = iy * sy + iz * sz + ix;
-                    let dst = ix * sy + iz * sz + iy;
-                    out_v[dst] = fdk_vec0[src];
-                }
-            }
-        }
-        fdk_vec = out_v;
+        fdk_vec = fdk_vec0;
     }
 
     // ---- GS 体素化 (网格 = FDK XY padding 到 n_xy, spacing 保持) ----
@@ -354,49 +327,36 @@ async fn main() -> anyhow::Result<()> {
     let rx = vox_mm * n_xy as f32 / 2.0;   // n_xy 世界半宽
     let rz = rz0;                          // z 不变 (FDK 183)
     let n_z = fdk_z;
-    let settings = VoxelSettings::new(
+    let mut settings = VoxelSettings::new(
         glam::uvec3(n_xy as u32, n_xy as u32, n_z as u32),
         glam::vec3(2.0 * rx, 2.0 * rx, 2.0 * rz),
         glam::Vec3::ZERO,
     );
+    if signed {
+        settings = settings.with_signed_opac(true);
+    }
     println!(
-        "voxelize GS: grid {n_xy}x{n_xy}x{n_z}, voxel {vox_mm:.3}mm, world {rx:.1}x{rx:.1}x{rz:.1}mm, signed={signed}"
+        "voxelize GS: grid {n_xy}x{n_xy}x{n_z}, voxel {vox_mm:.3}mm, world {rx:.1}x{rx:.1}x{rz:.1}mm, signed={signed} (kernel MU_WATER·silu/raw)"
     );
-    let splats = XRaySplats::from_raw(means, rots, log_scales, raw2, &device);
-    let v_vol = voxelize_forward(&splats, &settings).await; // [n_x, n_y, n_z], z 最快
+    let splats = XRaySplats::from_raw(means, rots, log_scales, raw, &device);
+    let v_vol = voxelize_forward(&splats, &settings).await; // x-major [n_x, n_y, n_z]
     let gs_vol: Vec<f32> = v_vol.into_data().to_vec()?;
 
-    // dump 原生布局 (x,y,z, z 最快) 供对照
-    {
-        let mut payload = Vec::with_capacity(gs_vol.len() * 4);
-        for v in &gs_vol { payload.extend_from_slice(&v.to_le_bytes()); }
-        let hdr = "NRRD0004\ntype: float\ndimension: 3\nsizes: 326 326 183\nencoding: raw\nendian: little\n\n";
-        let mut f = Vec::with_capacity(hdr.len() + payload.len());
-        f.extend_from_slice(hdr.as_bytes()); f.append(&mut payload);
-        std::fs::write(out.join("gs_native_raw.nrrd"), f)?;
-    }
-    // 公共布局 [y][z][x] (x 最快): gs_common[y][z][x] = gs[x][y][z]
-    let mut gs_common = vec![0.0f32; n_xy * n_xy * n_z];
-    for ix in 0..n_xy {
-        for iy in 0..n_xy {
-            for iz in 0..n_z {
-                let src = ix * n_xy * n_z + iy * n_z + iz;   // voxelizer [x][y][z]
-                let dst = iy * n_xy * n_z + iz * n_xy + ix; // common [y][z][x]
-                gs_common[dst] = gs_vol[src];
-            }
-        }
-    }
+    // dump 原生布局 (x-major, 与 DRR/FDK 一致) 供对照
+    write_nrrd_3d(&out.join("gs_native_raw.nrrd"), &gs_vol, n_xy, n_xy, n_z)?;
+    // 公共布局 = x-major: voxelizer 输出即公共布局, 零转置。
+    let gs_common = gs_vol;
 
-    // ---- FDK 居中 padding 到 n_xy (XY), 公共布局 [y][z][x]; no-fdk 全 0 ----
+    // ---- FDK 居中 padding 到 n_xy (XY), 公共布局 x-major; no-fdk 全 0 ----
     let ox = (n_xy - fdk_x) / 2;
     let oy = (n_xy - fdk_y) / 2;
     let mut fdk_pad = vec![0.0f32; n_xy * n_xy * n_z];
     if !no_fdk {
-        for iy in 0..fdk_y {
-            for iz in 0..fdk_z {
-                for ix in 0..fdk_x {
-                    let src = iy * fdk_x * fdk_z + iz * fdk_x + ix;
-                    let dst = (iy + oy) * n_xy * n_z + iz * n_xy + (ix + ox);
+        for ix in 0..fdk_x {
+            for iy in 0..fdk_y {
+                for iz in 0..fdk_z {
+                    let src = ix * (fdk_y * fdk_z) + iy * fdk_z + iz;
+                    let dst = (ix + ox) * (n_xy * n_z) + (iy + oy) * n_z + iz;
                     fdk_pad[dst] = fdk_vec[src];
                 }
             }

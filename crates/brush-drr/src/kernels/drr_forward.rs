@@ -2,11 +2,14 @@
 //!
 //! One thread per output pixel. Each ray marches `steps` samples from
 //! `sod - r` to `sod + r`, trilinearly samples the volume
-//! (`[-rx,rx]x[-ry,ry]x[-rz,rz]`, world coords) and accumulates `∫μ dl`.
-//! Output `proj = scale * integral + bias` (calibrated optical depth).
+//! (`[-rx,rx]x[-ry,ry]x[-rz,rz]`, world coords) and accumulates `∫μ dl`
+//! (Euclidean path length: each sample carries the `|dir|` magnification
+//! factor). Output `proj = scale * integral + bias` (calibrated optical
+//! depth).
 //!
-//! Memory layout `idx(x,y,z) = (y*vol_x*vol_z) + z*vol_x + x` (x fastest),
-//! matching the FDK volume writer.
+//! Memory layout `idx(x,y,z) = x*(vol_y*vol_z) + y*vol_z + z` (x slowest,
+//! z fastest — x-major), matching brush-voxel's native output layout and
+//! R2-Gaussian's `fields`, so voxelizer output feeds the DRR directly.
 
 use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::cube;
@@ -34,18 +37,19 @@ pub fn drr_trilinear(volume: &Tensor<f32>, u: DrrUniforms, p: Vec3A) -> f32 {
             let ty = vy - iy as f32;
             let tz = vz - iz as f32;
 
-            let sz = u.vol_x; // stride per z
-            let sy = u.vol_x * u.vol_z; // stride per y
-            let base = iy * sy + iz * sz + ix;
+            // x-major: flat(x,y,z) = x·(vy·vz) + y·vz + z (z fastest).
+            let sx = u.vol_y * u.vol_z; // stride per x
+            let sy = u.vol_z; // stride per y
+            let base = ix * sx + iy * sy + iz;
 
             let c000 = volume[base as usize];
-            let c100 = volume[(base + 1) as usize];
-            let c010 = volume[(base + sz) as usize];
-            let c110 = volume[(base + sz + 1) as usize];
-            let c001 = volume[(base + sy) as usize];
-            let c101 = volume[(base + sy + 1) as usize];
-            let c011 = volume[(base + sy + sz) as usize];
-            let c111 = volume[(base + sy + sz + 1) as usize];
+            let c100 = volume[(base + sx) as usize];
+            let c010 = volume[(base + sy) as usize];
+            let c110 = volume[(base + sx + sy) as usize];
+            let c001 = volume[(base + 1) as usize];
+            let c101 = volume[(base + sx + 1) as usize];
+            let c011 = volume[(base + sy + 1) as usize];
+            let c111 = volume[(base + sx + sy + 1) as usize];
 
             let c00 = c000 * (1.0 - tx) + c100 * tx;
             let c10 = c010 * (1.0 - tx) + c110 * tx;
@@ -79,6 +83,12 @@ pub fn drr_forward_kernel(
     );
     let cam_pos = Vec3A::new(u.cam_x, u.cam_y, u.cam_z);
     let dir = Vec3A::new((x as f32 - u.cx) / u.fx, (y as f32 - u.cy) / u.fy, 1.0);
+    // Euclidean length per camera-z step: `dir` is z-normalized (z=1), so
+    // the physical path element is `ds = |dir|·dt`. Without it the line
+    // integral under-counts oblique (off-axis) rays by up to ~9% at the
+    // corners of a wide-fov image, breaking the rasterizer's `mu`
+    // (unit-ray) convention.
+    let dir_len = f32::sqrt(dir.x() * dir.x() + dir.y() * dir.y() + 1.0f32);
 
     let t_near = u.sod - u.rx;
     let t_far = u.sod + u.rx;
@@ -89,7 +99,7 @@ pub fn drr_forward_kernel(
         let t = t_near + (s as f32 + 0.5) * dt;
         let p_local = dir.scale(t);
         let p_world = cam_rot.mul_vec3(p_local).add(cam_pos);
-        acc += drr_trilinear(volume, u, p_world) * dt;
+        acc += drr_trilinear(volume, u, p_world) * dt * dir_len;
     }
 
     let idx = (y * u.img_w + x) as usize;

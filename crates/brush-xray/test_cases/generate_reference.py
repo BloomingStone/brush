@@ -108,14 +108,24 @@ quats = torch.rand(N, 4, generator=gq, dtype=torch.float32) * 2.0 - 1.0
 raw_opac = torch.full((N,), 2.0, dtype=torch.float32)
 
 # ---------------------------------------------------------------------------
-# Build R2 inputs (scales = exp(log_scales), opacities = sigmoid(raw_opac)).
-# R2's backward returns opacity grads shaped [N,1] — the rasterizer expects
-# a column-vector opacity input (3DGS convention).
+# Build R2 inputs (scales = exp(log_scales), opacities = MU_WATER·silu(raw)).
+# brush-xray's unsigned mode activates `μ = MU_WATER·silu(raw)` (exp6); the R2
+# CUDA kernel is activation-neutral, so the pre-activated density is passed
+# directly (the R2 python wrapper's `torch.sigmoid` is NOT applied).
 # ---------------------------------------------------------------------------
+MU_WATER = 0.002
+
+
+def activated_density(raw_opac: torch.Tensor) -> torch.Tensor:
+    # silu(x) = x·sigmoid(x); μ = MU_WATER·silu(raw).
+    sig = torch.sigmoid(raw_opac)
+    return (MU_WATER * raw_opac * sig).unsqueeze(-1)
+
+
 means3D = means.to(DEVICE)
 scales = log_scales.exp().to(DEVICE)
 rotations = torch.nn.functional.normalize(quats, dim=1).to(DEVICE)
-opacities = torch.sigmoid(raw_opac).unsqueeze(-1).to(DEVICE)  # [N,1]
+opacities = activated_density(raw_opac).to(DEVICE)  # [N,1] pre-activated μ
 
 # means2D — projected pixel coords, detached (only used by R2 backward).
 means_view = torch.nn.functional.pad(means3D, (0, 1), value=1.0) @ world_view_transform.T
@@ -151,7 +161,7 @@ quats_g = quats.to(DEVICE).requires_grad_(True)
 raw_opac_g = raw_opac.to(DEVICE).requires_grad_(True)
 scales = log_scales_g.exp()
 rotations = torch.nn.functional.normalize(quats_g, dim=1)
-opacities = torch.sigmoid(raw_opac_g).unsqueeze(-1)
+opacities = activated_density(raw_opac_g)
 
 color, radii = rasterizer(means3D, means2D, opacities, scales, rotations, None)
 out_img = color[0].detach().cpu()  # [H, W]

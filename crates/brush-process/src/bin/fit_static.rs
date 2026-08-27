@@ -90,7 +90,8 @@ fn save_stack(dir: &Path, iter: u32, pairs: &[TensorData]) {
     println!("{} saved {} ({} views stacked)", ts(), p.display(), pairs.len());
 }
 
-/// 读 3D 体积为 .nii.gz → (vol_vec, vx, vy, vz)。与 fit_volume 相同。
+/// 读 3D 体积为 .nii.gz → (x-major vol_vec, vx, vy, vz)。nifti-rs 读回磁盘
+/// 列优先缓冲 (x 最快), 转成内部 x-major 布局 (与 fit_volume 相同)。
 fn read_nifti_volume(path: &Path) -> anyhow::Result<(Vec<f32>, usize, usize, usize)> {
     use nifti::{NiftiObject, ReaderOptions};
     let obj = ReaderOptions::new().read_file(path)?;
@@ -98,7 +99,7 @@ fn read_nifti_volume(path: &Path) -> anyhow::Result<(Vec<f32>, usize, usize, usi
     let (vx, vy, vz) = (dims[1] as usize, dims[2] as usize, dims[3] as usize);
     let volume = obj.into_volume();
     let data: Vec<f32> = volume.into_nifti_typed_data()?;
-    Ok((data, vx, vy, vz))
+    Ok((brush_process::volume_layout::to_xmajor(&data, vx, vy, vz), vx, vy, vz))
 }
 
 /// `[HH:MM:SS]` 北京时间 (UTC+8, 固定偏移; 轻量, 无 chrono 依赖)。
@@ -222,8 +223,8 @@ async fn main() -> anyhow::Result<()> {
     let mut fdk_calib: Option<PathBuf> = None;
     let mut fdk_steps = 256u32;
     let mut fdk_residual_init_density = 1e-5f32;
-    // nifti-rs 读写有 data.t() 转置: FDK 体积从 nii.gz 读回后 x<->y 被交换,
-    // DRR 渲染出来是转置的镜像。--fdk-transpose 在加载时转置修正。
+    // FDK 重建世界系与训练/GT 差了跨 y=x 的反射 (历史转置问题已解耦):
+    // 布局转换在 read_nifti_volume 内自动完成, 此 flag 仅做世界系镜像。
     let mut fdk_transpose = false;
     // 独立 --signed: 有符号渲染 (opac=MU_WATER·raw, 可负) 但不要求 FDK 体积。
     // 用于剪影等数据: 前景可建模为负密度高斯 (图像变亮 = 低密度积分)。
@@ -620,22 +621,21 @@ async fn main() -> anyhow::Result<()> {
         let vol_y = meta["vol_y"].as_u64().unwrap_or(_vy as u64) as usize;
         let vol_z = meta["vol_z"].as_u64().unwrap_or(_vz as u64) as usize;
         assert_eq!(vol_vec.len(), vol_x * vol_y * vol_z, "FDK volume size mismatch");
-        // nifti-rs data.t() 转置修正: 读取回的体积 x<->y 交换 (世界系转置)。
+        // 布局已由 read_nifti_volume 转成 x-major (自动, 无 flag)。
+        // --fdk-transpose 现在只做纯世界系镜像: FDK 重建世界系与训练/GT
+        // 差了跨 y=x 的反射 → x<->y 交换 (方网格无插值)。
         if fdk_transpose {
-            let sy = vol_x * vol_z;
-            let sz = vol_x;
+            let xm = |x: usize, y: usize, z: usize| x * (vol_y * vol_z) + y * vol_z + z;
             let mut out = vec![0.0f32; vol_vec.len()];
-            for iy in 0..vol_y {
-                for iz in 0..vol_z {
-                    for ix in 0..vol_x {
-                        let src = iy * sy + iz * sz + ix;
-                        let dst = ix * sy + iz * sz + iy;
-                        out[dst] = vol_vec[src];
+            for ix in 0..vol_x {
+                for iy in 0..vol_y {
+                    for iz in 0..vol_z {
+                        out[xm(ix, iy, iz)] = vol_vec[xm(iy, ix, iz)];
                     }
                 }
             }
             vol_vec = out;
-            println!("{} FDK volume transposed in xy (nifti data.t() fix)", ts());
+            println!("{} FDK volume world-mirrored in xy (y=x reflection)", ts());
         }
         let calib: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&calib_path)?)?;

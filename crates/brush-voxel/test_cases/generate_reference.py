@@ -50,13 +50,15 @@ quats = torch.rand(N, 4, generator=gq, dtype=torch.float32) * 2.0 - 1.0
 raw_opac = torch.full((N,), 2.0, dtype=torch.float32)
 
 # ---------------------------------------------------------------------------
-# R2 inputs: scales = exp(log_scales), opacities = sigmoid(raw_opac) [N,1],
-# rotations normalized (w,x,y,z).
+# R2 inputs: scales = exp(log_scales), opacities = PRE-ACTIVATED
+# μ = MU_WATER·silu(raw_opac) [N,1] (brush's in-kernel activation, mirrored
+# on the host here), rotations normalized (w,x,y,z). The CUDA kernels are
+# activation-neutral — the caller activates.
 # ---------------------------------------------------------------------------
 means3D = means.to(DEVICE)
 scales = log_scales.exp().to(DEVICE)
 rotations = torch.nn.functional.normalize(quats, dim=1).to(DEVICE)
-opacities = torch.sigmoid(raw_opac).unsqueeze(-1).to(DEVICE)  # [N,1]
+opacities = torch.sigmoid(raw_opac).unsqueeze(-1).to(DEVICE)  # [N,1] pre-activated μ
 
 voxel_settings = GaussianVoxelizationSettings(
     scale_modifier=1.0,
@@ -80,7 +82,13 @@ quats_g = quats.to(DEVICE).requires_grad_(True)
 raw_opac_g = raw_opac.to(DEVICE).requires_grad_(True)
 scales = log_scales_g.exp()
 rotations = torch.nn.functional.normalize(quats_g, dim=1)
-opacities = torch.sigmoid(raw_opac_g).unsqueeze(-1)
+# R2's CUDA kernel is activation-neutral. brush's voxelizer activates
+# in-kernel: μ = MU_WATER·silu(raw). Reproduce that here by chaining the
+# activation through autograd so the stored grads are dL/draw (raw logits),
+# which the Rust golden test feeds directly.
+MU_WATER = 0.002
+sig = torch.sigmoid(raw_opac_g)
+opacities = (MU_WATER * raw_opac_g * sig).unsqueeze(-1)  # μ = MU_WATER·silu(raw)
 
 fields, radii = voxelizer(means3D, opacities, scales, rotations, None)
 out_vol = fields.detach().cpu()  # [NV_X, NV_Y, NV_Z]
@@ -97,7 +105,7 @@ print("R2 voxel max density:", out_vol.max().item())
 print("R2 voxel sum:", out_vol.sum().item())
 print("R2 grads: means absmax", grad_means.abs().max().item(),
       "| dlog_scales", grad_log_scales.abs().max().item(),
-      "| draw_opac", grad_raw_opac.abs().max().item(),
+      "| draw_opac(dL/draw)", grad_raw_opac.abs().max().item(),
       "| dquats", grad_quats.abs().max().item())
 
 save_file(

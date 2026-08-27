@@ -1,6 +1,9 @@
 //! Golden-reference forward comparison against R2-Gaussian's voxelizer
 //! (CUDA). The reference volume is `fields` `[nVoxel_x, nVoxel_y, nVoxel_z]`
-//! — see `brush-voxel/test_cases/generate_reference.py`.
+//! — see `brush-voxel/test_cases/generate_reference.py`. The R2 CUDA
+//! kernel is activation-neutral; the reference is generated with the
+//! pre-activated density `μ = MU_WATER·silu(raw)` (the brush kernel's
+//! unsigned activation), so this test feeds the **raw logits** directly.
 
 use brush_cube::MainBackendBase;
 use burn::backend::ops::FloatTensorOps;
@@ -59,6 +62,8 @@ async fn matches_r2_voxel_forward() {
         TensorData::new::<f32, _>(transforms_data, [n, 10]),
         &device,
     );
+    // Raw logits — the kernel applies `MU_WATER·silu(raw)` (matching the
+    // reference's pre-activated `μ = MU_WATER·silu(raw)`).
     let raw_opac_ft = MainBackendBase::float_from_data(
         TensorData::new::<f32, _>(raw_opac.clone(), [n]),
         &device,

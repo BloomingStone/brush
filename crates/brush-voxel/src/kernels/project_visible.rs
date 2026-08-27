@@ -5,7 +5,7 @@
 use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::cube;
 use burn_cubecl::cubecl::prelude::*;
-use brush_cube::{Vec3A, sigmoid};
+use brush_cube::{MU_WATER, Vec3A, silu};
 
 use super::helpers::{
     VOXEL_LANES, read_quat, read_scale_mod, read_scale_raw, voxel_geometry,
@@ -37,7 +37,16 @@ pub fn project_visible_voxel_kernel(
 
     let (point_vol, inv_a, inv_b, inv_c, inv_d, inv_e, inv_f, radius, _valid) =
         voxel_geometry(mean, scale, scale_raw, quat, u);
-    let opac = sigmoid(raw_opacities[global_gid as usize]);
+    // Density activation, identical to brush-xray's `signed_opac` flag so
+    // the voxelizer consumes the same raw logits as the rasterizer:
+    //   unsigned: opac = MU_WATER · silu(raw) (≥ 0)
+    //   signed:   opac = MU_WATER · raw (may be negative, FDK residual)
+    let raw = raw_opacities[global_gid as usize];
+    let opac = select(
+        u.signed_opac != 0u32,
+        MU_WATER * raw,
+        MU_WATER * silu(raw),
+    );
 
     let dst = (compact_gid * VOXEL_LANES) as usize;
     projected[dst] = point_vol.x();

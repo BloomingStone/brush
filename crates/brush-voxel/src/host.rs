@@ -25,6 +25,8 @@ pub struct VoxelUniformsHost {
     pub num_visible: u32,
     pub num_intersections: u32,
     pub scale_modifier: f32,
+    /// Signed (FDK-residual) density mode: `opac = MU_WATER·raw`.
+    pub signed_opac: u32,
 }
 
 impl VoxelUniformsHost {
@@ -49,6 +51,7 @@ impl VoxelUniformsHost {
             num_visible: 0,
             num_intersections: 0,
             scale_modifier: settings.scale_modifier,
+            signed_opac: settings.signed_opac as u32,
         }
     }
 
@@ -77,6 +80,7 @@ impl VoxelUniformsHost {
             self.total_splats,
             self.num_visible,
             self.scale_modifier,
+            self.signed_opac,
         )
     }
 }

@@ -1,7 +1,9 @@
 //! DRR backward: scatter the per-pixel projection gradient back along each
 //! ray into the anisotropic volume (trilinear weights, atomic add).
 //!
-//! `proj = scale * ∫ μ dl + bias` → `dL/dμ_voxel = v_proj[x,y] * scale * dt * w`.
+//! `proj = scale * ∫ μ dl + bias` → `dL/dμ_voxel = v_proj[x,y] * scale * |dir| * dt * w`.
+//! Layout: x-major `idx(x,y,z) = x*(vol_y*vol_z) + y*vol_z + z` (z fastest),
+//! matching the forward.
 
 use burn_cubecl::cubecl;
 use burn_cubecl::cubecl::cube;
@@ -34,13 +36,15 @@ pub fn drr_backward_kernel<A: AtomicAddF32>(
     );
     let cam_pos = Vec3A::new(u.cam_x, u.cam_y, u.cam_z);
     let dir = Vec3A::new((x as f32 - u.cx) / u.fx, (y as f32 - u.cy) / u.fy, 1.0);
+    let dir_len = f32::sqrt(dir.x() * dir.x() + dir.y() * dir.y() + 1.0f32);
 
     let t_near = u.sod - u.rx;
     let t_far = u.sod + u.rx;
     let dt = (t_far - t_near) / u.steps as f32;
 
-    let sz = u.vol_x;
-    let sy = u.vol_x * u.vol_z;
+    // x-major: flat(x,y,z) = x·(vy·vz) + y·vz + z.
+    let sx = u.vol_y * u.vol_z; // stride per x
+    let sy = u.vol_z; // stride per y
 
     for s in 0..u.steps {
         let t = t_near + (s as f32 + 0.5) * dt;
@@ -65,18 +69,18 @@ pub fn drr_backward_kernel<A: AtomicAddF32>(
                 let wz0 = 1.0 - tz;
                 let wz1 = tz;
 
-                let base = iy * sy + iz * sz + ix;
-                let val = vp * dt * u.scale;
+                let base = ix * sx + iy * sy + iz;
+                let val = vp * dt * u.scale * dir_len;
 
                 A::add(&v_volume[base as usize], val * wx0 * wy0 * wz0);
-                A::add(&v_volume[(base + 1) as usize], val * wx1 * wy0 * wz0);
-                A::add(&v_volume[(base + sz) as usize], val * wx0 * wy1 * wz0);
-                A::add(&v_volume[(base + sz + 1) as usize], val * wx1 * wy1 * wz0);
-                A::add(&v_volume[(base + sy) as usize], val * wx0 * wy0 * wz1);
-                A::add(&v_volume[(base + sy + 1) as usize], val * wx1 * wy0 * wz1);
-                A::add(&v_volume[(base + sy + sz) as usize], val * wx0 * wy1 * wz1);
+                A::add(&v_volume[(base + sx) as usize], val * wx1 * wy0 * wz0);
+                A::add(&v_volume[(base + sy) as usize], val * wx0 * wy1 * wz0);
+                A::add(&v_volume[(base + sx + sy) as usize], val * wx1 * wy1 * wz0);
+                A::add(&v_volume[(base + 1) as usize], val * wx0 * wy0 * wz1);
+                A::add(&v_volume[(base + sx + 1) as usize], val * wx1 * wy0 * wz1);
+                A::add(&v_volume[(base + sy + 1) as usize], val * wx0 * wy1 * wz1);
                 A::add(
-                    &v_volume[(base + sy + sz + 1) as usize],
+                    &v_volume[(base + sx + sy + 1) as usize],
                     val * wx1 * wy1 * wz1,
                 );
             }

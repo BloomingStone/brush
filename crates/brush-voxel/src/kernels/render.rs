@@ -75,7 +75,11 @@ pub fn render_voxel_kernel(
         if power <= 0.0f32 {
             let g = f32::exp(power);
             let alpha = opa * g;
-            if alpha >= MIN_ALPHA {
+            // |alpha| gate + signed accumulation: in `Preactivated` mode the
+            // density can be negative (e.g. FDK-residual splats), matching
+            // the x-ray rasterizer's `|alpha| >= MIN_ALPHA` gate. In the
+            // default `Sigmoid` mode alpha ≥ 0 so abs is a no-op.
+            if f32::abs(alpha) >= MIN_ALPHA {
                 acc += alpha;
                 // Global isect index one-past-last-contributor (matches the
                 // rasterizer's `n_contrib` semantics).

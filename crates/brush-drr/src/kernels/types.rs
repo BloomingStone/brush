@@ -7,7 +7,8 @@ use burn_cubecl::cubecl::prelude::*;
 /// A `[H,W]` pixel grid, each pixel marches `steps` rays from `sod - r`
 /// to `sod + r` through an **anisotropic** `[vol_x, vol_y, vol_z]` volume
 /// spanning `[-rx, rx] x [-ry, ry] x [-rz, rz]` in world coordinates.
-/// Memory layout `idx(x,y,z) = (y*vol_x*vol_z) + z*vol_x + x` (x fastest).
+/// Memory layout `idx(x,y,z) = x*(vol_y*vol_z) + y*vol_z + z` (x slowest,
+/// z fastest — x-major, matches brush-voxel output / R2 fields).
 #[derive(CubeLaunch, CubeType, Clone, Copy)]
 #[expand(derive(Clone, Copy))]
 pub struct DrrUniforms {
