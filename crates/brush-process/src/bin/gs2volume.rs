@@ -81,6 +81,70 @@ fn write_nrrd_3d(path: &Path, data: &[f32], vol_x: usize, vol_y: usize, vol_z: u
     Ok(())
 }
 
+/// 读 .npy (v1.0, float32, C-order) 返回 flat 数据。
+fn read_npy_f32(path: &Path) -> anyhow::Result<(Vec<f32>, Vec<usize>)> {
+    let bytes = std::fs::read(path)?;
+    assert_eq!(&bytes[..6], b"\x93NUMPY", "not a npy file");
+    let header_len = u16::from_le_bytes([bytes[8], bytes[9]]) as usize;
+    let header = String::from_utf8(bytes[10..10 + header_len].to_vec())?;
+    let shape: Vec<usize> = {
+        let Some(open) = header.find("'shape':") else { return Ok((vec![], vec![])) };
+        let sub = &header[open..];
+        let Some(lb) = sub.find('(') else { return Ok((vec![], vec![])) };
+        let sub = &sub[lb + 1..];
+        let Some(rb) = sub.find(')') else { return Ok((vec![], vec![])) };
+        sub[..rb]
+            .split(',')
+            .map(|x| x.trim().parse::<usize>().unwrap_or(0))
+            .filter(|&x| x > 0)
+            .collect()
+    };
+    let total: usize = shape.iter().product();
+    let data_start = 10 + header_len;
+    let mut out = Vec::with_capacity(total);
+    for i in 0..total {
+        let o = data_start + i * 4;
+        out.push(f32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]));
+    }
+    Ok((out, shape))
+}
+
+/// 在形变场网格 `[nx,ny,nz,3]` (row-major, 坐标 `-ext + 2*ext*i/(n-1)`) 三线性插值。
+fn sample_deform_field(field: &[f32], n: [usize; 3], ext: f32, p: glam::Vec3) -> glam::Vec3 {
+    let [nx, ny, nz] = n;
+    let f = |x: f32, n: usize| -> (f32, usize, usize) {
+        let g = (x + ext) / (2.0 * ext) * (n as f32 - 1.0);
+        let i0 = g.floor().clamp(0.0, (n - 1) as f32) as usize;
+        let i1 = (i0 + 1).min(n - 1);
+        (g - i0 as f32, i0, i1)
+    };
+    let (tx, ix0, ix1) = f(p.x, nx);
+    let (ty, iy0, iy1) = f(p.y, ny);
+    let (tz, iz0, iz1) = f(p.z, nz);
+    let at = |ix: usize, iy: usize, iz: usize, a: usize| -> f32 {
+        field[((ix * ny + iy) * nz + iz) * 3 + a]
+    };
+    let mut d = glam::Vec3::ZERO;
+    for a in 0..3 {
+        let c000 = at(ix0, iy0, iz0, a);
+        let c100 = at(ix1, iy0, iz0, a);
+        let c010 = at(ix0, iy1, iz0, a);
+        let c110 = at(ix1, iy1, iz0, a);
+        let c001 = at(ix0, iy0, iz1, a);
+        let c101 = at(ix1, iy0, iz1, a);
+        let c011 = at(ix0, iy1, iz1, a);
+        let c111 = at(ix1, iy1, iz1, a);
+        let c00 = c000 * (1.0 - tx) + c100 * tx;
+        let c10 = c010 * (1.0 - tx) + c110 * tx;
+        let c01 = c001 * (1.0 - tx) + c101 * tx;
+        let c11 = c011 * (1.0 - tx) + c111 * tx;
+        let c0 = c00 * (1.0 - ty) + c10 * ty;
+        let c1 = c01 * (1.0 - ty) + c11 * ty;
+        d[a] = c0 * (1.0 - tz) + c1 * tz;
+    }
+    d
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -91,6 +155,9 @@ async fn main() -> anyhow::Result<()> {
     let mut out = PathBuf::from("target/gs2volume");
     let mut n_xy = 326usize;
     let mut signed = false;
+    let mut deform_field: Option<PathBuf> = None;
+    let mut deform_extent = 264.0f32;
+    let mut no_fdk = false;
     let mut i = 1;
     while i < args.len() {
         let a = &args[i];
@@ -108,11 +175,17 @@ async fn main() -> anyhow::Result<()> {
             n_xy = v.parse()?;
         } else if a == "--signed" {
             signed = true;
+        } else if let Some(v) = a.strip_prefix("--deform-field=") {
+            deform_field = Some(PathBuf::from(v));
+        } else if let Some(v) = a.strip_prefix("--deform-extent=") {
+            deform_extent = v.parse()?;
+        } else if a == "--no-fdk" {
+            no_fdk = true;
         }
         i += 1;
     }
     let ply = ply.expect("usage: gs2volume --ply=<canonical_final.ply> --fdk=<nii> --fdk-meta=<json> --fdk-calib=<json> --out=<dir>");
-    let fdk_vol = fdk_vol.expect("--fdk required");
+    let fdk_vol = fdk_vol.expect("--fdk required (or --no-fdk)");
     std::fs::create_dir_all(&out)?;
 
     // ---- 后端 + 设备 ----
@@ -134,6 +207,24 @@ async fn main() -> anyhow::Result<()> {
     let log_scales = data.log_scales.unwrap();
     let raw = data.raw_opacities.unwrap();
     println!("loaded {} splats from {ply:?}", n);
+    // 形变场 (phase 0, time 0): canonical → deformed (实际渲染位置)。
+    let mut means = means;
+    if let Some(df) = &deform_field {
+        let (field, shape) = read_npy_f32(df)?;
+        let n3 = [shape[0], shape[1], shape[2]];
+        assert_eq!(shape.len(), 4, "deform field must be [nx,ny,nz,3]");
+        assert_eq!(field.len(), n3[0] * n3[1] * n3[2] * 3, "deform field size");
+        let mut dmax = 0.0f32;
+        for i in 0..n {
+            let p = glam::Vec3::new(means[i * 3], means[i * 3 + 1], means[i * 3 + 2]);
+            let d = sample_deform_field(&field, n3, deform_extent, p);
+            means[i * 3] = p.x + d.x;
+            means[i * 3 + 1] = p.y + d.y;
+            means[i * 3 + 2] = p.z + d.z;
+            dmax = dmax.max(d.length());
+        }
+        println!("applied deform field {df:?} (extent {deform_extent}mm), max |d|={dmax:.2}mm");
+    }
 
     // ---- raw → sigmoid 域 (让 voxelizer 输出 = μ 场) ----
     // voxelizer opac = sigmoid(raw2); 我们想要 opac = μ = MU_WATER·(silu(raw) 或 raw)。
@@ -150,30 +241,39 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ---- FDK 体积 + meta + 转置修正 ----
-    let meta_path = fdk_meta.unwrap_or_else(|| fdk_vol.with_file_name("meta.json"));
-    let calib_path = fdk_calib.unwrap_or_else(|| fdk_vol.with_file_name("calib.json"));
-    let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
-    let rx0 = meta["rx"].as_f64().unwrap_or(118.6) as f32;
-    let rz0 = meta["rz"].as_f64().unwrap_or(84.7) as f32;
-    let (mut fdk_vec, _hx, _hy, _hz) = read_nifti_volume(&fdk_vol)?;
-    let fdk_x = meta["vol_x"].as_u64().unwrap_or(_hx as u64) as usize;
-    let fdk_y = meta["vol_y"].as_u64().unwrap_or(_hy as u64) as usize;
-    let fdk_z = meta["vol_z"].as_u64().unwrap_or(_hz as u64) as usize;
-    assert_eq!(fdk_vec.len(), fdk_x * fdk_y * fdk_z, "FDK size mismatch");
-    // nifti data.t() 转置修正 (x<->y)。
-    let sy = fdk_x * fdk_z;
-    let sz = fdk_x;
-    let mut out_v = vec![0.0f32; fdk_vec.len()];
-    for iy in 0..fdk_y {
-        for iz in 0..fdk_z {
-            for ix in 0..fdk_x {
-                let src = iy * sy + iz * sz + ix;
-                let dst = ix * sy + iz * sz + iy;
-                out_v[dst] = fdk_vec[src];
+    // FDK 体积 + meta + 转置修正 (--no-fdk 时跳过, 输出纯 GS 体积)。
+    let mut rx0 = 118.6f32;
+    let mut rz0 = 84.7f32;
+    let mut fdk_x = 256usize;
+    let mut fdk_y = 256usize;
+    let mut fdk_z = 183usize;
+    let mut fdk_vec: Vec<f32> = Vec::new();
+    if !no_fdk {
+        let meta_path = fdk_meta.unwrap_or_else(|| fdk_vol.with_file_name("meta.json"));
+        let _calib_path = fdk_calib.unwrap_or_else(|| fdk_vol.with_file_name("calib.json"));
+        let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
+        rx0 = meta["rx"].as_f64().unwrap_or(118.6) as f32;
+        rz0 = meta["rz"].as_f64().unwrap_or(84.7) as f32;
+        let (mut fdk_vec0, _hx, _hy, _hz) = read_nifti_volume(&fdk_vol)?;
+        fdk_x = meta["vol_x"].as_u64().unwrap_or(_hx as u64) as usize;
+        fdk_y = meta["vol_y"].as_u64().unwrap_or(_hy as u64) as usize;
+        fdk_z = meta["vol_z"].as_u64().unwrap_or(_hz as u64) as usize;
+        assert_eq!(fdk_vec0.len(), fdk_x * fdk_y * fdk_z, "FDK size mismatch");
+        // nifti data.t() 转置修正 (x<->y)。
+        let sy = fdk_x * fdk_z;
+        let sz = fdk_x;
+        let mut out_v = vec![0.0f32; fdk_vec0.len()];
+        for iy in 0..fdk_y {
+            for iz in 0..fdk_z {
+                for ix in 0..fdk_x {
+                    let src = iy * sy + iz * sz + ix;
+                    let dst = ix * sy + iz * sz + iy;
+                    out_v[dst] = fdk_vec0[src];
+                }
             }
         }
+        fdk_vec = out_v;
     }
-    fdk_vec = out_v;
 
     // ---- GS 体素化 (网格 = FDK XY padding 到 n_xy, spacing 保持) ----
     let vox_mm = 2.0 * rx0 / fdk_x as f32; // 0.927mm
@@ -204,16 +304,18 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // ---- FDK 居中 padding 到 n_xy (XY), 公共布局 [y][z][x] ----
+    // ---- FDK 居中 padding 到 n_xy (XY), 公共布局 [y][z][x]; no-fdk 全 0 ----
     let ox = (n_xy - fdk_x) / 2;
     let oy = (n_xy - fdk_y) / 2;
     let mut fdk_pad = vec![0.0f32; n_xy * n_xy * n_z];
-    for iy in 0..fdk_y {
-        for iz in 0..fdk_z {
-            for ix in 0..fdk_x {
-                let src = iy * fdk_x * fdk_z + iz * fdk_x + ix;
-                let dst = (iy + oy) * n_xy * n_z + iz * n_xy + (ix + ox);
-                fdk_pad[dst] = fdk_vec[src];
+    if !no_fdk {
+        for iy in 0..fdk_y {
+            for iz in 0..fdk_z {
+                for ix in 0..fdk_x {
+                    let src = iy * fdk_x * fdk_z + iz * fdk_x + ix;
+                    let dst = (iy + oy) * n_xy * n_z + iz * n_xy + (ix + ox);
+                    fdk_pad[dst] = fdk_vec[src];
+                }
             }
         }
     }
