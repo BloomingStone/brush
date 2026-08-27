@@ -281,6 +281,9 @@ async fn main() -> anyhow::Result<()> {
     let mut fdk_calib: Option<PathBuf> = None;
     let mut fdk_steps = 256u32;
     let mut fdk_residual_init_density = 1e-5f32;
+    // nifti-rs 读写有 data.t() 转置: FDK 体积从 nii.gz 读回后 x<->y 被交换,
+    // DRR 渲染出来是转置的镜像。--fdk-transpose 在加载时转置修正。
+    let mut fdk_transpose = false;
     // screen-size prune 阈值 (px, 0 = 关闭)。
     let mut max_screen_size: Option<f32> = None;
     // 贡献裁剪 (默认关): 剪掉 density×屏幕面积×可见性 都低且处于最低百分位
@@ -454,6 +457,8 @@ async fn main() -> anyhow::Result<()> {
             fdk_steps = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--fdk-resid-init-density=") {
             fdk_residual_init_density = v.parse()?;
+        } else if a == "--fdk-transpose" {
+            fdk_transpose = true;
         } else if let Some(v) = a.strip_prefix("--max-screen-size=") {
             max_screen_size = Some(v.parse()?);
         } else if a == "--cull-contribution" {
@@ -780,7 +785,7 @@ async fn main() -> anyhow::Result<()> {
             vol_path.with_file_name("calib.json")
         });
         use brush_train::fdk_prior::FdkPrior;
-        let (vol_vec, _vx, _vy, _vz) = read_nifti_volume(&vol_path)?;
+        let (mut vol_vec, _vx, _vy, _vz) = read_nifti_volume(&vol_path)?;
         let meta: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
         let rx = meta["rx"].as_f64().unwrap_or(118.6) as f32;
@@ -790,6 +795,23 @@ async fn main() -> anyhow::Result<()> {
         let vol_y = meta["vol_y"].as_u64().unwrap_or(_vy as u64) as usize;
         let vol_z = meta["vol_z"].as_u64().unwrap_or(_vz as u64) as usize;
         assert_eq!(vol_vec.len(), vol_x * vol_y * vol_z, "FDK volume size mismatch");
+        // nifti-rs data.t() 转置修正: 读取回的体积 x<->y 交换 (世界系转置)。
+        if fdk_transpose {
+            let sy = vol_x * vol_z;
+            let sz = vol_x;
+            let mut out = vec![0.0f32; vol_vec.len()];
+            for iy in 0..vol_y {
+                for iz in 0..vol_z {
+                    for ix in 0..vol_x {
+                        let src = iy * sy + iz * sz + ix;
+                        let dst = ix * sy + iz * sz + iy;
+                        out[dst] = vol_vec[src];
+                    }
+                }
+            }
+            vol_vec = out;
+            println!("{} FDK volume transposed in xy (nifti data.t() fix)", ts());
+        }
         let calib: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&calib_path)?)?;
         let scale = calib["s"].as_f64().unwrap_or(1.0) as f32;
