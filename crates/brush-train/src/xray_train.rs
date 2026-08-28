@@ -1100,7 +1100,9 @@ impl XRayTrainer {
         // 超过 refine_until_frac 后不再有任何结构变更 (clone/split/prune),
         // 直接跳过 —— 最后一步 refine 与导出重合时剪枝会改变 splat 状态,
         // 使导出 bin/ply 偏离训练 eval。此处冻结保证最后 eval 与导出一致。
-        let progress = iter as f32 / self.config.refine.total_iters.max(1) as f32;
+        // 用 trainer 级 total_iters (config.refine.total_iters 是未同步的
+        // 默认值, 与 refiner 内部实际 total_iters 不一致)。
+        let progress = iter as f32 / self.config.total_iters.max(1) as f32;
         if progress >= self.config.refine.refine_until_frac {
             return None;
         }

@@ -1,0 +1,67 @@
+# 260828-1316 rxa-static-refinefix / 5000p-10k
+
+## 目的
+验证 refine_until_frac 修复: 最后一步 refine 不再无条件剪枝, 导出的
+bin/ply 与训练最后 eval 应一致 (消除 +0.05 proj 均匀雾)。
+
+## 命令
+```bash
+env -u DISPLAY CUBECL_WGPU_DEFAULT_DEVICE='DiscreteGpu(1)' \
+  ./target/release/fit_static images/RXA_chest.dcm --points=5000 \
+  --refine-every=400 --eval-split-every=5 --eval-views=8 --eval-every=1000 \
+  --cull-density=0.001 --iters=10000 --dump-bin-every-eval \
+  --out=experiments/output/260828-1316_rxa-static-refinefix/5000p-10k/
+```
+
+## 结果 / 根因定位 (00:47)
+
+### 确认的事实 (现有 bin + 导出时 forward 重渲)
+- forward vs backward(autodiff) 渲染同一 .bin: max diff 2.4e-7 (逐位一致) → **渲染函数等价**
+- 训练 eval pred vs 导出 .bin forward: AVG PSNR 34.68 vs 23.95, Δ=10.7 dB; 各 view corr 0.80-0.93, mean(pg-pp)≈+0.03~0.05 **均匀雾** (非边缘错位)
+- `refine_until_frac=0.9` 生效: 最后 refine 8800 (0.88<0.9), 9200/9600/10000 冻结, 导出 = eval = 14280 splat → **最后一步剪枝不是根因**
+- 同一 canonical (14280 splat), 同相机, 同 GT:
+  - 训练 eval_view (autodiff, lift 后渲染): PSNR(pred,GT)=34.52
+  - 导出时 render_xray_forward 重渲: PSNR(FWD,GT)=23.23, max|FWD-pred|=0.33 (均匀雾)
+- gs2volume forward(.bin) = 导出 forward(canonical) = 23 (一致); .bin == canonical (into_data 忠实)
+
+### 结论
+导出参数 (.bin/.ply) 在 **forward 路径** 渲染时带 ~+0.05 proj 均匀雾 (23 dB);
+训练 **eval_view 的 autodiff/lift 原位渲染** 少了这段密度 (34.5 dB)。两者对同一
+canonical 不一致 → 10.7 dB 差距。
+
+tty 已排除: pass(Forward==Backward 逐位一致), backend(Autodiff<Wgpu>), 相机/GT(逐像素一致),
+splat 数(相同 14280), .bin==canonical, lift(value-preserving from_inner)。
+
+**尚存机制**: 训练循环内的 eval 渲染读到未完全同步/materialize 的 canonical 张量
+(异步提交未 sync → 读到上一步的密度; 导出时 into_data/forward 强制 sync → 读到当前完整密度)。
+需要: 让训练 eval 在渲染前同步/materialize canonical, 使其与导出一致。
+
+### 未决
+- 到底是 eval(autodiff) 少读密度(模型真带雾, 训练指标 34.5 虚高) 还是 forward 多读密度
+  (导出参数带假雾)。需在训练循环内强制 sync 后对比 eval vs 导出, 或对已知单 splat 做
+  forward/backward 逐像素差分对照。
+
+## 根因定论 (异步写未 flush → eval 读到陈旧 canonical)
+- canonical_10000 (in-loop eval 时 dump) 与 canonical_final (导出) **逐字节一致 (diff=0)** —
+  canonical 在 eval 与导出时数值其实相同。
+- 但同一 canonical:
+  - 训练 eval (无论 lift+bwd 还是 forward) → PSNR ~34.5 (inflated)
+  - 导出时 forward 重渲 / gs2volume forward → PSNR ~23 (+0.05 proj 均匀雾)
+- 二者 render_xray_forward 逐位等价、同后端(Wgpu)、同相机、同 GT、同字节 → 唯一差异是
+  **渲染时刻**: in-loop eval 在优化器步的 Wgpu 异步写**尚未 flush** 时读 canonical 的
+  `.primitive`, 读到**上一层的陈旧/偏轻密度** (34.5); 导出时 (队列已排空/into_data 强制同步)
+  读到**当前完整密度** (23, 真带 +0.05 fog)。
+- 即 **模型真实渲染 (forward, 导出/gs2volume/voxelizer/DRR 一致) 带 +0.05 proj 雾 (~23dB)**;
+  训练 eval/loss 因读到陈旧 canonical 而**低估该雾, 指标虚高 (34.5)**。故导出参数与
+  训练 eval 之间 10.7 dB 的"雾"差异是 **训练循环异步写未 flush 的读数问题**, 非 voxelizer/DRR bug。
+
+### 对 voxelizer/DRR 验证的意义
+导出参数在 forward 路径 (gs2volume/voxelizer/DRR) 全部一致 (GS≈DRR), pipeline 本身正确。
+gt_pred 的 pred 列由训练 eval 渲染 (陈旧读 → 34.5), 与 compare 的 forward GS (23) 不同，
+是训练读数问题, 不是 pipeline 不一致。
+
+### 建议修复 (需后端同步)
+- 在 step() 更新 canonical 后、进入 eval/下一步前, 强制同步/物化 canonical
+  (flush Wgpu 队列), 使 loss 与 eval 读到当前 (含雾) 值 → 训练才会对雾施加梯度并消除之。
+- burn/wgpu 无直接 `Device::sync()`; 需通过 readback 或 backend API 实现, 属后端修改。
+- 规避方案: 训练指标用导出参数经 gs2volume forward 重渲 (已一致), 不依赖 in-loop eval。

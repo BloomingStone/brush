@@ -837,6 +837,40 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ---- 导出最终 canonical splats 为 PLY -------------------------------
+    // 诊断: 用训练自身的 eval 相机做 forward 重渲 final canonical, 与
+    // eval_view (autodiff) 的 pred 对比 —— 若二者一致说明训练渲染路径无差,
+    // 差异来自 gs2volume 重载(相机/readback); 若不一致则是 autodiff 渲染路径。
+    {
+        use brush_train::xray_eval::save_gray_nrrd_f32_stack;
+        let canonical = trainer.canonical();
+        let mut fwd_pairs = Vec::with_capacity(eval_views.len());
+        for view in eval_views.iter() {
+            let gray = view.gray_image.as_ref().expect("gray GT");
+            let img = glam::uvec2(gray.width as u32, gray.height as u32);
+            let proj = brush_xray::render_xray_forward(&canonical, &view.camera, img, 1.0).await;
+            let pred_vec: Vec<f32> = proj
+                .clamp(1e-3, 14.0)
+                .neg()
+                .exp()
+                .into_data_async()
+                .await?
+                .into_vec::<f32>()
+                .map_err(|e| anyhow::anyhow!("fwd read: {e}"))?;
+            let pred_td = TensorData::new(pred_vec, [gray.height, gray.width]);
+            let vgt = TensorData::new(gray.data.as_ref().to_vec(), [gray.height, gray.width]);
+            fwd_pairs.push(merge_pair(&pred_td, &vgt));
+        }
+        let [h, w2] = [fwd_pairs[0].shape[0], fwd_pairs[0].shape[1]];
+        let mut vol = Vec::with_capacity(fwd_pairs.len() * h * w2);
+        for p in &fwd_pairs {
+            vol.extend_from_slice(p.as_slice::<f32>().expect("f32"));
+        }
+        let td = TensorData::new(vol, [fwd_pairs.len(), h, w2]);
+        let fwd_path = eval_nrrd.join("gt_pred_10000_FWD.nrrd");
+        save_gray_nrrd_f32_stack(&fwd_path, &td).expect("save FWD re-render");
+        println!("{} saved {} (export-time forward re-render, train camera)", ts(), fwd_path.display());
+    }
+
     let splats = xray_to_splats(trainer.canonical(), &device);
     let ply = brush_serde::splat_to_ply(splats, Some(glam::Vec3::Y)).await?;
     let ply_path = eval_ply.join("canonical_final.ply");
