@@ -226,6 +226,10 @@ struct FitDeformArgs {
     /// 硬性 splat 数上限 (到顶后只 prune 不再增)。
     #[arg(long, value_name = "N", default_value_t = 300_000, help_heading = "密度控制 / refine")]
     max_splats: u32,
+    /// refine (clone/split/prune) 截止比例: 超过 total_iters·frac 后完全
+    /// 停止结构变更, 保证最后 eval 与导出的 bin/ply 状态一致。
+    #[arg(long, value_name = "FRAC", default_value_t = 0.9, help_heading = "密度控制 / refine")]
+    refine_until_frac: f32,
     /// 固定 densify 梯度阈值 (缺省 5e-6; 与 dyn-grad-percentile 二选一)。
     #[arg(long, value_name = "F", help_heading = "密度控制 / refine")]
     fixed_grad_thr: Option<f32>,
@@ -821,6 +825,7 @@ async fn main() -> anyhow::Result<()> {
         cull_contribution_percentile: cull_percentile,
         cull_contribution_floor: cull_floor,
         min_splats,
+        refine_until_frac: args.refine_until_frac,
         ..XRayRefineConfig::default()
     };
     // 相机几何: R0 = half_w (W/2 世界), half_h, sod。

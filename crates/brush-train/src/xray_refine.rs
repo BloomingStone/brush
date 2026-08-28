@@ -46,12 +46,15 @@ pub enum XRayRefineGradThreshold {
 pub struct XRayRefineConfig {
     /// How often (in steps) `refine` should be invoked.
     pub refine_every: u32,
-    /// Total training steps (used for `densify_until_frac`).
+    /// Total training steps (used for `refine_until_frac`).
     pub total_iters: u32,
     /// Do not densify before this step.
     pub densify_from_iter: u32,
-    /// Stop densifying after `densify_until_frac * total_iters`.
-    pub densify_until_frac: f32,
+    /// Stop ALL structural refine operations (clone/split/prune) after
+    /// `refine_until_frac * total_iters`. The final `total_iters` step and the
+    /// export then see the identical splat state (no last-step prune that
+    /// would make the exported bin/ply differ from the training eval).
+    pub refine_until_frac: f32,
     /// Fixed or dynamic (recent-5 max percentile) grad threshold.
     pub grad_threshold: XRayRefineGradThreshold,
     /// Prune splats whose density is below this.
@@ -119,7 +122,7 @@ impl Default for XRayRefineConfig {
             refine_every: 300,
             total_iters: 30_000,
             densify_from_iter: 500,
-            densify_until_frac: 0.8,
+            refine_until_frac: 0.9,
             grad_threshold: XRayRefineGradThreshold::Dynamic(0.98),
             // Activated density = MU_WATER·softplus(raw) ≈ 0.002 mm⁻¹ at
             // water level. 5e-5 ≈ 2.5% of water — prune splats that have
@@ -299,12 +302,37 @@ impl XRayRefiner {
     ) -> (XRaySplats, XRayRefineUpdate, XRayRefineStats) {
         let device = splats.device();
         let progress = iter as f32 / self.config.total_iters.max(1) as f32;
+
+        // 超过 `refine_until_frac * total_iters` 后完全停止结构变更
+        // (clone/split/prune): 最后一步 refine 与导出重合时, 剪枝会改变
+        // splat 状态, 使导出的 bin/ply 偏离训练 eval (实测 +0.05 proj 雾)。
+        // 此处冻结, 保证最后 eval 与导出看到同一状态。
+        if progress >= self.config.refine_until_frac {
+            let n = splats.num_splats() as usize;
+            let keep_mask = Tensor::<1, Bool>::ones([n], &device);
+            let empty_i = Tensor::<1, Int>::from_data(TensorData::new(Vec::<i32>::new(), [0]), &device);
+            let update = XRayRefineUpdate {
+                keep_mask,
+                densify_inds: empty_i.clone(),
+                split_inds: empty_i,
+            };
+            let stats = XRayRefineStats {
+                total_splats: splats.num_splats(),
+                num_added: 0,
+                num_split: 0,
+                num_pruned: 0,
+                grad_threshold: None,
+                density_reset: false,
+            };
+            return (splats, update, stats);
+        }
+
         // Reset 步跳过 densify (对齐参考项目 `%reset>=interval` 规避):
         // reset 与 densify 同时发生时, 刚 densify 的新点会被 reset 立即压帽。
         let reset_step = self.config.density_reset_interval > 0
             && iter.is_multiple_of(self.config.density_reset_interval);
         let densifying = iter >= self.config.densify_from_iter
-            && progress < self.config.densify_until_frac
+            && progress < self.config.refine_until_frac
             && splats.num_splats() < self.config.max_splats
             && !reset_step;
 
@@ -720,7 +748,7 @@ mod tests {
         let config = XRayRefineConfig {
             total_iters: 1000,
             densify_from_iter: 0,
-            densify_until_frac: 1.0,
+            refine_until_frac: 1.0,
             // All splats carry grad 10.0 — a Dynamic(0.5) percentile would
             // set threshold = 10.0 and `grad > threshold` selects nothing
             // (strictly greater). A zero fixed threshold keeps the test's
@@ -764,7 +792,7 @@ mod tests {
         let config = XRayRefineConfig {
             total_iters: 1000,
             densify_from_iter: 10_000, // never reached
-            densify_until_frac: 1.0,
+            refine_until_frac: 1.0,
             ..Default::default()
         };
 

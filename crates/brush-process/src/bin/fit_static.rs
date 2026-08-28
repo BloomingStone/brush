@@ -116,6 +116,10 @@ struct FitStaticArgs {
     /// 硬性 splat 数上限 (到顶后只 prune 不再增)。
     #[arg(long, value_name = "N", default_value_t = 300_000, help_heading = "密度控制 / refine")]
     max_splats: u32,
+    /// refine (clone/split/prune) 截止比例: 超过 total_iters·frac 后完全
+    /// 停止结构变更, 保证最后 eval 与导出的 bin/ply 状态一致。
+    #[arg(long, value_name = "FRAC", default_value_t = 0.9, help_heading = "密度控制 / refine")]
+    refine_until_frac: f32,
     /// densify 梯度百分位 (0~1, 缺省 0.98; None = 固定阈值)。
     #[arg(long, value_name = "PCT", help_heading = "密度控制 / refine")]
     dyn_grad_percentile: Option<f32>,
@@ -204,6 +208,10 @@ struct FitStaticArgs {
     /// 每次 eval 采 M 个验证视图 (均匀)。
     #[arg(long, value_name = "M", default_value_t = 8, help_heading = "评估与输出")]
     eval_views: usize,
+    /// 每个 eval 步额外 dump canonical .bin (eval/bin/canonical_{step}),
+    /// 用于逐步对比"训练 pred vs 该步导出的 .bin 渲染"是否一致。
+    #[arg(long, help_heading = "评估与输出")]
+    dump_bin_every_eval: bool,
     /// 指标 CSV: 默认 <out>/metrics.csv, "off" 关闭。
     #[arg(long, value_name = "FILE", help_heading = "评估与输出")]
     log_csv: Option<PathBuf>,
@@ -222,6 +230,43 @@ fn xray_to_splats(canonical: &XRaySplats, device: &burn::tensor::Device) -> Spla
     let opac = canonical.raw_opacities.val();
     let sh = burn::tensor::Tensor::<3>::zeros([n, 1, 3], device);
     Splats::from_tensor_data(means, rots, log_scales, sh, opac, SplatRenderMode::Default)
+}
+
+/// 将 canonical 的原始参数 (transforms [N,10] + raw_opac [N]) 无损写成
+/// `<prefix>_transforms.bin` / `<prefix>_raw.bin` (raw 域 f32)。
+async fn write_canonical_bin(canonical: &XRaySplats, prefix: &Path) -> anyhow::Result<()> {
+    let t_data: Vec<f32> = canonical
+        .transforms
+        .val()
+        .into_data_async()
+        .await?
+        .into_vec::<f32>()
+        .map_err(|e| anyhow::anyhow!("transforms read: {e}"))?;
+    let o_data: Vec<f32> = canonical
+        .raw_opacities
+        .val()
+        .into_data_async()
+        .await?
+        .into_vec::<f32>()
+        .map_err(|e| anyhow::anyhow!("raw read: {e}"))?;
+    let mut tb = Vec::with_capacity(t_data.len() * 4);
+    for v in &t_data {
+        tb.extend_from_slice(&v.to_le_bytes());
+    }
+    let mut ob = Vec::with_capacity(o_data.len() * 4);
+    for v in &o_data {
+        ob.extend_from_slice(&v.to_le_bytes());
+    }
+    let stem = prefix
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "canonical".to_owned());
+    std::fs::write(
+        prefix.with_file_name(format!("{stem}_transforms.bin")),
+        tb,
+    )?;
+    std::fs::write(prefix.with_file_name(format!("{stem}_raw.bin")), ob)?;
+    Ok(())
 }
 
 /// Sample up to `count` views, spread evenly across the sequence (for eval on
@@ -352,6 +397,7 @@ async fn main() -> anyhow::Result<()> {
     let growth_frac = args.growth_frac;
     let refine_every = args.refine_every;
     let max_splats = args.max_splats;
+    let refine_until_frac = args.refine_until_frac;
     // 动态梯度阈值
     let xray_refine_thr = if let Some(pct) = args.dyn_grad_percentile {
         if pct <= 0.0 || pct >= 1.0 {
@@ -388,6 +434,7 @@ async fn main() -> anyhow::Result<()> {
     let eval_every = args.eval_every;
     let eval_split_every = args.eval_split_every;
     let eval_views_count = args.eval_views;
+    let dump_bin_every_eval = args.dump_bin_every_eval;
     let out = args.out.clone();
     let log_csv = args.log_csv.clone();
 
@@ -552,6 +599,7 @@ async fn main() -> anyhow::Result<()> {
         cull_contribution_percentile: cull_percentile,
         cull_contribution_floor: cull_floor,
         min_splats,
+        refine_until_frac,
         ..XRayRefineConfig::default()
     };
     // 相机几何: R0 = half_w (W/2 世界), half_h, sod。
@@ -726,6 +774,15 @@ async fn main() -> anyhow::Result<()> {
                 pairs.push(merge_pair(&sample.pred, &sample.gt));
             }
             save_stack(&eval_nrrd, step, &pairs);
+            if dump_bin_every_eval {
+                let prefix = eval_bin.join(format!("canonical_{step:05}"));
+                write_canonical_bin(&trainer.canonical(), &prefix).await?;
+                println!(
+                    "{} dumped {} (transforms+raw) at eval step",
+                    ts(),
+                    prefix.display()
+                );
+            }
             avg_psnr /= eval_views.len().max(1) as f32;
             avg_ssim /= eval_views.len().max(1) as f32;
             avg_lpips /= eval_views.len().max(1) as f32;
@@ -790,32 +847,8 @@ async fn main() -> anyhow::Result<()> {
     // transforms [N,10] (means+quats+log_scales) + raw_opac [N], 均为 raw
     // 域 f32; 供 gs2volume --bin= 直接消费, 与 PLY 结果三方对比。
     {
-        use burn::tensor::TensorData;
-        let c = trainer.canonical();
-        let t_data: Vec<f32> = c
-            .transforms
-            .val()
-            .into_data_async()
-            .await?
-            .into_vec::<f32>()
-            .map_err(|e| anyhow::anyhow!("transforms read: {e}"))?;
-        let o_data: Vec<f32> = c
-            .raw_opacities
-            .val()
-            .into_data_async()
-            .await?
-            .into_vec::<f32>()
-            .map_err(|e| anyhow::anyhow!("raw read: {e}"))?;
-        let mut tb = Vec::with_capacity(t_data.len() * 4);
-        for v in &t_data {
-            tb.extend_from_slice(&v.to_le_bytes());
-        }
-        let mut ob = Vec::with_capacity(o_data.len() * 4);
-        for v in &o_data {
-            ob.extend_from_slice(&v.to_le_bytes());
-        }
-        std::fs::write(eval_bin.join("canonical_final_transforms.bin"), tb)?;
-        std::fs::write(eval_bin.join("canonical_final_raw.bin"), ob)?;
+        let prefix = eval_bin.join("canonical_final");
+        write_canonical_bin(&trainer.canonical(), &prefix).await?;
         println!("{} exported {} (transforms+raw, 无激活往返)", ts(), out.display());
     }
 
