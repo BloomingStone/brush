@@ -116,3 +116,35 @@ cubecl/burn 的 buffer 生命周期 × 渲染 pipeline 交互层, 保持 descrip
 binding / watchpoint 定位写方) 或 cubecl 上游修复 (如内核绑定持 buffer
 强引用直到执行 / slice 复用尊重 pending 内核)。当前评估口径: 训练指标
 不可靠, 以导出 forward 重渲 (gt_pred_10000_FWD / gs2volume) 为准。
+
+## 2026-08-29 根因最终定位 (纠正之前"buffer 覆盖"结论)
+
+### 决定性证据 (同一时刻, 同一 canonical, stream 均=0)
+- `self.canonical.transforms.val()` 的 FusionTensor id = **1950417**, 内容
+  first3 = [57.79, -147.7, -101.9] (当前 canonical, 正确)。
+- render_xray 内部 `transforms_inner.id` = **1949720 / 1950703** (eval 各视图),
+  内容 first3 = [50.1, ...] (陈旧 = **上一 step 的 canonical**)。
+- raw Forward == raw Backward (逐位一致), Fusion Backward(直连) == forward
+  (正确 0.76 proj)。**唯一偏少的是 autodiff `render_xray`(lift 路径)**。
+- eval(autodiff) mean proj ≈0.73 vs forward ≈0.76; PSNR 31 vs 21。
+
+### 真正根因 (不是内存池 buffer 覆盖)
+- **lift (`lift_xray_splats_to_autodiff`) 读到了陈旧的 canonical 张量**
+  (上一 step 的 FusionTensor, 不同 id + 不同内容)。
+- 机制: `Param::val()` → `FusionTensor::clone` 在**跨 stream** 时走
+  `shared_view`(新 id), 而 shared_view 解析到的是**未落地的陈旧 buffer**。
+  训练循环 (optimizer 更新后 pending op 未 flush) 中触发; eval/loss 的 render
+  因此读到 pre-update 密度 → **低估雾 → 持续加密度 → 雾累积**。
+- 导出/gs2volume 的 forward 渲染 (无 lift/shared_view) 读到当前密度, 故带雾
+  (~23 dB); 训练 eval/loss (lift 陈旧读) 不带雾 (~31 dB, 虚高)。
+
+### 尝试过的修复 (均无效, 已回退)
+- lift 用 `val()` 代替 `consume()`; lift 改 `&XRaySplats` 免 clone: 无效。
+- step() 末尾 `resolve_tensor_float` 强制物化 canonical: 无效。
+- `#[tokio::main(flavor="current_thread")]` 单线程: 无效 (fusion 内部还有
+  server 线程, StreamId 仍跨线程)。
+
+### 结论
+- 需要 burn-fusion 层修复 `shared_view` / `StreamId` 跨线程解析 (或让 lift
+  不走 shared_view)。应用层 (val/consume/物化/单线程) 均无法阻止陈旧读。
+- 过渡口径: 训练指标以导出 forward 重渲 (gt_pred_10000_FWD / gs2volume) 为准。
