@@ -188,6 +188,9 @@ async fn main() -> anyhow::Result<()> {
     let mut compare_drr = false;
     // --eval-split-every=N: 与训练一致的 held-out 视图选择 (否则用 train 视图)。
     let mut eval_split: Option<usize> = None;
+    // --xray-path=bwd: GS 列用训练完全相同的 autodiff 渲染路径
+    // (brush_xray_bwd::render_xray, Backward pass) 而非 Forward。
+    let mut xray_path_bwd = false;
     let mut dump_isects = false;
     // --bin=<prefix>: 直接从 fit_static 导出的原始参数 .bin 加载
     // (<prefix>_transforms.bin [N,10] f32 + <prefix>_raw.bin [N] f32, raw 域,
@@ -224,6 +227,8 @@ async fn main() -> anyhow::Result<()> {
             voxel_mm = v.parse()?;
         } else if let Some(v) = a.strip_prefix("--eval-split-every=") {
             eval_split = Some(v.parse()?);
+        } else if a == "--xray-path=bwd" {
+            xray_path_bwd = true;
         } else if a == "--compare-drr" {
             compare_drr = true;
         } else if a == "--dump-isects" {
@@ -491,7 +496,7 @@ async fn main() -> anyhow::Result<()> {
         "voxelize GS: grid {n_xy}x{n_xy}x{n_z}, world {:.1}x{:.1}x{:.1}mm, signed={signed} (kernel MU_WATER·silu/raw)",
         2.0 * rx, 2.0 * rx, 2.0 * rz
     );
-    let splats = XRaySplats::from_raw(means, rots, log_scales, raw, &device);
+    let splats = XRaySplats::from_raw(means.clone(), rots.clone(), log_scales.clone(), raw.clone(), &device);
     let v_vol = if dump_isects {
         // 诊断: 直连 raw pipeline, 落盘中间数组 (cube_offsets / isect / projected)。
         use brush_voxel::{VoxelOps, VoxelPass};
@@ -596,9 +601,12 @@ async fn main() -> anyhow::Result<()> {
         total.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
 
     // ---- DRR vs GS 直接投影对比 (--compare-drr, 需 --ref-dcm) ----
+    // 产物写入 <out>/eval/nrrd (与 fit_static 的验证产物同目录约定)。
     // 对均匀抽样的视图: GS xray 直接渲染 vs 体积 DRR 渲染 (两者都是
     // proj = ∫μ dl 域), 输出 GT|exp(-gs)|exp(-drr) NRRD stack + 指标。
     if compare_drr {
+        let cmp_dir = out.join("eval/nrrd");
+        std::fs::create_dir_all(&cmp_dir)?;
         let dcm_path = ref_dcm.as_ref().expect("--compare-drr requires --ref-dcm=<dcm>");
         use brush_vfs::BrushVfs;
         use std::sync::Arc;
@@ -667,8 +675,21 @@ async fn main() -> anyhow::Result<()> {
             let img = glam::uvec2(w as u32, h as u32);
             let cam = view.camera;
             // GS 直接渲染 (raw logits, unsigned 内核激活)。
-            let gs_proj = render_xray_forward(&splats, &cam, img, 1.0).await;
-            let gs_v: Vec<f32> = gs_proj
+            let gs_proj = if xray_path_bwd {
+                // 训练完全相同的渲染路径 (autodiff + Backward pass)。
+                let device_ad = device.clone().autodiff();
+                let splats_ad = XRaySplats::from_raw(
+                    means.clone(),
+                    rots.clone(),
+                    log_scales.clone(),
+                    raw.clone(),
+                    &device_ad,
+                );
+                let out = brush_xray_bwd::render_xray(splats_ad, &cam, img, 1.0, false).await;
+                out.img
+            } else {
+                render_xray_forward(&splats, &cam, img, 1.0).await
+            };            let gs_v: Vec<f32> = gs_proj
                 .to_data_async()
                 .await
                 .expect("gs proj readback")
@@ -778,9 +799,9 @@ async fn main() -> anyhow::Result<()> {
             let mut f = Vec::with_capacity(header.len() + payload.len());
             f.extend_from_slice(header.as_bytes());
             f.append(&mut payload);
-            std::fs::write(out.join("compare_drr_vs_gs.nrrd"), f)?;
+            std::fs::write(cmp_dir.join("compare_drr_vs_gs.nrrd"), f)?;
         }
-        std::fs::write(out.join("compare_drr_vs_gs.csv"), metrics.join("\n"))?;
+        std::fs::write(cmp_dir.join("compare_drr_vs_gs.csv"), metrics.join("\n"))?;
         // Raw proj 转储 (诊断): gs_proj / drr_proj 每视图 [H,W]。
         for (tag, stack) in [("gs_proj", &stack_gs_proj), ("drr_proj", &stack_drr_proj)] {
             let mut payload = Vec::with_capacity(stack.len() * h0 * w0 * 4);
@@ -797,7 +818,7 @@ async fn main() -> anyhow::Result<()> {
             let mut f = Vec::with_capacity(header.len() + payload.len());
             f.extend_from_slice(header.as_bytes());
             f.append(&mut payload);
-            std::fs::write(out.join(format!("compare_{tag}.nrrd")), f)?;
+            std::fs::write(cmp_dir.join(format!("compare_{tag}.nrrd")), f)?;
         }
         println!("saved -> {out:?}/compare_drr_vs_gs.nrrd (GT|GS|DRR) + .csv + raw proj");
     }

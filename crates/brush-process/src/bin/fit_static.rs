@@ -609,6 +609,13 @@ async fn main() -> anyhow::Result<()> {
     println!("{} eval on {} views every {} steps", ts(), eval_views.len(), eval_every);
 
     std::fs::create_dir_all(&out)?;
+    // 验证产物分目录: eval/nrrd (投影对比) | eval/bin (原始参数) | eval/ply (点云)。
+    let eval_nrrd = out.join("eval/nrrd");
+    let eval_bin = out.join("eval/bin");
+    let eval_ply = out.join("eval/ply");
+    std::fs::create_dir_all(&eval_nrrd)?;
+    std::fs::create_dir_all(&eval_bin)?;
+    std::fs::create_dir_all(&eval_ply)?;
 
     // 指标 CSV 记录器: 每次 eval 追加一行(时间戳 + 各指标)。
     let t0 = Instant::now();
@@ -647,7 +654,7 @@ async fn main() -> anyhow::Result<()> {
             l += sample.lpips;
             pairs.push(merge_pair(&sample.pred, &sample.gt));
         }
-        save_stack(&out, 0, &pairs);
+        save_stack(&eval_nrrd, 0, &pairs);
         p /= eval_views.len().max(1) as f32;
         s /= eval_views.len().max(1) as f32;
         l /= eval_views.len().max(1) as f32;
@@ -718,7 +725,7 @@ async fn main() -> anyhow::Result<()> {
                 avg_lpips += sample.lpips;
                 pairs.push(merge_pair(&sample.pred, &sample.gt));
             }
-            save_stack(&out, step, &pairs);
+            save_stack(&eval_nrrd, step, &pairs);
             avg_psnr /= eval_views.len().max(1) as f32;
             avg_ssim /= eval_views.len().max(1) as f32;
             avg_lpips /= eval_views.len().max(1) as f32;
@@ -775,7 +782,7 @@ async fn main() -> anyhow::Result<()> {
     // ---- 导出最终 canonical splats 为 PLY -------------------------------
     let splats = xray_to_splats(trainer.canonical(), &device);
     let ply = brush_serde::splat_to_ply(splats, Some(glam::Vec3::Y)).await?;
-    let ply_path = out.join("canonical_final.ply");
+    let ply_path = eval_ply.join("canonical_final.ply");
     std::fs::write(&ply_path, ply)?;
     println!("{} exported {}", ts(), ply_path.display());
 
@@ -807,8 +814,8 @@ async fn main() -> anyhow::Result<()> {
         for v in &o_data {
             ob.extend_from_slice(&v.to_le_bytes());
         }
-        std::fs::write(out.join("canonical_final_transforms.bin"), tb)?;
-        std::fs::write(out.join("canonical_final_raw.bin"), ob)?;
+        std::fs::write(eval_bin.join("canonical_final_transforms.bin"), tb)?;
+        std::fs::write(eval_bin.join("canonical_final_raw.bin"), ob)?;
         println!("{} exported {} (transforms+raw, 无激活往返)", ts(), out.display());
     }
 
