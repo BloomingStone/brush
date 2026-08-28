@@ -65,3 +65,26 @@ gt_pred 的 pred 列由训练 eval 渲染 (陈旧读 → 34.5), 与 compare 的 
   (flush Wgpu 队列), 使 loss 与 eval 读到当前 (含雾) 值 → 训练才会对雾施加梯度并消除之。
 - burn/wgpu 无直接 `Device::sync()`; 需通过 readback 或 backend API 实现, 属后端修改。
 - 规避方案: 训练指标用导出参数经 gs2volume forward 重渲 (已一致), 不依赖 in-loop eval。
+
+## 2026-08-28 深入排查 (debug 构建 + wgpu validation + 逐层 DIAG)
+
+### 更正
+- 之前把 compare_gs_proj.nrrd (raw proj 域) 当 intensity 比较 → 虚高 14 dB。
+  修正后: 同一 .bin 在 fit_static 与 gs2volume 两进程渲染**逐位一致** (0.4825)。
+
+### 已确认
+- 训练循环内 eval/loss 渲染 (lift+bwd) 偏亮 (mean_int 0.494 vs 导出 0.480),
+  与导出 forward 渲染不一致 (view4 PSNR 差 ~12 dB)。这是 34.5 vs 23 dB 现象的本质。
+- canonical 数值 (into_data) 渲染前/后逐位正确 (nonzero=0)。
+- 但**渲染输入 buffer 渲染后被覆盖 70% (maxdiff ~30)** → 渲染输出 buffer 复用了
+  渲染输入 buffer 的地址 (内存池) → 内核读写别名 → 渲染结果损坏 (偏亮)。
+- 根因: cubecl/burn 内存池在"已提交内核的输入 buffer"上复用 (排队内核的绑定
+  不持有 buffer 生命周期) → 训练循环中 (内存压力大) 触发; 导出时刻无此问题。
+- 已排除: 相机/GT/PLY/渲染函数/stream (单线程+固定 stream 0 均试)/voxelizer
+  (probe_before/after 逐位一致)。
+
+### 未解决
+- 需要 cubecl/burn 层修复: 渲染输入 buffer 在已提交内核执行前不被内存池复用
+  (drop queue / 分配规避 / 内核绑定持 Arc)。应用层无可靠绕过 (重建/_keep/sync
+  均无效——free 不看 fusion count)。
+- 过渡方案: 训练指标用导出 forward 重渲 (gt_pred_10000_FWD.nrrd / gs2volume) 度量。
