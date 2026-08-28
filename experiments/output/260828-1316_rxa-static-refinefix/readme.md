@@ -88,3 +88,31 @@ gt_pred 的 pred 列由训练 eval 渲染 (陈旧读 → 34.5), 与 compare 的 
   (drop queue / 分配规避 / 内核绑定持 Arc)。应用层无可靠绕过 (重建/_keep/sync
   均无效——free 不看 fusion count)。
 - 过渡方案: 训练指标用导出 forward 重渲 (gt_pred_10000_FWD.nrrd / gs2volume) 度量。
+
+## 2026-08-28 深度排查续 (应用层修复穷尽)
+
+### 尝试过的修复 (全部无效)
+- 渲染前重建 canonical (host 往返 from_raw, 全新 id): eval 仍偏亮。
+- 保持渲染输入 CubeTensor (resolve, descriptor 计数≥2 → is_free=false): 无效。
+- 渲染提交后 client.sync (等 GPU): 无效。
+- tokio current_thread 单线程: 无效。
+- cubecl-common StreamId::current() 固定 0 (消除跨 stream shared_view):
+  编译生效确认 (rlib 重编, stream 均=0), 仍无效。
+
+### 新增关键证据
+- Adam 更新后立即 into_data (step 内): **读到新值** (quats 在变) → canonical 值
+  渲染前是好的。
+- 渲染输入 (lift 后) 与 canonical: **不同 FusionTensor id** (975238 vs 974952),
+  内容 70% 不同 (maxdiff~28) → lift 拿到的不是 canonical 的张量。
+- 重建 + forward 渲染 (与导出完全同路径同值): eval 仍偏亮 (0.493 vs 0.478)
+  → 渲染输入 buffer 在渲染内核执行时仍被覆盖, 与代码路径无关。
+- cubecl slice 复用只看 descriptor 计数 (is_free, ≤1 即复用), 不检查 GPU
+  是否仍在读; drop queue 延迟释放的是存储, 不阻止 slice 复用。
+
+### 结论 (诚实)
+应用层无法根本修复: 渲染输入 buffer 在训练循环中被覆盖的机制在
+cubecl/burn 的 buffer 生命周期 × 渲染 pipeline 交互层, 保持 descriptor/
+重建/同步/单 stream 均不能阻止。需要 GPU 层调试 (RenderDoc 看 buffer
+binding / watchpoint 定位写方) 或 cubecl 上游修复 (如内核绑定持 buffer
+强引用直到执行 / slice 复用尊重 pending 内核)。当前评估口径: 训练指标
+不可靠, 以导出 forward 重渲 (gt_pred_10000_FWD / gs2volume) 为准。
