@@ -1,61 +1,79 @@
-# repro-stale-lift
+# repro-stale-lift — 用真实 xray render 模块复现陈旧读
 
-应用无关的最小复现 crate：在 burn-fusion 后端 (`burn_wgpu::Wgpu`) 上，复刻 brush
-训练循环里 `lift_xray_splats_to_autodiff` → `lift_to_autodiff` 的行为，检查"带
-pending op 的 fusion 张量经 lift 后是否读到陈旧 buffer"。
+复现 brush 训练里 `eval/loss` 渲染偏少 (~4% density, 现象见
+`experiments/output/260828-1316_rxa-static-refinefix/root_cause_report.md`) 的
+陈旧读 bug。
 
-不依赖任何 brush crate，只依赖 `burn` / `burn-wgpu` / `burn-fusion`。
+## 结构（已接入真实模块）
 
-## 背景
+`src/main.rs` 用**真实的** xray render 模块复刻静态重建训练循环：
 
-见 `experiments/output/260828-1316_rxa-static-refinefix/root_cause_report.md`。
-
-训练 eval/loss 的 autodiff 渲染 (`render_xray`) 读到了陈旧的 canonical 张量
-(上一 step 的 FusionTensor，不同 TensorId + 不同内容)，导致渲染密度偏少 ~4%，
-训练持续加密度 → 雾累积。而 forward 渲染 (`render_xray_forward`) 读到当前密度，
-导出后暴露出雾 (~23 dB vs eval ~31 dB)。
-
-## 这个 crate 做什么
-
-1. 复刻 `lift_to_autodiff`（`AutodiffBackend::from_inner` + `wrap_ad_wgpu_float`）。
-2. 维护一个 `Param<Tensor>` (inner)，每步用 Adam 式融合 op 更新
-   (momentum / variance 跨步持久)，外加一个模拟 render 大张量压力的 `_noise`。
-3. 每 500 步对比：
-   - 直接读 `p.val().into_data()`（真值）
-   - lift 后读 `lift_to_autodiff(p.val()).into_data()`（bug 路径）
-
-## 运行
-
-```bash
-cargo build -p repro-stale-lift
-env -u DISPLAY CUBECL_WGPU_DEFAULT_DEVICE='DiscreteGpu(1)' \
-  ./target/debug/repro-stale-lift
+```
+canonical (inner XRaySplats)
+  → lift_xray_splats_to_autodiff        (brush-xray-bwd)
+  → render_xray (autodiff, Backward)     (brush-xray-bwd)
+  → L1 loss vs 随机 GT → backward
+  → AdamScaled 复刻 (per-component scaling [1,10] + momentum 跨步持久)
+  → .inner() 写回 canonical (inner)
 ```
 
-## 当前状态（重要）
+依赖：`brush-cube` / `brush-render` / `brush-xray` / `brush-xray-bwd`（不依赖
+`brush-train`，避免数据集/deform/loss 重依赖）。
 
-**用简单融合 op（累积更新 + 每步 lift + require_grad）目前没有复现陈旧读
-(ndiff=0, maxdiff=0)。**
+## 检查方式
 
-本 crate 里有一个**跨线程 shared_view 测试**（`std::thread::spawn` 里做 `val()` 克隆 +
-读），确认了：
+每 100 步在**另一个 OS 线程**（`std::thread::spawn` + current-thread runtime，必然
+不同 `StreamId`）上对比：
 
-- 跨线程克隆**确实**产生新的 `TensorId`（shared_view）：主线程 `stream=0/id=3506`，
-  子线程 `stream=9/id=3507`。
-- 但 shared_view 读到的**内容与真值一致**（`v[0] == direct[0]`），即 `tag_shared_view`
-  正确地 materialize 了 src 并共享了 buffer。
+1. `render_xray`（autodiff/lift 路径）— **先做**，是 step 后第一个 drain canonical 的
+   路径（等价 brush `eval_view` 的 render）；若读陈旧则密度偏少。
+2. `render_xray_forward`（raw，无 lift）— 后做，此时 canonical 已落地，读真值。
 
-**结论**：`shared_view`（跨 stream 新 id）**不是**陈旧读的根因——它本身保值。之前
-报告里"shared_view 解析到未落地陈旧 buffer"的机制描述需要修正：陈旧读的触发点在
-**渲染 pipeline 内部**（`Fusion::render_xray` 的 `resolve_tensor_float`/drain + 自定义
-cubecl kernel 的 raw buffer + BindOp 绑定的组合），而非 lift/shared_view 本身。
+打印 `ratio = ad_sum / fwd_sum`；若 <1 即复现陈旧读。
 
-这是一个有价值的负结果，把搜索空间从"lift/shared_view"收窄到"渲染 pipeline"。
+## 当前结果（负结果，2026-08-29）
 
-## 如何在这个 crate 里继续逼近
+**`ratio = 1.00000`，未复现陈旧读。** 已尝试的组合：
 
-1. 直接调用 `Fusion::render_xray`（Backward pass），对比 forward，并打印
-   `resolve_tensor_float` 前后的 `TensorId` / buffer 地址；
-2. 复刻渲染 pipeline 的 buffer 分配模式（out_img [H,W]、visible [N]、n_contrib [H,W] 等
-   raw cubecl buffer 与融合张量的交错分配/释放）；
-3. 观察 `resolve_tensor_float` 返回的 CubeTensor 内容 vs `into_data` 的差异。
+| 变量 | 结果 |
+|---|---|
+| 真实 `render_xray` / `render_xray_forward` / `lift_xray_splats_to_autodiff` | ratio=1.0 |
+| AdamScaled 复刻（scaling [1,10] + momentum 跨步持久） | ratio=1.0 |
+| 跨线程（std::thread spawn, 不同 StreamId） | ratio=1.0 |
+| autodiff 先 / forward 后（autodiff 是第一个 drain） | ratio=1.0 |
+| 更大规模（8192 splats, 128×128） + 欠密度增长场景 | ratio=1.0 |
+
+关键观察：`step_cur` 恒为 0 —— 训练 future 在 `yield_now` 后**从不迁移线程**
+（GPU 读回走 `submit_blocking` 阻塞当前线程，不真正 yield 到 tokio 调度器）。
+而 brush 的 `xray_stream` 里 `step()` 与 `eval_view()` 之间读回会真正 suspend，
+导致同一 task 在不同 worker 线程间迁移。
+
+## 与 brush 尚存的差异（待逼近）
+
+1. **线程迁移**：brush 的 step 与 eval 在**同一个** async task 里，读回真正 suspend
+   时 task 被 steal 到别的 worker 线程；本 crate 用 `std::thread::spawn` 硬造跨线程，
+   但跨线程 shared_view 读到的内容一致（见
+   `root_cause_report.md` §10 —— shared_view 保值）。
+2. **优化器封装**：brush 用 `OptimizerAdaptor<AdamScaled>` + 每步 `to_record()` /
+   `load_record()`；本 crate 是手工复刻。
+3. **规模/读回模式**：brush 每步读回 `num_visible`/`num_intersections`（`tr_execute`）
+   且图像 862×634 / 14280 splats；本 crate 64×64 / 2048。
+
+## 已知（有价值）结论
+
+- 跨线程 `FusionTensor::clone` 确实产生新 `TensorId`（`shared_view`），但内容与
+  真值一致（`tag_shared_view` 正确 materialize src 并共享 buffer）。
+- 因此陈旧读**不是** shared_view / lift 本身，触发点更可能在渲染 pipeline 内部
+  （`resolve_tensor_float`/drain + 自定义 cubecl kernel 的 raw buffer 分配 + BindOp
+  绑定），且依赖**同一 task 跨线程迁移**（brush 的 work-stealing tokio）而非显式
+  跨线程克隆。
+
+## 下一步
+
+1. 把 step 与 eval 放进**同一个** tokio task，用真实读回 suspend（大张量/慢读回）
+   让 task 迁移线程，而不是 `std::thread::spawn` 硬造；
+2. 或直接在 `brush-xray-bwd` 的 `render_xray` 里加诊断探针（读回 `transforms_inner`
+   的 `TensorId` + 内容），在真实 fit_static 训练里对比 canonical；
+3. 重点追 burn-fusion 的 `submit`（异步 enqueue）/`submit_blocking`（drain）之间的
+   `custom_channel` 双缓冲时序，以及 `MultiStream::drain` 是否可能漏掉未 flush 的
+   pending op。

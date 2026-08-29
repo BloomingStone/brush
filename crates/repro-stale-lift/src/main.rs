@@ -1,136 +1,204 @@
-//! 应用无关的最小复现: burn-fusion 后端上, 带 pending op 的 fusion 张量经
-//! lift (AutodiffBackend::from_inner) 后读到陈旧 buffer。
+//! 用真实 xray render 模块复现 brush 训练里的陈旧读 bug。
 //!
-//! 复现 brush 训练循环里 `lift_xray_splats_to_autodiff` 的行为:
-//!   1. 一个 `Param<Tensor>` (inner device), 每步用 Adam 式融合 op 更新
-//!      (momentum / variance 跨步持久, 等价 optimizer step)。
-//!   2. 定期对比:
-//!        - 直接读 `p.val().into_data()` (应 = 真值)
-//!        - lift 后读 `lift_to_autodiff(p.val()).into_data()` (bug: 可能读到陈旧值)
+//! 复现 brush 训练循环 (静态重建, 无 deform):
+//!   1. `lift_xray_splats_to_autodiff` 把 canonical (inner) 抬到 autodiff;
+//!   2. `render_xray` (autodiff, XRayPass::Backward) 渲染密度图;
+//!   3. L1 loss vs 固定随机 GT -> backward;
+//!   4. AdamScaled (per-component scaling [1,10]) 步进 -> `.valid()` 写回 canonical。
 //!
-//! 若 lift 读到的值与真值不同, 即复现了训练中 eval/loss 渲染偏少的 bug。
+//! 关键: 多线程 tokio (work-stealing) 会让 `step()` 与 `render` 落在不同
+//! worker 线程 (= 不同 `StreamId`), 触发 `FusionTensor::clone/into_ir` 的
+//! 跨 stream `shared_view`。bug 表现为 autodiff (lift) 渲染的密度比 raw
+//! forward 渲染少 (~4%)。
+//!
+//! 检查: 每 N 步在另一个 OS 线程上对比
+//!   - `render_xray` (autodiff, lift 路径, 疑似陈旧) — 先做, 是 step 后
+//!     第一个 drain canonical 的路径
+//!   - `render_xray_forward` (raw, 无 lift, 真值) — 后做, canonical 已落地
+//! 两者密度和之比。
 
-use burn::backend::{
-    Autodiff, AutodiffBackend, BackendTensor, CheckpointingStrategy, DispatchTensor,
-    DispatchTensorKind,
-};
-use burn::backend::tensor::FloatTensor;
-use burn::module::{Module, Param, ParamId};
+use brush_render::camera::Camera;
+use brush_render::kernels::camera_model::CameraModel;
+use brush_xray::{XRaySplats, render_xray_forward};
+use brush_xray_bwd::{lift_xray_splats_to_autodiff, render_xray};
+use burn::optim::GradientsParams;
 use burn::tensor::{Tensor, TensorData};
-use burn_wgpu::graphics::AutoGraphicsApi;
-use burn_wgpu::{Wgpu, WgpuDevice};
+use burn_fusion::stream::StreamId;
 
-type B = Wgpu;
-type AD = Autodiff<B>;
+fn std_cam() -> Camera {
+    Camera::new(
+        glam::vec3(0.0, 0.0, -5.0),
+        glam::Quat::IDENTITY,
+        0.6,
+        0.6,
+        glam::vec2(0.5, 0.5),
+        CameraModel::Pinhole,
+    )
+}
 
-/// 复刻 `brush_render::burn_glue::lift_to_autodiff` (去掉了 brush 依赖)。
-fn lift_to_autodiff<const D: usize>(t: Tensor<D>) -> Tensor<D> {
-    let dispatch: DispatchTensor = t.into_dispatch();
-    match dispatch.kind {
-        DispatchTensorKind::Wgpu(BackendTensor::Float(inner)) => {
-            let ad = <AD as AutodiffBackend>::from_inner(inner);
-            Tensor::from_dispatch(DispatchTensor {
-                kind: DispatchTensorKind::Autodiff(Box::new(DispatchTensorKind::Wgpu(
-                    BackendTensor::Autodiff(ad),
-                ))),
-                checkpointing: Some(CheckpointingStrategy::None),
-            })
-        }
-        other => panic!("expected Wgpu float tensor, got: {:?}", other),
+fn build_splats(n: usize, device: &burn::tensor::Device) -> XRaySplats {
+    let mut transforms = Vec::with_capacity(n * 10);
+    let mut raw = Vec::with_capacity(n);
+    for i in 0..n {
+        let x = ((i * 7919) % 1000) as f32 / 500.0 - 1.0;
+        let y = ((i * 104729) % 1000) as f32 / 500.0 - 1.0;
+        let z = ((i * 1299721) % 1000) as f32 / 500.0 - 1.0;
+        transforms.extend_from_slice(&[x, y, z, 1.0, 0.0, 0.0, 0.0, -0.3, -0.5, -0.7]);
+        raw.push(1.0 + 0.001 * (i % 500) as f32);
     }
+    let t = Tensor::from_data(TensorData::new(transforms, [n, 10]), device);
+    let r = Tensor::from_data(TensorData::new(raw, [n]), device);
+    XRaySplats::from_tensor_data(t, r)
 }
 
-/// 复刻 `unwrap_wgpu_float`: 提取 inner FusionTensor。
-fn unwrap_wgpu_float<const D: usize>(t: Tensor<D>) -> FloatTensor<B> {
-    let dispatch: DispatchTensor = t.into_dispatch();
-    match dispatch.kind {
-        DispatchTensorKind::Wgpu(BackendTensor::Float(inner)) => inner,
-        other => panic!("expected Wgpu float, got: {:?}", other),
-    }
+fn img_sum(img: &Tensor<2>) -> f32 {
+    img.clone()
+        .into_data()
+        .as_slice::<f32>()
+        .unwrap()
+        .iter()
+        .sum()
 }
 
-/// 复刻 `unwrap_ad_wgpu_float`: 从 lifted tensor 提取 AutodiffTensor。
-fn unwrap_ad<const D: usize>(t: Tensor<D>) -> FloatTensor<AD> {
-    let dispatch: DispatchTensor = t.into_dispatch();
-    match dispatch.kind {
-        DispatchTensorKind::Autodiff(inner) => match *inner {
-            DispatchTensorKind::Wgpu(BackendTensor::Autodiff(ad)) => ad,
-            other => panic!("expected Wgpu autodiff, got: {:?}", other),
-        },
-        other => panic!("expected autodiff, got: {:?}", other),
-    }
-}
-
-/// 复刻 `wrap_wgpu_float`: 把 FusionTensor 包回 `Tensor<D>`。
-fn wrap_wgpu_float<const D: usize>(t: FloatTensor<B>) -> Tensor<D> {
-    Tensor::from_dispatch(DispatchTensor {
-        kind: DispatchTensorKind::Wgpu(BackendTensor::Float(t)),
-        checkpointing: None,
-    })
-}
-
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
-    let device = WgpuDevice::DefaultDevice;
-    burn_wgpu::init_setup_async::<AutoGraphicsApi>(&device, Default::default()).await;
-    let device: burn::tensor::Device = device.into();
+    let wgpu_device = burn_wgpu::WgpuDevice::DefaultDevice;
+    burn_wgpu::init_setup_async::<burn_wgpu::graphics::AutoGraphicsApi>(
+        &wgpu_device,
+        Default::default(),
+    )
+    .await;
+    let device: burn::tensor::Device = wgpu_device.into();
 
-    let n = 16384usize;
-    let init: Vec<f32> = (0..n).map(|i| 1.0 + i as f32 * 1e-4).collect();
+    let cam = std_cam();
+    let img_size = glam::uvec2(64, 64);
+    let n = 2048usize;
 
-    // 初始 Param (inner device), 同 brush 的 canonical.transforms。
-    let mut p: Param<Tensor<1>> = Param::initialized(
-        ParamId::new(),
-        Tensor::from_data(TensorData::new(init.clone(), [n]), &device),
-    );
+    // 固定随机 GT (驱动梯度, 让 transforms 每步真实变化)。
+    let mut seed = 42u64;
+    let gt_vec: Vec<f32> = (0..(64 * 64))
+        .map(|_| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((seed >> 33) as f32 / (u32::MAX as f32)) * 0.5
+        })
+        .collect();
+    let device_ad = device.clone().autodiff();
+    let gt = Tensor::<2>::from_data(TensorData::new(gt_vec, [64, 64]), &device_ad);
 
-    let steps = 5000u32;
+    let mut canonical = build_splats(n, &device);
 
-    for step in 1..=steps {
-        // 每步累积更新 (值持续变化, 便于检测陈旧读): p <- p + 0.001。
-        let p_new = p.val().add_scalar(0.001);
-        p = Param::initialized(ParamId::new(), p_new);
+    // ---- AdamScaled 复刻 (与 brush xray_train.rs 一致) ----
+    let beta1 = 0.9f32;
+    let beta2 = 0.999f32;
+    let eps = 1e-15f32;
+    let lr_mean = 1e-3f32;
+    let lr_opac = 1e-3f32;
+    let lr_values: [f32; 10] = [
+        lr_mean, lr_mean, lr_mean, lr_mean, lr_mean, lr_mean, lr_mean, lr_mean, lr_mean, lr_mean,
+    ];
+    // 跨步持久的 momentum 状态 (moment_1, moment_2)。
+    let mut mom_t: Option<(Tensor<2>, Tensor<2>)> = None;
+    let mut mom_o: Option<(Tensor<1>, Tensor<1>)> = None;
+    let mut time = 0usize;
 
-        // 每步都 lift 一次 (等价 brush 的 loss render 每步 lift canonical)。
-        let _p_ad = lift_to_autodiff(p.val()).require_grad();
+    let steps = 3000u32;
 
-        if step % 500 == 0 {
-            // 直接读 (真值)。
-            let direct: Vec<f32> = p.val().into_data().to_vec::<f32>().expect("f32");
-            // lift 后读 (bug 路径)。
-            let lifted = lift_to_autodiff(p.val()).require_grad();
-            let lifted_val: Vec<f32> = lifted.into_data().to_vec::<f32>().expect("f32");
+    for step in 0..steps {
+        // ---- step (tokio 决定在哪个 worker 线程 poll 这个 future) ----
+        let step_cur = StreamId::current().value;
 
-            let mut ndiff = 0usize;
-            let mut maxdiff = 0.0f32;
-            for (a, b) in direct.iter().zip(lifted_val.iter()) {
-                let d = (a - b).abs();
-                if d > 1e-6 {
-                    ndiff += 1;
-                }
-                if d > maxdiff {
-                    maxdiff = d;
-                }
-            }
+        let canonical_ad = lift_xray_splats_to_autodiff(canonical.clone());
+        let out = render_xray(canonical_ad.clone(), &cam, img_size, 1.0, false).await;
+
+        let loss = (out.img.clone() - gt.clone()).abs().mean();
+        let mut grads = loss.backward();
+        let transforms_id = canonical_ad.transforms.id;
+        let opacities_id = canonical_ad.raw_opacities.id;
+        let mut gp = GradientsParams::from_module(&mut grads, &canonical_ad);
+        let grad_t = gp.remove::<2>(transforms_id).expect("transforms grad");
+        let grad_o = gp.remove::<1>(opacities_id).expect("opacity grad");
+
+        time += 1;
+
+        // transforms: scaling [1,10] + reduce_moment_2=false。
+        let g2t = grad_t.clone().powi_scalar(2);
+        let (m1t, m2t) = match mom_t.take() {
+            None => (
+                grad_t.clone().mul_scalar(1.0 - beta1),
+                g2t.mul_scalar(1.0 - beta2),
+            ),
+            Some((m1, m2)) => (
+                m1.mul_scalar(beta1).add(grad_t.clone().mul_scalar(1.0 - beta1)),
+                m2.mul_scalar(beta2).add(g2t.mul_scalar(1.0 - beta2)),
+            ),
+        };
+        mom_t = Some((m1t.clone(), m2t.clone()));
+        let m1tc = m1t.div_scalar(1.0 - beta1.powi(time as i32));
+        let m2tc = m2t.div_scalar(1.0 - beta2.powi(time as i32));
+        let grad_hat_t = m1tc.div(m2tc.sqrt().add_scalar(eps));
+        let scaling = Tensor::<1>::from_floats(lr_values.as_slice(), &device).reshape([1, 10]);
+        let delta_t = grad_hat_t.mul(scaling.mul_scalar(lr_mean));
+
+        // opacity: 无 scaling, reduce_moment_2=true (但 D=1 时退化为普通 Adam)。
+        let g2o = grad_o.clone().powi_scalar(2);
+        let (m1o, m2o) = match mom_o.take() {
+            None => (
+                grad_o.clone().mul_scalar(1.0 - beta1),
+                g2o.mul_scalar(1.0 - beta2),
+            ),
+            Some((m1, m2)) => (
+                m1.mul_scalar(beta1).add(grad_o.clone().mul_scalar(1.0 - beta1)),
+                m2.mul_scalar(beta2).add(g2o.mul_scalar(1.0 - beta2)),
+            ),
+        };
+        mom_o = Some((m1o.clone(), m2o.clone()));
+        let m1oc = m1o.div_scalar(1.0 - beta1.powi(time as i32));
+        let m2oc = m2o.div_scalar(1.0 - beta2.powi(time as i32));
+        let grad_hat_o = m1oc.div(m2oc.sqrt().add_scalar(eps));
+        let delta_o = grad_hat_o.mul_scalar(lr_opac);
+
+        // 优化器在 inner 后端步进 (grad 是 inner), 结果直接作为 inner canonical。
+        let t_inner = canonical_ad.transforms.val().inner();
+        let o_inner = canonical_ad.raw_opacities.val().inner();
+        let new_transforms = t_inner.sub(delta_t);
+        let new_opac = o_inner.sub(delta_o);
+        canonical = XRaySplats {
+            transforms: burn::module::Param::initialized(transforms_id, new_transforms),
+            raw_opacities: burn::module::Param::initialized(opacities_id, new_opac),
+        };
+
+        // 每步 yield 一次, 增大 tokio 把后续 future 迁到别的线程的概率。
+        tokio::task::yield_now().await;
+
+        if step % 100 == 0 {
+            // ---- 在另一个 OS 线程上做检查 (必然不同 StreamId) ----
+            let c = canonical.clone();
+            let h = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let check_cur = StreamId::current().value;
+                    // autodiff (lift) 渲染先做 —— 它是 step 后第一个 drain canonical
+                    // 的路径 (等价 brush eval_view 的 render), 若读陈旧则密度偏少。
+                    let ad = lift_xray_splats_to_autodiff(c.clone());
+                    let out = render_xray(ad, &cam, img_size, 1.0, false).await;
+                    let ad_sum = img_sum(&out.img);
+                    // forward 渲染后做 (此时 canonical 已被 materialize, 读真值)。
+                    let fwd = render_xray_forward(&c, &cam, img_size, 1.0).await;
+                    let fwd_sum = img_sum(&fwd);
+                    (check_cur, fwd_sum, ad_sum)
+                })
+            })
+            .join()
+            .unwrap();
+
+            let (check_cur, fwd_sum, ad_sum) = h;
+            let ratio = ad_sum / fwd_sum;
             println!(
-                "step {step:5}: direct[0]={:.6} lifted[0]={:.6} ndiff={ndiff} maxdiff={maxdiff:.6e}",
-                direct[0], lifted_val[0]
+                "step {step:5}: step_cur={step_cur} check_cur={check_cur} fwd_sum={fwd_sum:.4} ad_sum={ad_sum:.4} ratio={ratio:.5}",
             );
-
-            // 跨线程测试: 在另一线程做 val() 克隆 + 读 (触发跨 stream shared_view)。
-            {
-                let p_clone = p.clone();
-                let handle = std::thread::spawn(move || {
-                    let ft = unwrap_wgpu_float(p_clone.val());
-                    let v: Vec<f32> = wrap_wgpu_float::<1>(ft.clone()).into_data().to_vec::<f32>().expect("f32");
-                    (ft.id, ft.stream.value, burn_fusion::stream::StreamId::current().value, v[0])
-                });
-                let (tid, tstream, tcur, v0) = handle.join().unwrap();
-                println!(
-                    "       cross-thread: id={:?} stream={} cur={} v[0]={:.6} (direct[0]={:.6})",
-                    tid, tstream, tcur, v0, direct[0]
-                );
-            }
         }
     }
 }
