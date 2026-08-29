@@ -22,10 +22,13 @@ pub fn render_voxel_kernel(
     u: VoxelUniforms,
     #[comptime] bwd_info: bool,
 ) {
-    let workgroup_id = CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X;
-    let gx = workgroup_id % u.grid_x;
-    let gy = (workgroup_id / u.grid_x) % u.grid_y;
-    let gz = workgroup_id / (u.grid_x * u.grid_y);
+    // 3D grid dispatch: workgroup (gx,gy,gz) is one cube. `workgroup_id`
+    // below is the 1D cube index used to index `cube_offsets` (written by
+    // `get_tile_offsets` in gx + gy·grid_x + gz·grid_x·grid_y order).
+    let gx = CUBE_POS_X;
+    let gy = CUBE_POS_Y;
+    let gz = CUBE_POS_Z;
+    let workgroup_id = gx + gy * CUBE_COUNT_X + gz * CUBE_COUNT_X * CUBE_COUNT_Y;
 
     let local = UNIT_POS;
     let vx_local = local % BLOCK3D_X;

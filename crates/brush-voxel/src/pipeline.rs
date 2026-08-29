@@ -196,9 +196,15 @@ impl VoxelOps for MainBackendBase {
 
         trace_span!("VoxelRender").in_scope(|| {
             let u = uniforms.to_launch_object();
+            // 3D grid dispatch (workgroup per cube): the 1D
+            // `Static(num_cubes,1,1)` form exceeded wgpu's 65535 limit once
+            // the volume grid grew past ~40³ cubes (adaptive grid extent).
+            let gx = u.grid_x;
+            let gy = u.grid_y;
+            let gz = u.grid_z;
             kernels::render::render_voxel_kernel::launch::<WgpuRuntime>(
                 &client,
-                burn_cubecl::cubecl::CubeCount::Static(num_cubes, 1, 1),
+                burn_cubecl::cubecl::CubeCount::Static(gx, gy, gz),
                 CubeDim::new_1d(BLOCK3D_SIZE),
                 compact_gid_from_isect.clone().into_tensor_arg(),
                 cube_offsets.clone().into_tensor_arg(),

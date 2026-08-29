@@ -28,7 +28,7 @@ fn compute_cov2d_cone_bwd(
     v_conic: Sym2,
     v_mu: f32,
 ) -> (Sym3, Vec3A) {
-    let (_conic, mu, cov3, _j, m, tx, ty, txtz, tytz) =
+    let (_conic, mu, cov3, j, m, tx, ty, txtz, tytz) =
         cone_geometry(mean_c, scale, quat, u);
     let vrk = compute_cov3d(scale, quat);
 
@@ -77,33 +77,30 @@ fn compute_cov2d_cone_bwd(
     );
 
     // v_cov3D = S = symmetric-vector gradient of Vrk (matches R2's dL_dcov).
-    // cov3 = mᵀ·Vrk·m ⇒ full-gradient X = m·G·mᵀ; the 6 stored cov entries
-    // are symmetric, so S[i,i] = X[i,i] and S[i,j] = 2·X[i,j] (i≠j).
+    // cov3 = Jᵀ·(R·Vrk·Rᵀ)·J ⇒ full-gradient X = Rᵀ·J·G·Jᵀ·R
+    // (with m = R·J: X = mᵀ·G·m); the 6 stored cov entries are symmetric,
+    // so S[i,i] = X[i,i] and S[i,j] = 2·X[i,j] (i≠j).
     let active = mu != 0.0f32;
-    let dr0 = dg.mul_vec3(m.row0());
-    let dr1 = dg.mul_vec3(m.row1());
-    let dr2 = dg.mul_vec3(m.row2());
-    let v_c00 = select(active, m.row0().dot(dr0), 0.0f32);
-    let v_c01 = select(active, 2.0f32 * m.row0().dot(dr1), 0.0f32);
-    let v_c02 = select(active, 2.0f32 * m.row0().dot(dr2), 0.0f32);
-    let v_c11 = select(active, m.row1().dot(dr1), 0.0f32);
-    let v_c12 = select(active, 2.0f32 * m.row1().dot(dr2), 0.0f32);
-    let v_c22 = select(active, m.row2().dot(dr2), 0.0f32);
+    let dc0 = dg.mul_vec3(m.col0());
+    let dc1 = dg.mul_vec3(m.col1());
+    let dc2 = dg.mul_vec3(m.col2());
+    let v_c00 = select(active, m.col0().dot(dc0), 0.0f32);
+    let v_c01 = select(active, 2.0f32 * m.col0().dot(dc1), 0.0f32);
+    let v_c02 = select(active, 2.0f32 * m.col0().dot(dc2), 0.0f32);
+    let v_c11 = select(active, m.col1().dot(dc1), 0.0f32);
+    let v_c12 = select(active, 2.0f32 * m.col1().dot(dc2), 0.0f32);
+    let v_c22 = select(active, m.col2().dot(dc2), 0.0f32);
 
-    // Mean grads through J: dL/dm = (Vrk·m)·D' with D' = D diagonal doubled
-    // (symmetric-adjoint of m ↦ mᵀ·Vrk·m; matches R2's dL_dM), dL/dJ = Wᵀ·dL/dm.
+    // Mean grads through J: cov3 = Jᵀ·S_cam·J with S_cam = R·Vrk·Rᵀ, so
+    // dL/dJ = S_cam·J·D' (D' = symmetric-adjoint of J ↦ Jᵀ·S_cam·J).
     let dm_diag2 = Mat3::from_cols(
         Vec3A::new(2.0f32 * dL_dhata, dL_dhatb, dL_dhatc),
         Vec3A::new(dL_dhatb, 2.0f32 * dL_dhatd, dL_dhate),
         Vec3A::new(dL_dhatc, dL_dhate, 2.0f32 * dL_dhatf),
     );
-    let dl_dm = vrk.mul_mat3(m).mul_mat3(dm_diag2);
     let w = u.view_rotation();
-    let dl_dj = Mat3::from_cols(
-        w.transpose_mul_vec3(dl_dm.col0()),
-        w.transpose_mul_vec3(dl_dm.col1()),
-        w.transpose_mul_vec3(dl_dm.col2()),
-    );
+    let s_cam = vrk.congruence(w);
+    let dl_dj = s_cam.mul_mat3(j).mul_mat3(dm_diag2);
 
     // J element grads (my J is column-major; [r][c] = c{c}_{x,y,z}[r]):
     //   J00 = fx/tz, J20 = -fx·tx/tz², J11 = fy/tz, J21 = -fy·ty/tz²,

@@ -91,10 +91,12 @@ impl VoxelBwdOps for MainBackendBase {
         trace_span!("VoxelRenderBackwards").in_scope(|| {
             use crate::kernels::atomic::{CasAtomicAdd, HfAtomicAdd};
             use crate::kernels::render_bwd::render_voxel_bwd_kernel;
+            // 3D grid dispatch (see VoxelRender: 1D form exceeded 65535).
+            let (gx, gy, gz) = (grid.x, grid.y, grid.z);
             if hard_floats {
                 render_voxel_bwd_kernel::launch::<HfAtomicAdd, WgpuRuntime>(
                     &client,
-                    CubeCount::Static(cube_count, 1, 1),
+                    CubeCount::Static(gx, gy, gz),
                     cube_dim,
                     compact_gid_from_isect.into_tensor_arg(),
                     cube_offsets.into_tensor_arg(),
@@ -107,7 +109,7 @@ impl VoxelBwdOps for MainBackendBase {
             } else {
                 render_voxel_bwd_kernel::launch::<CasAtomicAdd, WgpuRuntime>(
                     &client,
-                    CubeCount::Static(cube_count, 1, 1),
+                    CubeCount::Static(gx, gy, gz),
                     cube_dim,
                     compact_gid_from_isect.into_tensor_arg(),
                     cube_offsets.into_tensor_arg(),

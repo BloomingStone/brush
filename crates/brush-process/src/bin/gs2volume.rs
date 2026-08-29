@@ -179,6 +179,8 @@ async fn main() -> anyhow::Result<()> {
     let mut deform_extent = 264.0f32;
     let mut ckpt: Option<PathBuf> = None; // HexPlane 网络权重 (deform_final.bin)
     let mut no_fdk = false;
+    // 诊断: 剔除 σ > 阈值的 splat (归因大 σ splat 对 DRR vs GS 差异的贡献)。
+    let mut max_sigma: Option<f32> = None;
     // 独立体积尺寸: --ref-dcm 从 DICOM 推断 (XY=1.5×图宽世界, Z=图高世界),
     // --extent-xy/--extent-z 显式指定世界范围 (mm), --voxel-mm 体素尺寸。
     let mut ref_dcm: Option<PathBuf> = None;
@@ -243,6 +245,8 @@ async fn main() -> anyhow::Result<()> {
             deform_extent = v.parse()?;
         } else if a == "--no-fdk" {
             no_fdk = true;
+        } else if let Some(v) = a.strip_prefix("--max-sigma=") {
+            max_sigma = Some(v.parse()?);
         }
         i += 1;
     }
@@ -384,6 +388,35 @@ async fn main() -> anyhow::Result<()> {
         println!("applied deform field {df:?} (extent {deform_extent}mm), max |d|={dmax:.2}mm");
     }
 
+    // 诊断剔除: --max-sigma=N 丢弃任一轴 σ>N 的 splat (归因用)。
+    if let Some(cap) = max_sigma {
+        let mut keep = vec![false; means.len() / 3];
+        let mut nkeep = 0usize;
+        for i in 0..keep.len() {
+            let s0 = log_scales[i * 3].exp();
+            let s1 = log_scales[i * 3 + 1].exp();
+            let s2 = log_scales[i * 3 + 2].exp();
+            if s0 <= cap && s1 <= cap && s2 <= cap {
+                keep[i] = true;
+                nkeep += 1;
+            }
+        }
+        println!("max-sigma filter: kept {nkeep}/{} splats (σ<={cap:.1}mm)", keep.len());
+        let kf = |v: Vec<f32>, per: usize| -> Vec<f32> {
+            let mut out = Vec::with_capacity(nkeep * per);
+            for i in 0..keep.len() {
+                if keep[i] {
+                    out.extend_from_slice(&v[i * per..(i + 1) * per]);
+                }
+            }
+            out
+        };
+        means = kf(means, 3);
+        rots = kf(rots, 4);
+        log_scales = kf(log_scales, 3);
+        raw = kf(raw, 1);
+    }
+
     // ---- 密度域: raw logits 直通 —— voxelizer 内核激活 (与 brush-xray
     //      同约定: unsigned = MU_WATER·silu(raw), --signed = MU_WATER·raw) ----
     // (旧绕行在 host 反解 logit, 对 μ>1 / 负密度有损 clamp; 现已移除。)
@@ -438,6 +471,40 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(e) = extent_z {
         half_z = Some(0.5 * e);
+    }
+
+    // 网格自适应: 未显式 --extent-* 时, 从 splat 数据推断覆盖范围
+    // (per-axis p99.9 的 |mean|+3σ, 与 DICOM 推断取 max, cap 400mm)。
+    // 此前默认网格 (XY=1.5×图宽, Z=图高) 在 z 方向仅 ~93mm 半高, 而 splat
+    // 中心可到 ±236mm (训练拟合的条纹), 其 3σ bbox 大量超出网格 →
+    // voxelizer 截断 → DRR 投影系统性低于 GS 直接投影 (gs_sum 大 6-12%,
+    // 且随视角变化)。自适应网格让 DRR ≈ GS (已验证: 全覆盖网格下
+    // gs_sum/drr_sum → 1.000)。
+    if extent_xy.is_none() && extent_z.is_none() {
+        let n = means.len() / 3;
+        let sig: Vec<f32> = log_scales.iter().map(|&l| l.exp()).collect();
+        let mut p999 = [0.0f32; 3];
+        let mut cmax = [0.0f32; 3];
+        for ax in 0..3 {
+            let mut vals: Vec<f32> = (0..n)
+                .map(|i| means[i * 3 + ax].abs() + 3.0 * sig[i * 3 + ax])
+                .collect();
+            vals.sort_by(|a, b| a.partial_cmp(b).expect("f32"));
+            p999[ax] = vals[(0.999 * vals.len() as f32) as usize];
+            cmax[ax] = vals[vals.len() - 1];
+        }
+        let cap = 400.0f32;
+        let w = p999[0].min(cap).max(p999[1].min(cap));
+        let z = p999[2].min(cap);
+        let cur_w = half_w.unwrap_or(0.0);
+        let cur_z = half_z.unwrap_or(0.0);
+        half_w = Some(cur_w.max(w));
+        half_z = Some(cur_z.max(z));
+        println!(
+            "adaptive grid: splat |mean|+3σ p99.9 = ({:.0},{:.0},{:.0}) max = ({:.0},{:.0},{:.0})mm -> half XY {:.0}mm Z {:.0}mm (cap {cap:.0})",
+            p999[0], p999[1], p999[2], cmax[0], cmax[1], cmax[2],
+            half_w.unwrap(), half_z.unwrap(),
+        );
     }
 
     // 网格: n_xy/n_z 显式 > 由 extent/voxel-mm 推出 > FDK 跟随。

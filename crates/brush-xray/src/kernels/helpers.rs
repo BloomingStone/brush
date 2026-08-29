@@ -59,8 +59,20 @@ pub fn cone_geometry(
         Vec3A::new(0.0f32, u.focal_y * inv_tz, -u.focal_y * ty * inv_tz2),
         Vec3A::new(tx / l, ty / l, mean_c.z() / l),
     );
-    let m = u.view_rotation().mul_mat3(j);
-    let cov3 = vrk.transpose_congruence(m);
+    // Screen covariance (pixel-linearized): cov3 = Jᵀ·Σ_cam·J with
+    // Σ_cam = R_view·Vrk·R_viewᵀ — the world covariance pulled back to the
+    // camera frame (v_cam = R_view·v_world ⇒ Σ_cam = R_view·Σ·R_viewᵀ).
+    //
+    // Historical bug: the old code used `(R_view·J)ᵀ·Vrk·(R_view·J)`
+    // (== Jᵀ·R_viewᵀ·Vrk·R_view·J), i.e. Σ_cam = R_viewᵀ·Vrk·R_view with
+    // the transposes on the wrong side. That only coincides with the
+    // correct form for near-symmetric R_view (AP/PA poses), so oblique
+    // C-arm views got a distorted screen ellipse — verified against exact
+    // per-splat ray integration (screen σ off by up to ~6x on oblique
+    // views, making GS projection vs voxelized-DRR differ by ~8%).
+    let w = u.view_rotation();
+    let m = w.mul_mat3(j);
+    let cov3 = vrk.congruence(w).transpose_congruence(j);
 
     let conic = Sym2 {
         c00: cov3.c00,
