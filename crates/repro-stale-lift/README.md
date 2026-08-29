@@ -34,22 +34,28 @@ env -u DISPLAY CUBECL_WGPU_DEFAULT_DEVICE='DiscreteGpu(1)' \
 
 ## 当前状态（重要）
 
-**用简单的融合 op（含 Adam 式 momentum/variance 跨步持久 + 每步 lift + require_grad
-+ 大张量压力 `_noise`）目前没有复现陈旧读 (ndiff=0, maxdiff=0)。**
+**用简单融合 op（累积更新 + 每步 lift + require_grad）目前没有复现陈旧读
+(ndiff=0, maxdiff=0)。**
 
-这是一个有价值的负结果：说明陈旧读**不是**单纯由"带 pending op 的 fusion 张量 +
-lift (from_inner)"触发，而是与 X-ray 渲染 pipeline 的特定结构有关，可能来自以下任一
-（需继续排查）：
+本 crate 里有一个**跨线程 shared_view 测试**（`std::thread::spawn` 里做 `val()` 克隆 +
+读），确认了：
 
-- `Fusion<MainBackendBase>::render_xray` 内部的 `resolve_tensor_float`（drain）+ BindOp
-  绑定回融合流的组合；
-- 自定义 cubecl kernel 的 raw buffer 分配（内存池）与融合流的交互；
-- `render_xray` (autodiff) 里 `prep_nodes` / `refine_weight_holder` / `prep.finish`
-  与 Backward pass 的组合（单独加 [1] zeros 已排除，但组合未排除）。
+- 跨线程克隆**确实**产生新的 `TensorId`（shared_view）：主线程 `stream=0/id=3506`，
+  子线程 `stream=9/id=3507`。
+- 但 shared_view 读到的**内容与真值一致**（`v[0] == direct[0]`），即 `tag_shared_view`
+  正确地 materialize 了 src 并共享了 buffer。
+
+**结论**：`shared_view`（跨 stream 新 id）**不是**陈旧读的根因——它本身保值。之前
+报告里"shared_view 解析到未落地陈旧 buffer"的机制描述需要修正：陈旧读的触发点在
+**渲染 pipeline 内部**（`Fusion::render_xray` 的 `resolve_tensor_float`/drain + 自定义
+cubecl kernel 的 raw buffer + BindOp 绑定的组合），而非 lift/shared_view 本身。
+
+这是一个有价值的负结果，把搜索空间从"lift/shared_view"收窄到"渲染 pipeline"。
 
 ## 如何在这个 crate 里继续逼近
 
-1. 把 `lift_to_autodiff` 的 `require_grad()` 也加进"检查"路径；
-2. 增加真实 render 的融合张量个数/尺寸（out_img ≈ [H,W] f32，visible [N]，n_contrib [H,W] u32）；
-3. 直接调用 `Fusion::render_xray`（Backward pass）对比 forward；
-4. 打印 `resolve_tensor_float` 前后的 `TensorId` 与 buffer 地址。
+1. 直接调用 `Fusion::render_xray`（Backward pass），对比 forward，并打印
+   `resolve_tensor_float` 前后的 `TensorId` / buffer 地址；
+2. 复刻渲染 pipeline 的 buffer 分配模式（out_img [H,W]、visible [N]、n_contrib [H,W] 等
+   raw cubecl buffer 与融合张量的交错分配/释放）；
+3. 观察 `resolve_tensor_float` 返回的 CubeTensor 内容 vs `into_data` 的差异。

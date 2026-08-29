@@ -166,3 +166,20 @@ render 读到陈旧(偏低)密度 → loss 误判"欠密度"
   `resolve_tensor_float` 为何拿到旧 buffer —— 重点看 `shared_view`/`tag_shared_view`
   与 pending op 的 drain 时序、以及 handle 生命周期 (TensorId 为何指向旧 buffer)。
 - **最小复现**: 见 `crates/repro-stale-lift/` (应用无关, 只依赖 burn/burn-wgpu/burn-fusion)。
+
+---
+
+## 10. 更正 (2026-08-29 晚, 基于 repro-stale-lift)
+
+用最小复现 crate (`crates/repro-stale-lift`) 的跨线程 shared_view 测试确认:
+
+- 跨线程 `FusionTensor::clone` **确实**产生新的 TensorId (shared_view): 主线程
+  `stream=0/id=3506`, 子线程 `stream=9/id=3507`。
+- 但 shared_view 读到的**内容与真值一致** (`tag_shared_view` 正确 materialize 了 src
+  并共享 buffer)。
+
+**因此 §5 的机制描述需修正**: "shared_view 解析到未落地陈旧 buffer" 不成立 ——
+shared_view 本身保值。陈旧读的真正触发点在**渲染 pipeline 内部**
+(`Fusion::render_xray` 的 `resolve_tensor_float`/drain + 自定义 cubecl kernel 的 raw
+buffer 分配 + BindOp 绑定的组合), 而非 lift / shared_view。搜索空间从 lift/shared_view
+收窄到渲染 pipeline。

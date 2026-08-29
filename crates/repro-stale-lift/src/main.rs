@@ -14,7 +14,8 @@ use burn::backend::{
     Autodiff, AutodiffBackend, BackendTensor, CheckpointingStrategy, DispatchTensor,
     DispatchTensorKind,
 };
-use burn::module::{AutodiffModule, Module, Param, ParamId};
+use burn::backend::tensor::FloatTensor;
+use burn::module::{Module, Param, ParamId};
 use burn::tensor::{Tensor, TensorData};
 use burn_wgpu::graphics::AutoGraphicsApi;
 use burn_wgpu::{Wgpu, WgpuDevice};
@@ -39,7 +40,36 @@ fn lift_to_autodiff<const D: usize>(t: Tensor<D>) -> Tensor<D> {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
+/// 复刻 `unwrap_wgpu_float`: 提取 inner FusionTensor。
+fn unwrap_wgpu_float<const D: usize>(t: Tensor<D>) -> FloatTensor<B> {
+    let dispatch: DispatchTensor = t.into_dispatch();
+    match dispatch.kind {
+        DispatchTensorKind::Wgpu(BackendTensor::Float(inner)) => inner,
+        other => panic!("expected Wgpu float, got: {:?}", other),
+    }
+}
+
+/// 复刻 `unwrap_ad_wgpu_float`: 从 lifted tensor 提取 AutodiffTensor。
+fn unwrap_ad<const D: usize>(t: Tensor<D>) -> FloatTensor<AD> {
+    let dispatch: DispatchTensor = t.into_dispatch();
+    match dispatch.kind {
+        DispatchTensorKind::Autodiff(inner) => match *inner {
+            DispatchTensorKind::Wgpu(BackendTensor::Autodiff(ad)) => ad,
+            other => panic!("expected Wgpu autodiff, got: {:?}", other),
+        },
+        other => panic!("expected autodiff, got: {:?}", other),
+    }
+}
+
+/// 复刻 `wrap_wgpu_float`: 把 FusionTensor 包回 `Tensor<D>`。
+fn wrap_wgpu_float<const D: usize>(t: FloatTensor<B>) -> Tensor<D> {
+    Tensor::from_dispatch(DispatchTensor {
+        kind: DispatchTensorKind::Wgpu(BackendTensor::Float(t)),
+        checkpointing: None,
+    })
+}
+
+#[tokio::main]
 async fn main() {
     let device = WgpuDevice::DefaultDevice;
     burn_wgpu::init_setup_async::<AutoGraphicsApi>(&device, Default::default()).await;
@@ -54,35 +84,15 @@ async fn main() {
         Tensor::from_data(TensorData::new(init.clone(), [n]), &device),
     );
 
-    // Adam 状态 (跨步持久)。
-    let mut m: Tensor<1> = Tensor::zeros([n], &device);
-    let mut v: Tensor<1> = Tensor::zeros([n], &device);
-
-    let lr = 1e-3f32;
-    let beta1 = 0.9f32;
-    let beta2 = 0.999f32;
-    let eps = 1e-8f32;
     let steps = 5000u32;
 
     for step in 1..=steps {
-        // 假梯度 g = p (inner, 仅制造融合依赖链)。
-        let g = p.val();
-        // momentum: m = beta1*m + (1-beta1)*g
-        m = m.clone().mul_scalar(beta1).add(g.clone().mul_scalar(1.0 - beta1));
-        // variance: v = beta2*v + (1-beta2)*g^2
-        v = v
-            .clone()
-            .mul_scalar(beta2)
-            .add(g.clone().powi_scalar(2).mul_scalar(1.0 - beta2));
-        // param: p = p - lr * m / (sqrt(v) + eps)
-        let p_new = g.sub(m.clone().div(v.clone().sqrt().add_scalar(eps)).mul_scalar(lr));
+        // 每步累积更新 (值持续变化, 便于检测陈旧读): p <- p + 0.001。
+        let p_new = p.val().add_scalar(0.001);
         p = Param::initialized(ParamId::new(), p_new);
 
         // 每步都 lift 一次 (等价 brush 的 loss render 每步 lift canonical)。
         let _p_ad = lift_to_autodiff(p.val()).require_grad();
-
-        // 模拟 render 的融合张量压力。
-        let _noise = Tensor::<1>::zeros([n * 4], &device).add_scalar(1.0);
 
         if step % 500 == 0 {
             // 直接读 (真值)。
@@ -106,6 +116,21 @@ async fn main() {
                 "step {step:5}: direct[0]={:.6} lifted[0]={:.6} ndiff={ndiff} maxdiff={maxdiff:.6e}",
                 direct[0], lifted_val[0]
             );
+
+            // 跨线程测试: 在另一线程做 val() 克隆 + 读 (触发跨 stream shared_view)。
+            {
+                let p_clone = p.clone();
+                let handle = std::thread::spawn(move || {
+                    let ft = unwrap_wgpu_float(p_clone.val());
+                    let v: Vec<f32> = wrap_wgpu_float::<1>(ft.clone()).into_data().to_vec::<f32>().expect("f32");
+                    (ft.id, ft.stream.value, burn_fusion::stream::StreamId::current().value, v[0])
+                });
+                let (tid, tstream, tcur, v0) = handle.join().unwrap();
+                println!(
+                    "       cross-thread: id={:?} stream={} cur={} v[0]={:.6} (direct[0]={:.6})",
+                    tid, tstream, tcur, v0, direct[0]
+                );
+            }
         }
     }
 }

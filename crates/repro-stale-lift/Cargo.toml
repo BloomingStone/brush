@@ -15,4 +15,4 @@ burn = { workspace = true, features = ["wgpu", "autodiff"] }
 burn-wgpu.workspace = true
 burn-fusion.workspace = true
 
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
