@@ -1435,3 +1435,22 @@ pub fn create_xray_trainer(
 
     XRayTrainer::new(config, canonical, deform, respi, fdk, device)
 }
+
+/// 静态重建专用构造函数: **强制** `enable_deform=false`, 无论传入配置如何。
+///
+/// 与 [`create_xray_trainer`] 的区别: 静态训练在 API 层面就不可能带 deform —
+/// 历史上 fit_static 曾因 `XRayTrainConfig::default()` 的 `enable_deform=true`
+/// 而意外启用了 HexPlane 形变网络, 导致训练 eval 渲染形变后的 splats、导出
+/// 渲染未形变 canonical, 两者不一致被误判为"陈旧读"。用本构造函数从源头杜绝。
+pub fn create_static_xray_trainer(
+    mut config: XRayTrainConfig,
+    num_points: u32,
+    scene_extent: f32,
+    init: InitRegion,
+    device: &Device,
+    fov: Option<(&[brush_render::camera::Camera], glam::UVec2)>,
+    fdk: Option<FdkPrior>,
+) -> XRayTrainer {
+    config.enable_deform = false;
+    create_xray_trainer(config, num_points, scene_extent, init, device, fov, fdk)
+}

@@ -183,3 +183,55 @@ shared_view 本身保值。陈旧读的真正触发点在**渲染 pipeline 内�
 (`Fusion::render_xray` 的 `resolve_tensor_float`/drain + 自定义 cubecl kernel 的 raw
 buffer 分配 + BindOp 绑定的组合), 而非 lift / shared_view。搜索空间从 lift/shared_view
 收窄到渲染 pipeline。
+
+---
+
+## 11. 最终定论 (2026-08-29, 真实 fit_static 探针 + 修复验证)
+
+### 真相: 不是陈旧读, 是 fit_static 意外启用了 deform
+
+在真实 `fit_static` (RXA_chest.dcm) 里加逐层探针 (eval_view 读 canonical、
+lift 前后、render 内部 `splats.transforms.val()`) 后发现:
+
+- `XRayTrainConfig::default()` 的 **`enable_deform = true`** (xray_train.rs:225),
+  而 **fit_static 代码从未设置 `cfg.enable_deform = false`** (尽管注释说"删除
+  形变场部分") → fit_static 实际带 HexPlane deform 网络在跑。
+- 因此训练 eval 渲染的是 `deform_splats(canonical, deforms)` **形变后的 splats**
+  (新 TensorId, 内容 = canonical + d_xyz, 这是**正常行为**), 而导出渲染的是
+  `render_xray_forward(&canonical)` **未形变的 canonical**。
+- 之前 §4/§5 观察到的 "render 的 transforms_inner id ≠ canonical id、内容不同"
+  就是 **canonical vs 形变后 splats 的对比**, 不是陈旧读, 也不是 shared_view bug。
+
+### 决定性验证
+
+给 fit_static 加 `cfg.enable_deform = false` 后重跑 (5000p/160 iter):
+
+```
+eval pred vs 导出 forward 重渲: maxdiff = 0.000000, meandiff = 0 (逐位一致)
+proj mean 均为 0.743 (原报告: eval 0.73 vs 导出 0.76)
+```
+
+deform 一关, 训练 eval 与导出渲染**逐位一致** → "陈旧读/雾/buffer 覆盖"
+的全部机制猜想 (共享_view 解析陈旧 buffer、内存池覆盖、异步未 flush) 均不成立。
+
+### 为什么 eval 指标虚高 (31 dB vs 导出 23 dB)
+
+deform 网络被训练来拟合 GT: 它会把 canonical 里多余的密度 splats 移开,
+使**形变后**的渲染更接近 GT (0.73, PSNR 31)。而 canonical 本身保留了雾
+(导出未形变渲染 0.76, PSNR 23)。即 deform 吸收了雾 → 训练指标不可信。
+
+### 修复
+
+`crates/brush-process/src/bin/fit_static.rs`:
+```rust
+let mut cfg = XRayTrainConfig::default();
+cfg.enable_deform = false;  // 静态重建必须显式关闭 (默认 true)
+```
+
+### 教训
+
+1. fit_static 是 "静态重建" 但默认开了 deform → eval 渲染形变后 splats。
+2. 之前所有 "lift 陈旧读 / shared_view 解析陈旧 buffer / 内存池 buffer 覆盖"
+   的结论都是**错误对比 canonical vs 形变后 splats** 造成的假象。
+3. `repro-stale-lift` crate 无法复现的原因也清楚了: 应用层没有 deform,
+   自然没有 "eval 渲染 ≠ canonical" 的现象。

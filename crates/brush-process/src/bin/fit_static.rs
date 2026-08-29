@@ -1,8 +1,10 @@
-//! 静态 X-ray 重建 (与 `fit_deform` 逻辑一致, 删除形变场部分):
-//! 拟合 `images/RXA_chest.dcm` 等纯静态数据。
+//! 静态 X-ray 重建: 拟合 `images/RXA_chest.dcm` 等纯静态数据。
 //!
-//! 与 `fit_deform` 的差异: 只有形变相关部分被删除 —
-//!   - 无 deform 网络 (`enable_deform=false`): canonical splats 直接渲染
+//! 用 [`create_static_xray_trainer`] 构建 trainer —— 该构造函数**强制**
+//! `enable_deform=false`, 静态训练不可能带 deform 网络 (历史上曾因默认
+//! `enable_deform=true` 未显式关闭而意外启用, 导致 eval 渲染形变后 splats、
+//! 导出渲染未形变 canonical, 两者不一致)。因此本工具:
+//!   - 无 deform 网络: canonical splats 直接渲染
 //!   - 无 phase/time 条件化、无 AST/warm-up、无时间编码
 //!   - 无 deform ckpt / deform_field 导出
 //! 其余 (初始化/圆柱、loss、refine、eval、PLY 导出) 与 fit_deform 一致。
@@ -30,7 +32,7 @@ use clap::Parser;
 use brush_render::gaussian_splats::{SplatRenderMode, Splats};
 use brush_train::xray_eval::save_gray_nrrd_f32_stack;
 use brush_train::xray_refine::{XRayRefineConfig, XRayRefineGradThreshold};
-use brush_train::xray_train::{XRayTrainConfig, create_xray_trainer};
+use brush_train::xray_train::{XRayTrainConfig, create_static_xray_trainer};
 use brush_vfs::BrushVfs;
 use brush_xray::XRaySplats;
 use burn::tensor::{Device, TensorData};
@@ -48,7 +50,7 @@ fn parse_loss(s: &str) -> Result<GrayLossType, String> {
 
 /// 静态 X-ray 重建 CLI (clap)。参数按功能分组, 默认值与旧手写解析一致。
 #[derive(Parser)]
-#[command(name = "fit_static", about = "静态 X-ray 重建 (与 fit_deform 一致, 删除形变场部分)")]
+#[command(name = "fit_static", about = "静态 X-ray 重建 (无 deform, canonical 直接渲染)")]
 struct FitStaticArgs {
     /// DICOM 序列文件路径 (如 images/RXA_chest.dcm)。
     #[arg(value_name = "DCM", help_heading = "输入数据")]
@@ -539,8 +541,8 @@ async fn main() -> anyhow::Result<()> {
         Some(r) => r,
         None => {
             // 物理上界: C-arm 旋转所能容纳的最大长度 = min(SOD, SDD-SOD),
-            // x0.6 安全冗余 + deform 网格分辨率折中 (0.8→11mm/单元过粗,
-            // 0.6→8.3mm/单元)。SOD = 源到等中心, SDD-SOD = 等中心到探测器。
+            // x0.6 安全冗余 (0.6→8.3mm/单元网格分辨率)。SOD = 源到等中心,
+            // SDD-SOD = 等中心到探测器。
             let sod = dataset.train.views[0].camera.position.length();
             let r = sod.min(sdd - sod) * 0.6;
             println!(
@@ -558,11 +560,11 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // ---- Trainer: 随机初始化 + deform 模式 + 启用 refine -----------------
-    // `create_xray_trainer` 做随机球内点云(KNN scale + μ_water 密度初始化),
-    // 并把 config.refine.scene_extent 设为 scene_extent; `enable_deform=true`
-    // 时按 `deform_backend` 创建 HexPlane (默认) 或 hash-grid 形变网络
-    // (coord_scale = scene_extent)。
+    // ---- Trainer: 随机初始化 + 纯静态 (无 deform) + 启用 refine ----------
+    // `create_static_xray_trainer` 做随机球内点云(KNN scale + μ_water 密度初始化),
+    // 并把 config.refine.scene_extent 设为 scene_extent; 构造函数内部**强制**
+    // `enable_deform=false` (见函数文档: 历史 bug 是默认 enable_deform=true
+    // 未被显式关闭, 导致 eval 渲染形变后 splats 与导出一致性被破坏)。
     let mut cfg = XRayTrainConfig::default();
     cfg.init_density = init_density;
     cfg.lr_mean = lr_mean;
@@ -632,7 +634,7 @@ async fn main() -> anyhow::Result<()> {
     // --no-fov-filter 关闭 (圆柱旋转中会重新入视野, 见实验)。
     let train_cams: Vec<_> = dataset.train.views.iter().map(|v| v.camera).collect();
     let fov = Some((train_cams.as_slice(), glam::uvec2(g0.width, g0.height)));
-    let mut trainer = create_xray_trainer(cfg, points, scene_extent, init, &device, fov, None);
+    let mut trainer = create_static_xray_trainer(cfg, points, scene_extent, init, &device, fov, None);
     // 梯度诊断只在 eval 步收集(打印 + CSV 用), 见训练循环。
 
     let mut dataloader = SceneLoader::new(&dataset.train, 42, &load_config);
@@ -729,7 +731,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // ---- 训练循环(与标准流程一致, 含 density control + deform) -----------
+    // ---- 训练循环(与标准流程一致, 含 density control; 无 deform) ---------
     for iter in 0..iters {
         let step = iter + 1;
         // 梯度诊断只在 eval 步需要(打印 + CSV): 其余步关闭, 省掉每步 4 次

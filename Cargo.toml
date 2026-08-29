@@ -27,7 +27,6 @@ members = [
     "crates/brush-xray",
     "crates/brush-xray-bwd",
     "crates/colmap-reader",
-    "crates/repro-stale-lift",
     "crates/lpips",
     "crates/lpips-convert",
     "crates/rrfd",
