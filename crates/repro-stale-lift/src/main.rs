@@ -103,6 +103,10 @@ async fn main() {
 
     let steps = 3000u32;
 
+    // 关键: 把训练循环放进 tokio::spawn (worker 线程池), 这样 task 会在 .await 时
+    // 被 work-stealing 迁到不同 worker 线程 —— 复刻 brush 里同一 task 跨线程迁移。
+    // (放在 #[tokio::main] 的 block_on 里则永远停在主线程, StreamId 恒为 0。)
+    let handle = tokio::spawn(async move {
     for step in 0..steps {
         // ---- step (tokio 决定在哪个 worker 线程 poll 这个 future) ----
         let step_cur = StreamId::current().value;
@@ -112,6 +116,12 @@ async fn main() {
 
         let loss = (out.img.clone() - gt.clone()).abs().mean();
         let mut grads = loss.backward();
+        // 复刻 brush step() 每步的 refine_weight readback (grad_remove → into_data,
+        // 会 drain stream 并 mark_read 该 grad 张量)。
+        let _refine_weight = out
+            .refine_weight_holder
+            .grad_remove(&mut grads)
+            .expect("refine weight grad");
         let transforms_id = canonical_ad.transforms.id;
         let opacities_id = canonical_ad.raw_opacities.id;
         let mut gp = GradientsParams::from_module(&mut grads, &canonical_ad);
@@ -167,8 +177,9 @@ async fn main() {
             raw_opacities: burn::module::Param::initialized(opacities_id, new_opac),
         };
 
-        // 每步 yield 一次, 增大 tokio 把后续 future 迁到别的线程的概率。
-        tokio::task::yield_now().await;
+        // 用 sleep 而不是 yield_now: sleep 会把 task 放回全局队列, 允许被其他
+        // worker steal (真实读回 suspend 的等价行为), yield_now 通常回到同线程。
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
 
         if step % 100 == 0 {
             // ---- 在另一个 OS 线程上做检查 (必然不同 StreamId) ----
@@ -201,4 +212,6 @@ async fn main() {
             );
         }
     }
+    });
+    handle.await.unwrap();
 }
