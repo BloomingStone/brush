@@ -63,27 +63,33 @@ fn img_sum(img: &Tensor<2>) -> f32 {
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     let wgpu_device = burn_wgpu::WgpuDevice::DefaultDevice;
+    // 匹配 brush `burn_init_setup` 的 RuntimeOptions (tasks_max=64, ExclusivePages)。
     burn_wgpu::init_setup_async::<burn_wgpu::graphics::AutoGraphicsApi>(
         &wgpu_device,
-        Default::default(),
+        burn_wgpu::RuntimeOptions {
+            tasks_max: 64,
+            memory_config: burn_wgpu::MemoryConfiguration::ExclusivePages,
+        },
     )
     .await;
     let device: burn::tensor::Device = wgpu_device.into();
 
     let cam = std_cam();
-    let img_size = glam::uvec2(64, 64);
-    let n = 2048usize;
+    // 匹配 brush 的全分辨率 (862×634) + splat 数 (14280)。
+    let img_size = glam::uvec2(862, 634);
+    let n = 14280usize;
 
     // 固定随机 GT (驱动梯度, 让 transforms 每步真实变化)。
     let mut seed = 42u64;
-    let gt_vec: Vec<f32> = (0..(64 * 64))
+    let (h, w) = (img_size.y as usize, img_size.x as usize);
+    let gt_vec: Vec<f32> = (0..(h * w))
         .map(|_| {
             seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
             ((seed >> 33) as f32 / (u32::MAX as f32)) * 0.5
         })
         .collect();
     let device_ad = device.clone().autodiff();
-    let gt = Tensor::<2>::from_data(TensorData::new(gt_vec, [64, 64]), &device_ad);
+    let gt = Tensor::<2>::from_data(TensorData::new(gt_vec, [h, w]), &device_ad);
 
     let mut canonical = build_splats(n, &device);
 
@@ -101,7 +107,7 @@ async fn main() {
     let mut mom_o: Option<(Tensor<1>, Tensor<1>)> = None;
     let mut time = 0usize;
 
-    let steps = 3000u32;
+    let steps = 400u32;
 
     // 关键: 把训练循环放进 tokio::spawn (worker 线程池), 这样 task 会在 .await 时
     // 被 work-stealing 迁到不同 worker 线程 —— 复刻 brush 里同一 task 跨线程迁移。
@@ -181,7 +187,7 @@ async fn main() {
         // worker steal (真实读回 suspend 的等价行为), yield_now 通常回到同线程。
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
 
-        if step % 100 == 0 {
+        if step % 40 == 0 {
             // ---- 在另一个 OS 线程上做检查 (必然不同 StreamId) ----
             let c = canonical.clone();
             let h = std::thread::spawn(move || {
