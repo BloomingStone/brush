@@ -1,0 +1,55 @@
+[package]
+name = "brush-fit"
+edition.workspace = true
+version.workspace = true
+readme.workspace = true
+license.workspace = true
+
+# rlib: 供 Rust 程序/其他 crate 调用; cdylib: 供 C/C++/Python 等加载动态库。
+[lib]
+name = "brush_fit"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "brush-fit"
+path = "src/bins/main.rs"
+
+[[bin]]
+name = "brush-fit-dump"
+path = "src/bins/dump_deform.rs"
+
+[dependencies]
+brush-render.path = "../../crates/brush-render"
+brush-vfs.path = "../../crates/brush-vfs"
+brush-serde.path = "../../crates/brush-serde"
+brush-train = { path = "../../crates/brush-train" }
+brush-loss = { path = "../../crates/brush-loss" }
+brush-dataset = { path = "../../crates/brush-dataset" }
+brush-dicom = { path = "../../crates/brush-dicom" }
+brush-deform = { path = "../../crates/brush-deform" }
+brush-xray = { path = "../../crates/brush-xray" }
+brush-xray-bwd = { path = "../../crates/brush-xray-bwd" }
+brush-voxel = { path = "../../crates/brush-voxel" }
+brush-cube = { path = "../../crates/brush-cube" }
+
+burn = { workspace = true, features = ["wgpu"] }
+burn-cubecl.workspace = true
+burn-wgpu.workspace = true
+
+nifti.workspace = true
+ndarray.workspace = true
+flate2.workspace = true
+glam.workspace = true
+
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+log.workspace = true
+rand.workspace = true
+web-time.workspace = true
+tokio = { workspace = true, features = ["io-util", "rt", "rt-multi-thread", "macros"] }
+tokio-stream.workspace = true
+
+[lints]
+workspace = true
