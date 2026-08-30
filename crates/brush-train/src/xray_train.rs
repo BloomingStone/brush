@@ -1108,7 +1108,6 @@ impl XRayTrainer {
         }
         if iter.is_multiple_of(self.config.refine.refine_every) {
             let (canonical, update, stats) = self.refiner.refine(iter, self.canonical.clone()).await;
-            let (canonical, update, stats) = self.refiner.refine(iter, self.canonical.clone()).await;
 
             // Sync optimizer state: keep rows matching `keep_mask`, append
             // zero state for the densified clones.

@@ -68,3 +68,41 @@ env -u DISPLAY CUBECL_WGPU_DEFAULT_DEVICE='DiscreteGpu(1)' \
   eval 更真实, 指标可能变化)。
 - fit_deform 系列实验受相同 bug 影响, 按需重训。
 - 检查 brush-render (普通 3DGS) 的 cov2d 变换是否也存在同型转置问题 (不在本次范围)。
+
+## 追加 (2026-08-30): backward 链式修复 + 双重 refine bug + 完整验证
+
+### backward 链式 bug (端到端数值验证定位)
+修复 forward 后训练不稳定 (rot 梯度爆炸 6.7, loss 反弹) → 逐段数值验证
+(单 splat 单像素, 扰动 scale/quat/mean/vrk 与解析链对比) 发现两处 backward bug:
+
+1. **v_cov3D 约定错误**: dL/dVrk 是"独立元素梯度", 需**双半和**展开:
+   - dS[c][d] (c≤d) = Σ_{i≤j} v[i][j]·J[c][i]·J[d][j] (对角) / 含交叉项 (非对角)
+   - dVrk[a][b] = Σ_{c≤d} dS[c][d]·w[c][a]·w[d][a] (对角) / 交叉 (非对角)
+   - 不能用纯矩阵 congruence (对角项权重不同)。数值验证 1e-11。
+2. **compute_cov3d_bwd 的 quat 梯度公式错** (R2 移植, 非各向同性时错):
+   - 正确: dL/dR = dL/dMᵀ·S (行转置×scale); dq_k = tr(dL/dRᵀ·∂R/∂q_k)
+   - 标准四元数导数展开。数值验证 3e-10 (含 dnormvdv4)。
+
+端到端验证: scale err 3.6e-11, quat err 3.0e-10, mean err ~1% (像素 VJP 符号核对)。
+
+### 双重 refine bug (导致 stats 覆盖 + 状态错乱)
+`maybe_refine` 里 `refiner.refine()` 被调用两次 (重复行, commit 0306f043b 引入):
+第一次实际执行 split (diag: split=393), 第二次 (accumulator 已重置) 返回
+split=0 覆盖 stats → 日志恒 "split 0" + optimizer 状态同步基于第二次 update。
+修复: 删除重复行 → split 正常 (iter 800: split 2261)。
+
+### 完整验证 (新训练 5000p/5000 步, GPU1, 修复后全部代码)
+```
+fit_static images/RXA_chest.dcm --points=5000 --refine-every=400 --eval-split-every=5 \
+  --eval-views=8 --eval-every=1000 --cull-density=0.001 --iters=5000
+```
+- iter 5000: loss 0.2243, PSNR 30.04, SSIM 0.957, LPIPS 0.4965, 15140 splats
+- splats 增长正常 (5000→15140, iter 800 起 split 2261/次)
+- 梯度稳定 (rot ~3e-3 不爆炸)
+
+gs2volume --compare-drr (自适应网格 800³):
+- **全部 8 视图 mean|drr-gs| ≤ 0.011 (大部分 0.003)**, gs_sum/drr_sum 差 <0.5%
+- view 0: 0.123 → 0.003; view 19: 0.030 → 0.004
+- **eval pred vs gs2volume GS (bin 重渲): max diff 1.8e-7** (逐位一致)
+
+产物: v7-verify/ (compare_*.nrrd + fit_metrics.csv)。
