@@ -106,3 +106,10 @@ gs2volume --compare-drr (自适应网格 800³):
 - **eval pred vs gs2volume GS (bin 重渲): max diff 1.8e-7** (逐位一致)
 
 产物: v7-verify/ (compare_*.nrrd + fit_metrics.csv)。
+
+## 追加 (2026-08-30): 完整训练产物存档
+- `v7-verify/train_output/`: fit_static v7 完整输出 (5000p/5000 步, RXA_chest.dcm, GPU1)
+  - `eval/bin/canonical_final_{transforms,raw}.bin`: 最终 splats 原始参数 (供 gs2volume 复用)
+  - `eval/ply/canonical_final.ply`: 点云 (激活域)
+  - `eval/nrrd/gt_pred_{00000..05000}.nrrd` + `gt_pred_10000_FWD.nrrd`: 训练 eval 投影对比 + 导出时 FWD 重渲
+  - `metrics.csv`: 训练曲线 (loss/PSNR/SSIM/LPIPS)
