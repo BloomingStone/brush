@@ -1,0 +1,233 @@
+[12:59:54] brush-fit deform -> experiments/output/260831-1300_brush-fit-verify/deform
+ROI crop: full 648x474 -> (20,20) 608x434
+[loaded] 321 views, frame0 608x434
+[cardiac phase] 321 views, range [0.013, 0.988], 64 unique values
+[real time] [0.013, 5.012] s (321 frames, 5.000 s total)
+[auto scene_extent] 264.0 mm (min(SOD 760, SDD-SOD 440) x 0.6)
+[auto gamma] = 1.000 (median -> 0.50)
+FOV filter: kept 5000/5000 random points (rejected 7347 outside every view)
+[13:00:07] init splats: 5000 (init region Ball { radius: 264.0 }, r=264mm, init μ=0.01 mm⁻¹, lr_mean=0.00002->0.000002)
+[eval] held-out set: 81 views
+[13:00:07] eval on 8 views every 1000 steps
+[13:00:07] logging metrics -> experiments/output/260831-1300_brush-fit-verify/deform/metrics.csv
+[13:00:20] saved experiments/output/260831-1300_brush-fit-verify/deform/eval/nrrd/gt_pred_00000.nrrd (8 views stacked)
+[13:00:20] iter init psnr=  5.78 ssim=0.137 lpips=0.6823
+[13:00:46] refine iter 400: 5000 splats (added 0, split 0, pruned 0) grad_thr=-1 | >R0=4040/5000 (80.8%), meanμ=0.00749
+[13:00:55] refine iter 800: 8906 splats (added 3906, split 3906, pruned 0) grad_thr=0.000005 | >R0=7219/8906 (81.1%), meanμ=0.00640
+[13:01:24] saved experiments/output/260831-1300_brush-fit-verify/deform/eval/nrrd/gt_pred_01000.nrrd (8 views stacked)
+[13:01:24] iter 1000 loss=  0.2258 psnr= 31.70 ssim=0.971 lpips=0.4447 visible=8903 splats=8906 (eval 8 views) | grads mean=3.7e-5 rot=1.5e-4 scale=3.0e-4 density=5.2e-5 | pos step≈4.68e-10mm
+[13:01:29] refine iter 1200: 14790 splats (added 6033, split 6033, pruned 149) grad_thr=0.000005 | >R0=12198/14790 (82.5%), meanμ=0.00434
+[13:01:45] refine iter 1600: 19501 splats (added 5970, split 5970, pruned 1259) grad_thr=0.000005 | >R0=16030/19501 (82.2%), meanμ=0.00336
+[13:02:09] refine iter 2000: 22967 splats (added 5533, split 5533, pruned 2067) grad_thr=0.000005 | >R0=18248/22967 (79.5%), meanμ=0.00295
+[13:02:15] saved experiments/output/260831-1300_brush-fit-verify/deform/eval/nrrd/gt_pred_02000.nrrd (8 views stacked)
+[13:02:15] iter 2000 loss=  0.1482 psnr= 25.64 ssim=0.958 lpips=0.4887 visible=19219 splats=19501 (eval 8 views) | grads mean=1.5e-5 rot=5.1e-5 scale=1.3e-4 density=3.4e-5 | pos step≈1.17e-10mm
+[13:02:37] refine iter 2400: 26113 splats (added 5355, split 5355, pruned 2209) grad_thr=0.000005 | >R0=19794/26113 (75.8%), meanμ=0.00271
+[13:02:58] refine iter 2800: 28702 splats (added 4882, split 4882, pruned 2293) grad_thr=0.000005 | >R0=20565/28702 (71.7%), meanμ=0.00256
+[13:03:12] saved experiments/output/260831-1300_brush-fit-verify/deform/eval/nrrd/gt_pred_03000.nrrd (8 views stacked)
+[13:03:12] iter 3000 loss=  0.1239 psnr= 36.14 ssim=0.978 lpips=0.3510 visible=28603 splats=28702 (eval 8 views) | grads mean=1.2e-5 rot=4.6e-5 scale=9.7e-5 density=3.1e-5 | pos step≈5.92e-11mm
+[13:03:23] refine iter 3200: 31242 splats (added 4676, split 4676, pruned 2136) grad_thr=0.000005 | >R0=21138/31242 (67.7%), meanμ=0.00245
+[13:03:48] refine iter 3600: 32874 splats (added 3705, split 3705, pruned 2073) grad_thr=0.000005 | >R0=21074/32874 (64.1%), meanμ=0.00236
+[13:04:16] refine iter 4000: 34011 splats (added 2915, split 2915, pruned 1778) grad_thr=0.000005 | >R0=20853/34011 (61.3%), meanμ=0.00230
+[13:04:19] saved experiments/output/260831-1300_brush-fit-verify/deform/eval/nrrd/gt_pred_04000.nrrd (8 views stacked)
+[13:04:19] iter 4000 loss=  0.0949 psnr= 30.85 ssim=0.971 lpips=0.4179 visible=32748 splats=32874 (eval 8 views) | grads mean=9.5e-6 rot=3.6e-5 scale=9.0e-5 density=3.1e-5 | pos step≈3.02e-11mm
+[13:04:45] refine iter 4400: 34435 splats (added 2120, split 2120, pruned 1696) grad_thr=0.000005 | >R0=20393/34435 (59.2%), meanμ=0.00227
+[13:05:28] saved experiments/output/260831-1300_brush-fit-verify/deform/eval/nrrd/gt_pred_05000.nrrd (8 views stacked)
+[13:05:28] iter 5000 loss=  0.0782 psnr= 39.76 ssim=0.984 lpips=0.2616 visible=34310 splats=34435 (eval 8 views) | grads mean=8.0e-6 rot=3.5e-5 scale=8.1e-5 density=3.0e-5 | pos step≈1.60e-11mm
+[export] deform ckpt -> experiments/output/260831-1300_brush-fit-verify/deform/deform_final.bin
+[export] deform field via brush-fit-dump (spacing 4.12mm, cell 8.25mm, 每单元 2.0 采样)...
+[dump] loaded experiments/output/260831-1300_brush-fit-verify/deform/deform_final.bin (coord_scale=264, rs=64)
+[dump] grid 128^3, spacing 4.125mm (cell 8.25mm, 每单元 2.0 采样)
+[dump] phase=0.000 -> experiments/output/260831-1300_brush-fit-verify/deform/deform_field_phase00.npy / experiments/output/260831-1300_brush-fit-verify/deform/deform_field_phase00.nii.gz
+[dump] phase=0.125 -> experiments/output/260831-1300_brush-fit-verify/deform/deform_field_phase01.npy / experiments/output/260831-1300_brush-fit-verify/deform/deform_field_phase01.nii.gz
+[dump] phase=0.250 -> experiments/output/260831-1300_brush-fit-verify/deform/deform_field_phase02.npy / experiments/output/260831-1300_brush-fit-verify/deform/deform_field_phase02.nii.gz
+[dump] phase=0.375 -> experiments/output/260831-1300_brush-fit-verify/deform/deform_field_phase03.npy / experiments/output/260831-1300_brush-fit-verify/deform/deform_field_phase03.nii.gz
+[dump] phase=0.500 -> experiments/output/260831-1300_brush-fit-verify/deform/deform_field_phase04.npy / experiments/output/260831-1300_brush-fit-verify/deform/deform_field_phase04.nii.gz
+[dump] phase=0.625 -> experiments/output/260831-1300_brush-fit-verify/deform/deform_field_phase05.npy / experiments/output/260831-1300_brush-fit-verify/deform/deform_field_phase05.nii.gz
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/cubecl-058c47895211d464/ba103c7/crates/cubecl-runtime/src/memory_management/memory_manage.rs:418:9:
+assertion `left == right` failed
+  left: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 6 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 1 } }
+ right: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 412 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 0 } }
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/cubecl-058c47895211d464/ba103c7/crates/cubecl-runtime/src/memory_management/memory_manage.rs:418:9:
+assertion `left == right` failed
+  left: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 6 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 1 } }
+ right: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 412 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 0 } }
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/cubecl-058c47895211d464/ba103c7/crates/cubecl-runtime/src/memory_management/memory_manage.rs:418:9:
+assertion `left == right` failed
+  left: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 6 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 1 } }
+ right: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 412 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 0 } }
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/cubecl-058c47895211d464/ba103c7/crates/cubecl-runtime/src/memory_management/memory_manage.rs:418:9:
+assertion `left == right` failed
+  left: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 6 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 1 } }
+ right: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 412 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 0 } }
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/cubecl-058c47895211d464/ba103c7/crates/cubecl-runtime/src/memory_management/memory_manage.rs:418:9:
+assertion `left == right` failed
+  left: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 6 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 1 } }
+ right: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 414 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 0 } }
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/cubecl-058c47895211d464/ba103c7/crates/cubecl-runtime/src/memory_management/memory_manage.rs:418:9:
+assertion `left == right` failed
+  left: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 6 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 1 } }
+ right: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 415 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 0 } }
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/cubecl-058c47895211d464/ba103c7/crates/cubecl-runtime/src/memory_management/memory_manage.rs:418:9:
+assertion `left == right` failed
+  left: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 6 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 1 } }
+ right: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 415 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 0 } }
+[dump] phase=0.750 -> experiments/output/260831-1300_brush-fit-verify/deform/deform_field_phase06.npy / experiments/output/260831-1300_brush-fit-verify/deform/deform_field_phase06.nii.gz
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/cubecl-058c47895211d464/ba103c7/crates/cubecl-runtime/src/memory_management/memory_manage.rs:418:9:
+assertion `left == right` failed
+  left: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 6 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 1 } }
+ right: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 459 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 0 } }
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/cubecl-058c47895211d464/ba103c7/crates/cubecl-runtime/src/memory_management/memory_manage.rs:418:9:
+assertion `left == right` failed
+  left: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 6 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 1 } }
+ right: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 459 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 0 } }
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/cubecl-058c47895211d464/ba103c7/crates/cubecl-runtime/src/memory_management/memory_manage.rs:418:9:
+assertion `left == right` failed
+  left: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 6 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 1 } }
+ right: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 461 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 0 } }
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/cubecl-058c47895211d464/ba103c7/crates/cubecl-runtime/src/memory_management/memory_manage.rs:418:9:
+assertion `left == right` failed
+  left: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 6 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 1 } }
+ right: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 461 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 0 } }
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/cubecl-058c47895211d464/ba103c7/crates/cubecl-runtime/src/memory_management/memory_manage.rs:418:9:
+assertion `left == right` failed
+  left: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 6 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 1 } }
+ right: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 461 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 0 } }
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/cubecl-058c47895211d464/ba103c7/crates/cubecl-runtime/src/memory_management/memory_manage.rs:418:9:
+assertion `left == right` failed
+  left: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 6 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 1 } }
+ right: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 461 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 0 } }
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/cubecl-058c47895211d464/ba103c7/crates/cubecl-runtime/src/memory_management/memory_manage.rs:418:9:
+assertion `left == right` failed
+  left: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 6 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 1 } }
+ right: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 463 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 0 } }
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/cubecl-058c47895211d464/ba103c7/crates/cubecl-runtime/src/memory_management/memory_manage.rs:418:9:
+assertion `left == right` failed
+  left: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 6 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 1 } }
+ right: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 464 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 0 } }
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/cubecl-058c47895211d464/ba103c7/crates/cubecl-runtime/src/memory_management/memory_manage.rs:418:9:
+assertion `left == right` failed
+  left: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 6 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 1 } }
+ right: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 464 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 0 } }
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/cubecl-058c47895211d464/ba103c7/crates/cubecl-runtime/src/memory_management/memory_manage.rs:418:9:
+assertion `left == right` failed
+  left: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 6 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 1 } }
+ right: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 469 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 0 } }
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/cubecl-058c47895211d464/ba103c7/crates/cubecl-runtime/src/memory_management/memory_manage.rs:418:9:
+assertion `left == right` failed
+  left: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 6 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 1 } }
+ right: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 470 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 0 } }
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/cubecl-058c47895211d464/ba103c7/crates/cubecl-runtime/src/memory_management/memory_manage.rs:418:9:
+assertion `left == right` failed
+  left: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 6 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 1 } }
+ right: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 480 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 0 } }
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/cubecl-058c47895211d464/ba103c7/crates/cubecl-runtime/src/memory_management/memory_manage.rs:418:9:
+assertion `left == right` failed
+  left: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 6 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 1 } }
+ right: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 480 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 0 } }
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+
+thread 'DSD-4-0' (3229196) panicked at /home/shi_jie/.cargo/git/checkouts/cubecl-058c47895211d464/ba103c7/crates/cubecl-runtime/src/memory_management/memory_manage.rs:418:9:
+assertion `left == right` failed
+  left: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 6 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 1 } }
+ right: ManagedMemoryDescriptor { id: ManagedMemoryId { value: 480 }, location: MemoryLocation { pool: 0, page: 0, slice: 0, init: 0 } }
+[dump] phase=0.875 -> experiments/output/260831-1300_brush-fit-verify/deform/deform_field_phase07.npy / experiments/output/260831-1300_brush-fit-verify/deform/deform_field_phase07.nii.gz
+[dump] done -> experiments/output/260831-1300_brush-fit-verify/deform/deform_field
+[volume] deform phase=0, time=0: max |d| = 79.52 mm (含 d_rotation)
+[volume] adaptive grid: splat |mean|+3σ p99.9 = (262,279,169) max = (269,301,200)mm -> half XY 279mm Z 169mm (cap 400)
+[volume] grid 558x558x337 @ 1.00mm (span XY 558mm Z 337mm)
+[export] volume -> experiments/output/260831-1300_brush-fit-verify/deform/volume_phase00.nii.gz
+[export] ply -> experiments/output/260831-1300_brush-fit-verify/deform/canonical_final.ply
+[13:05:43] learned time freqs (Hz): 0.200 0.250 0.313 0.391 0.490 0.613 0.766 0.959 1.199 1.500
+[13:05:43] done -> experiments/output/260831-1300_brush-fit-verify/deform

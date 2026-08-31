@@ -1,0 +1,42 @@
+[12:59:53] brush-fit static -> experiments/output/260831-1300_brush-fit-verify/static
+ROI crop: full 862x634 -> (20,20) 822x594
+[loaded] 149 views, frame0 822x594
+[cardiac phase] 149 views, range [0.000, 0.000], 1 unique values
+[real time] [0.017, 3.100] s (149 frames, 3.083 s total)
+[auto scene_extent] 264.0 mm (min(SOD 760, SDD-SOD 440) x 0.6)
+[auto gamma] = 0.257 (median -> 0.50)
+[init] cylinder: R=180.4 (R0 120.3 x 1.5), half_h=107.5, N=12018 (density base 5000 @ R0)
+FOV filter: kept 5000/5000 random points (rejected 339 outside every view)
+[13:00:03] init splats: 5000 (init region Cylinder { radius: 180.3894, half_height: 107.529724 }, r=263.99402mm, init μ=0.002 mm⁻¹, lr_mean=0.00002->0.000002)
+[eval] held-out set: 38 views
+[13:00:03] eval on 8 views every 1000 steps
+[13:00:03] logging metrics -> experiments/output/260831-1300_brush-fit-verify/static/metrics.csv
+[13:00:06] saved experiments/output/260831-1300_brush-fit-verify/static/eval/nrrd/gt_pred_00000.nrrd (8 views stacked)
+[13:00:06] iter init psnr= 15.49 ssim=0.895 lpips=0.6738
+[13:00:20] refine iter 400: 3755 splats (added 0, split 0, pruned 1245) grad_thr=-1 | >R0=2661/3755 (70.9%), meanμ=0.00188
+[13:00:35] refine iter 800: 5250 splats (added 2280, split 2280, pruned 785) grad_thr=0.000005 | >R0=3537/5250 (67.4%), meanμ=0.00200
+[13:00:45] saved experiments/output/260831-1300_brush-fit-verify/static/eval/nrrd/gt_pred_01000.nrrd (8 views stacked)
+[13:00:45] iter 1000 loss=  0.3140 psnr= 30.28 ssim=0.959 lpips=0.5263 visible=5244 splats=5250 (eval 8 views) | grads mean=3.9e-5 rot=2.3e-4 scale=5.2e-4 density=1.8e-4 | pos step≈4.89e-10mm
+[13:00:53] refine iter 1200: 7194 splats (added 2939, split 2939, pruned 995) grad_thr=0.000005 | >R0=4558/7194 (63.4%), meanμ=0.00212
+[13:01:09] refine iter 1600: 10020 splats (added 3953, split 3953, pruned 1127) grad_thr=0.000005 | >R0=6057/10020 (60.4%), meanμ=0.00219
+[13:01:26] refine iter 2000: 13578 splats (added 4845, split 4845, pruned 1287) grad_thr=0.000005 | >R0=7821/13578 (57.6%), meanμ=0.00223
+[13:01:29] saved experiments/output/260831-1300_brush-fit-verify/static/eval/nrrd/gt_pred_02000.nrrd (8 views stacked)
+[13:01:29] iter 2000 loss=  0.1654 psnr= 28.34 ssim=0.952 lpips=0.5471 visible=10009 splats=10020 (eval 8 views) | grads mean=1.4e-5 rot=8.5e-5 scale=4.1e-4 density=1.4e-4 | pos step≈1.15e-10mm
+[13:01:47] refine iter 2400: 17149 splats (added 5209, split 5209, pruned 1638) grad_thr=0.000005 | >R0=9561/17149 (55.8%), meanμ=0.00225
+[13:02:06] refine iter 2800: 20383 splats (added 4841, split 4841, pruned 1607) grad_thr=0.000005 | >R0=11211/20383 (55.0%), meanμ=0.00225
+[13:02:19] saved experiments/output/260831-1300_brush-fit-verify/static/eval/nrrd/gt_pred_03000.nrrd (8 views stacked)
+[13:02:19] iter 3000 loss=  0.1648 psnr= 31.31 ssim=0.960 lpips=0.4577 visible=20378 splats=20383 (eval 8 views) | grads mean=1.4e-5 rot=5.7e-5 scale=1.6e-4 density=5.9e-5 | pos step≈6.98e-11mm
+[13:02:29] refine iter 3200: 22245 splats (added 3657, split 3657, pruned 1795) grad_thr=0.000005 | >R0=12368/22245 (55.6%), meanμ=0.00224
+[13:02:50] refine iter 3600: 23391 splats (added 2657, split 2657, pruned 1511) grad_thr=0.000005 | >R0=13087/23391 (55.9%), meanμ=0.00223
+[13:03:10] refine iter 4000: 24261 splats (added 2194, split 2194, pruned 1324) grad_thr=0.000005 | >R0=13662/24261 (56.3%), meanμ=0.00222
+[13:03:13] saved experiments/output/260831-1300_brush-fit-verify/static/eval/nrrd/gt_pred_04000.nrrd (8 views stacked)
+[13:03:13] iter 4000 loss=  0.1985 psnr= 30.37 ssim=0.958 lpips=0.4680 visible=23381 splats=23391 (eval 8 views) | grads mean=1.3e-5 rot=5.5e-5 scale=2.0e-4 density=7.4e-5 | pos step≈4.04e-11mm
+[13:03:34] refine iter 4400: 24701 splats (added 1783, split 1783, pruned 1343) grad_thr=0.000005 | >R0=13965/24701 (56.5%), meanμ=0.00221
+[13:04:08] saved experiments/output/260831-1300_brush-fit-verify/static/eval/nrrd/gt_pred_05000.nrrd (8 views stacked)
+[13:04:08] iter 5000 loss=  0.1933 psnr= 31.68 ssim=0.962 lpips=0.4131 visible=24678 splats=24701 (eval 8 views) | grads mean=1.2e-5 rot=5.1e-5 scale=2.0e-4 density=7.3e-5 | pos step≈2.48e-11mm
+[volume] adaptive grid: splat |mean|+3σ p99.9 = (217,190,143) max = (252,228,232)mm -> half XY 217mm Z 143mm (cap 400)
+[volume] grid 435x435x286 @ 1.00mm (span XY 435mm Z 286mm)
+[export] volume -> experiments/output/260831-1300_brush-fit-verify/static/volume_phase00.nii.gz
+[export] ply -> experiments/output/260831-1300_brush-fit-verify/static/canonical_final.ply
+[export] bin -> experiments/output/260831-1300_brush-fit-verify/static/canonical_final_transforms.bin / _raw.bin
+[13:04:11] done -> experiments/output/260831-1300_brush-fit-verify/static
