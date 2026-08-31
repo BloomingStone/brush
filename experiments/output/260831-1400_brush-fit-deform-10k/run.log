@@ -1,0 +1,44 @@
+[13:52:41] brush-fit deform -> experiments/output/260831-1400_brush-fit-deform-10k
+ROI crop: full 648x474 -> (20,20) 608x434
+[loaded] 321 views, frame0 608x434
+[cardiac phase] 321 views, range [0.013, 0.988], 64 unique values
+[real time] [0.013, 5.012] s (321 frames, 5.000 s total)
+[auto scene_extent] 264.0 mm (min(SOD 760, SDD-SOD 440) x 0.6)
+[auto gamma] = 1.000 (median -> 0.50)
+FOV filter: kept 5000/5000 random points (rejected 7347 outside every view)
+[13:52:53] init splats: 5000 (init region Ball { radius: 264.0 }, r=264mm, init μ=0.01 mm⁻¹, lr_mean=0.00002->0.000002)
+[eval] held-out set: 81 views
+[13:52:53] eval on 8 views every 10000 steps
+[13:52:53] logging metrics -> experiments/output/260831-1400_brush-fit-deform-10k/metrics.csv
+[13:53:00] saved experiments/output/260831-1400_brush-fit-deform-10k/eval/nrrd/gt_pred_00000.nrrd (8 views stacked)
+[13:53:00] iter init psnr=  5.78 ssim=0.137 lpips=0.6824
+[13:53:14] refine iter 400: 5000 splats (added 0, split 0, pruned 0) grad_thr=-1 | >R0=4040/5000 (80.8%), meanμ=0.00771
+[13:53:23] refine iter 800: 8603 splats (added 3603, split 3603, pruned 0) grad_thr=0.000005 | >R0=6970/8603 (81.0%), meanμ=0.00667
+[13:53:36] refine iter 1200: 14227 splats (added 5776, split 5776, pruned 152) grad_thr=0.000005 | >R0=11668/14227 (82.0%), meanμ=0.00470
+[13:53:49] refine iter 1600: 19279 splats (added 6349, split 6349, pruned 1297) grad_thr=0.000005 | >R0=15989/19279 (82.9%), meanμ=0.00370
+[13:54:10] refine iter 2000: 23596 splats (added 6606, split 6606, pruned 2289) grad_thr=0.000005 | >R0=19634/23596 (83.2%), meanμ=0.00323
+[13:54:31] refine iter 2400: 27624 splats (added 6602, split 6602, pruned 2574) grad_thr=0.000005 | >R0=22740/27624 (82.3%), meanμ=0.00291
+[13:54:52] refine iter 2800: 30678 splats (added 5914, split 5914, pruned 2860) grad_thr=0.000005 | >R0=24889/30678 (81.1%), meanμ=0.00265
+[13:55:14] refine iter 3200: 32604 splats (added 4911, split 4911, pruned 2985) grad_thr=0.000005 | >R0=25792/32604 (79.1%), meanμ=0.00245
+[13:55:37] refine iter 3600: 33617 splats (added 3980, split 3980, pruned 2967) grad_thr=0.000005 | >R0=25792/33617 (76.7%), meanμ=0.00229
+[13:56:05] refine iter 4000: 34445 splats (added 3661, split 3661, pruned 2833) grad_thr=0.000005 | >R0=25533/34445 (74.1%), meanμ=0.00219
+[13:56:31] refine iter 4400: 35153 splats (added 3460, split 3460, pruned 2752) grad_thr=0.000005 | >R0=25217/35153 (71.7%), meanμ=0.00212
+[13:56:56] refine iter 4800: 35816 splats (added 3383, split 3383, pruned 2720) grad_thr=0.000005 | >R0=24954/35816 (69.7%), meanμ=0.00207
+[13:57:22] refine iter 5200: 36349 splats (added 3243, split 3243, pruned 2710) grad_thr=0.000005 | >R0=24600/36349 (67.7%), meanμ=0.00201
+[13:57:47] refine iter 5600: 37042 splats (added 3193, split 3193, pruned 2500) grad_thr=0.000005 | >R0=24437/37042 (66.0%), meanμ=0.00198
+[13:58:14] refine iter 6000: 37721 splats (added 3247, split 3247, pruned 2568) grad_thr=0.000005 | >R0=24223/37721 (64.2%), meanμ=0.00195
+[13:58:40] refine iter 6400: 38086 splats (added 3072, split 3072, pruned 2707) grad_thr=0.000005 | >R0=24012/38086 (63.0%), meanμ=0.00193
+[13:59:07] refine iter 6800: 38431 splats (added 2965, split 2965, pruned 2620) grad_thr=0.000005 | >R0=23737/38431 (61.8%), meanμ=0.00191
+[13:59:33] refine iter 7200: 38649 splats (added 2841, split 2841, pruned 2623) grad_thr=0.000005 | >R0=23509/38649 (60.8%), meanμ=0.00191
+[14:00:01] refine iter 7600: 38931 splats (added 2712, split 2712, pruned 2430) grad_thr=0.000005 | >R0=23334/38931 (59.9%), meanμ=0.00189
+[14:00:27] refine iter 8000: 39137 splats (added 2650, split 2650, pruned 2444) grad_thr=0.000005 | >R0=23183/39137 (59.2%), meanμ=0.00188
+[14:00:55] refine iter 8400: 39271 splats (added 2619, split 2619, pruned 2485) grad_thr=0.000005 | >R0=23017/39271 (58.6%), meanμ=0.00187
+[14:01:23] refine iter 8800: 39326 splats (added 2424, split 2424, pruned 2369) grad_thr=0.000005 | >R0=22821/39326 (58.0%), meanμ=0.00186
+[14:02:50] saved experiments/output/260831-1400_brush-fit-deform-10k/eval/nrrd/gt_pred_10000.nrrd (8 views stacked)
+[14:02:50] iter 10000 loss=  0.0493 psnr= 43.61 ssim=0.993 lpips=0.1440 visible=38927 splats=39326 (eval 8 views) | grads mean=6.8e-6 rot=3.2e-5 scale=6.3e-5 density=3.5e-5 | pos step≈1.37e-11mm
+[volume] deform phase=0, time=0: max |d| = 50.27 mm (含 d_rotation)
+[volume] grid = image iso-extent: half XY 118.6mm (W 237mm) Z 84.7mm (H 169mm)
+[volume] grid 237x237x169 @ 1.00mm (span XY 237mm Z 169mm)
+[export] volume -> experiments/output/260831-1400_brush-fit-deform-10k/volume_phase00.nii.gz
+[export] ply -> experiments/output/260831-1400_brush-fit-deform-10k/canonical_final.ply
+[14:02:51] done -> experiments/output/260831-1400_brush-fit-deform-10k
