@@ -77,19 +77,52 @@ println!("volume: {}", outcome.volume_phase0.display());
 fit_static/fit_deform CLI 一致的默认值。带进度回调版本:
 `run_static_with_progress(cfg, Box::new(|p| ...))` (`FitProgress::Step/Done`)。
 
-## C FFI (libbrush_fit.so)
+## C ABI (libbrush_fit.so)
+
+构建产物 `target/release/libbrush_fit.so` (cdylib), 头文件
+`apps/brush-fit/include/brush_fit.h`。三个导出符号:
 
 ```c
-// config 为 FitConfig 的 JSON (snake_case), 同步阻塞, 返回 0=成功
+// config 为 FitConfig 的 JSON (snake_case, 缺失字段用默认), 同步阻塞, 返回 0=成功
 int brush_fit_run(const char* config_json, char* errbuf, size_t errbuf_len);
-// 可选: 注册进度回调 extern "C" void cb(uint32_t iter, uint32_t total,
-//       float loss, void* user_data) — 训练开始前调用
+// 注册进度回调 (训练开始前调用): iter=0,total=0 表示结束
 void brush_fit_set_progress_cb(brush_fit_progress_cb cb, void* user_data);
-// 生成示例 config JSON (写入 errbuf), 返回 0
+// 生成示例 config JSON (全部字段+默认值, 写入 errbuf), 返回 0
 int brush_fit_example_config(char* errbuf, size_t errbuf_len);
 ```
 
-Python 示例:
+C 程序编译链接:
+
+```bash
+gcc my_prog.c -I apps/brush-fit/include -L target/release -lbrush_fit \
+    -Wl,-rpath,$PWD/target/release -o my_prog
+```
+
+C 示例:
+
+```c
+#include <stdio.h>
+#include "brush_fit.h"
+
+static int steps = 0;
+static void on_progress(uint32_t iter, uint32_t total, float loss, void* ud) {
+    (void)ud; steps++;
+    if (iter == 0 && total == 0) printf("[done]\n");
+    else printf("step %u/%u loss=%.4f\n", iter, total, loss);
+}
+int main(void) {
+    char err[4096];
+    brush_fit_set_progress_cb(on_progress, NULL);
+    const char* cfg =
+        "{\"dcm\":\"images/RXA_chest.dcm\",\"out\":\"/tmp/fit\","
+        "\"mode\":\"static\",\"points\":200,\"iters\":200}";
+    int rc = brush_fit_run(cfg, err, sizeof err);
+    if (rc) fprintf(stderr, "err: %s\n", err);
+    return rc;
+}
+```
+
+Python 示例 (ctypes):
 
 ```python
 import ctypes, json
@@ -100,6 +133,11 @@ cfg = dict(dcm='images/RXA_chest.dcm', out='/tmp/fit', mode='static',
 err = ctypes.create_string_buffer(4096)
 rc = lib.brush_fit_run(json.dumps(cfg).encode(), err, 4096)
 ```
+
+注意:
+- 进度回调的 `loss` 在默认 no-eval 下为 NaN (loss 只读回于 eval 步)。
+- 需 GPU 环境 (选卡见构建节); 多进程/多线程同时 `brush_fit_run` 不保证安全
+  (全局 wgpu 设备 + 一次训练)。
 
 ## 注意事项
 
