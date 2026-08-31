@@ -33,8 +33,104 @@ fn burn_options() -> RuntimeOptions {
 }
 
 pub async fn burn_init_setup() -> WgpuDevice {
-    burn_wgpu::init_setup_async::<AutoGraphicsApi>(&WgpuDevice::DefaultDevice, burn_options())
-        .await;
+    // 图形后端按序尝试、失败自动降级 (cubecl-wgpu 枚举不到适配器时直接
+    // panic, 无法在 async 上下文 catch → 独立 current_thread runtime +
+    // catch_unwind 隔离每次尝试):
+    //   Windows: dx12 → vulkan → opengl; macOS: metal; 其他: vulkan → opengl
+    // BRUSH_FIT_GRAPHICS_API 可指定单个或逗号列表 (dx12,vulkan,opengl,...)。
+    #[derive(Clone)]
+    enum ApiKind {
+        Dx12,
+        Vulkan,
+        OpenGl,
+        Metal,
+        Auto,
+    }
+    impl ApiKind {
+        fn name(&self) -> &'static str {
+            match self {
+                Self::Dx12 => "dx12",
+                Self::Vulkan => "vulkan",
+                Self::OpenGl => "opengl",
+                Self::Metal => "metal",
+                Self::Auto => "auto",
+            }
+        }
+        async fn init(&self) -> WgpuDevice {
+            match self {
+                Self::Dx12 => init_setup_gpu::<burn_wgpu::graphics::Dx12>().await,
+                Self::Vulkan => init_setup_gpu::<burn_wgpu::graphics::Vulkan>().await,
+                Self::OpenGl => init_setup_gpu::<burn_wgpu::graphics::OpenGl>().await,
+                Self::Metal => init_setup_gpu::<burn_wgpu::graphics::Metal>().await,
+                Self::Auto => init_setup_gpu::<AutoGraphicsApi>().await,
+            }
+        }
+    }
+    use ApiKind as A;
+    let candidates: Vec<ApiKind> = match std::env::var("BRUSH_FIT_GRAPHICS_API") {
+        Ok(v) => v
+            .split(',')
+            .map(|s| match s.trim().to_ascii_lowercase().as_str() {
+                "dx12" | "d3d12" => A::Dx12,
+                "vulkan" => A::Vulkan,
+                "opengl" | "gl" => A::OpenGl,
+                "metal" => A::Metal,
+                "auto" => A::Auto,
+                other => {
+                    log::warn!("未知 BRUSH_FIT_GRAPHICS_API 值 '{other}', 忽略");
+                    A::Auto
+                }
+            })
+            .collect(),
+        Err(_) => {
+            if cfg!(target_os = "windows") {
+                vec![A::Dx12, A::Vulkan, A::OpenGl]
+            } else if cfg!(target_os = "macos") {
+                vec![A::Metal]
+            } else {
+                vec![A::Vulkan, A::OpenGl]
+            }
+        }
+    };
+    let mut last_err = None;
+    for api in &candidates {
+        // 独立线程 + current_thread runtime 隔离每次尝试 (async 上下文嵌套
+        // runtime 会 panic; join 捕获 cubecl-wgpu 的适配器枚举 panic)。
+        let handle = {
+            let api = api.clone();
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("temporary runtime")
+                    .block_on(api.init())
+            })
+        };
+        match handle.join() {
+            Ok(dev) => {
+                log::info!("wgpu 后端初始化成功: {}", api.name());
+                return dev;
+            }
+            Err(e) => {
+                let msg = e
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| e.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_owned());
+                log::warn!("wgpu 后端 {} 初始化失败: {msg}", api.name());
+                last_err = Some(format!("{}: {msg}", api.name()));
+            }
+        }
+    }
+    panic!(
+        "所有 wgpu 图形后端初始化失败 ({}) — 检查 GPU 驱动, 或设置 \
+         BRUSH_FIT_GRAPHICS_API=dx12,vulkan,opengl 指定后端",
+        last_err.unwrap_or_else(|| "无候选".to_owned())
+    );
+}
+
+async fn init_setup_gpu<G: burn_wgpu::graphics::GraphicsApi>() -> WgpuDevice {
+    burn_wgpu::init_setup_async::<G>(&WgpuDevice::DefaultDevice, burn_options()).await;
     connect_device(WgpuDevice::DefaultDevice);
     WgpuDevice::DefaultDevice
 }
