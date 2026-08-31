@@ -746,7 +746,7 @@ async fn main() -> anyhow::Result<()> {
                     raw.clone(),
                     &device_ad,
                 );
-                let out = brush_xray_bwd::render_xray(splats_ad, &cam, img, 1.0, false).await;
+                let out = brush_xray_bwd::render_xray(splats_ad, &cam, img, 1.0, false, 0.0).await;
                 out.img
             } else {
                 render_xray_forward(&splats, &cam, img, 1.0).await

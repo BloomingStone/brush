@@ -56,7 +56,7 @@ async fn autodiff_grads_match_pipeline() {
     );
 
     // Differentiable forward.
-    let out = render_xray(splats.clone(), &cam, img_size, 1.0, false).await;
+    let out = render_xray(splats.clone(), &cam, img_size, 1.0, false, 0.0).await;
     assert_eq!(out.img.dims(), [64, 64]);
     let loss = out.img.sum();
     let grads = loss.backward();
@@ -84,7 +84,7 @@ async fn autodiff_grads_match_pipeline() {
     let v_output_ft =
         MainBackendBase::float_from_data(TensorData::ones::<f32, _>([64, 64]), &base);
 
-    let ref_grads = xray_bwd_pipeline(&cam, img_size, transforms_ft, raw_opac_ft, 1.0, v_output_ft)
+    let ref_grads = xray_bwd_pipeline(&cam, img_size, transforms_ft, raw_opac_ft, 1.0, 0.0, v_output_ft)
         .await;
     let ref_t = MainBackendBase::float_into_data(ref_grads.v_transforms)
         .await

@@ -109,7 +109,7 @@ struct CommonArgs {
     rigid_anchor_weight: f32,
 
     // ---- 密度控制 / refine ----
-    #[arg(long, default_value_t = 0.25)]
+    #[arg(long, default_value_t = 1.0)]
     growth_frac: f32,
     #[arg(long, default_value_t = 400)]
     refine_every: u32,
@@ -143,6 +143,20 @@ struct CommonArgs {
     min_splats: u32,
     #[arg(long, default_value_t = 0)]
     density_reset: u32,
+
+    // ---- scale 约束 (细长条抑制) ----
+    /// 屏幕面积惩罚权重 (Brush #479; 默认 0.1)。
+    #[arg(long, default_value_t = 0.1)]
+    screen_area_penalty: f32,
+    /// log 空间各向异性正则权重 (0 = 关)。
+    #[arg(long, default_value_t = 0.0)]
+    scale_aniso_weight: f32,
+    /// log-scale 软上限 (mm; 0 = 关)。
+    #[arg(long, default_value_t = 10.0)]
+    scale_cap_mm: f32,
+    /// log-scale 软上限正则权重。
+    #[arg(long, default_value_t = 0.5)]
+    scale_cap_weight: f32,
 
     // ---- 损失 ----
     #[arg(long, default_value = "charbonnier")]
@@ -178,6 +192,9 @@ struct CommonArgs {
     /// 关闭 eval GT|pred NRRD 保存。
     #[arg(long)]
     no_save_eval: bool,
+    /// 完全关闭 eval (不建 eval 目录, 不写 metrics.csv)。
+    #[arg(long)]
+    no_eval: bool,
     /// 导出 canonical PLY 点云。
     #[arg(long)]
     save_ply: bool,
@@ -259,6 +276,10 @@ impl CommonArgs {
             cull_floor: self.cull_floor,
             min_splats: self.min_splats,
             density_reset: self.density_reset,
+            screen_area_penalty: self.screen_area_penalty,
+            scale_aniso_weight: self.scale_aniso_weight,
+            scale_cap_mm: self.scale_cap_mm,
+            scale_cap_weight: self.scale_cap_weight,
             loss: self.loss,
             loss_eps: self.loss_eps,
             loss_delta: self.loss_delta,
@@ -274,6 +295,7 @@ impl CommonArgs {
             eval_split_every: self.eval_split_every,
             eval_views: self.eval_views,
             save_eval: !self.no_save_eval,
+            eval_enabled: !self.no_eval,
             save_ply: self.save_ply,
             save_deform: self.save_deform,
             save_bin: self.save_bin,

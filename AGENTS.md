@@ -59,6 +59,23 @@ systemd-run --user --scope -p CPUWeight=100 -p MemoryMax=12G \
 - 减缓 splat 增长: 默认 5k 初始点 / growth_frac 0.25 / percent_dense 0.0003 /
   cull_density 5e-4 / max_splats 300k / **fixed-grad-thr 5e-6** (~40k splats)。
 
+## scale 约束 / 细长条抑制 (2026-08-28 引入, 2026-08-31 移植)
+
+- **机制** (Brush #479 screen_area_penalty 内核梯度 + log 空间 scale 正则):
+  - `--screen-area-penalty` (可微屏幕面积惩罚, 加到 cov2d 梯度, bounded;
+    经 conic 逆推流会 O(1/det⁴) 爆炸)
+  - `--scale-cap-mm/--scale-cap-weight` (log-scale 软上限)
+  - `--scale-aniso-weight` (各向异性正则, 0.1 过强, 0.02 轻量)
+- **最优配置 (ab_cap10_pen01)**: `--scale-cap-mm=10 --scale-cap-weight=0.5
+  --screen-area-penalty=0.1` — 无长条伪影 (ratio>10 20-36%→~7%, max 轴
+  341→90mm), LPIPS 代价 +0.006。brush-fit 默认即此配置。
+- **clone 死代码坑**: `oversized_thr = scene_extent × percent_dense`。mm 尺度
+  场景下默认 0.0005 → 0.132mm 比 splat 实际尺度小两个数量级 → 只有 split 没有
+  clone。恢复 clone: percent_dense≈0.02 (与真实尺度同量级) + growth_frac 1.0
+  (pd002_gf100 最优)。fit_static/fit_deform/brush-fit 默认已改。
+- **refine 灾难性剪枝保护** (xray_refine.rs): 单次 refine 最多剪 85%, 防止
+  罕见全量 NaN/越界事件清空 splats 导致 burn-fusion 崩溃。
+
 ## 评估口径 (2026-08-21 起)
 
 - **LPIPS 是主要指标**(最符合人眼观感; PSNR/SSIM 在边缘处饱和失真,

@@ -95,7 +95,7 @@ async fn matches_r2_cone_beam_backward() {
     );
     let img_size = glam::uvec2(64, 64);
 
-    let grads = xray_bwd_pipeline(&cam, img_size, transforms_ft, raw_opac_ft, 1.0, v_output_ft)
+    let grads = xray_bwd_pipeline(&cam, img_size, transforms_ft, raw_opac_ft, 1.0, 0.0, v_output_ft)
         .await;
 
     let v_transforms = MainBackendBase::float_into_data(grads.v_transforms)

@@ -82,7 +82,7 @@ async fn render_loss(
     signed: bool,
 ) -> f32 {
     let splats = build_splats(scene, device);
-    let out = render_xray(splats, cam, img_size, 1.0, signed).await;
+    let out = render_xray(splats, cam, img_size, 1.0, signed, 0.0).await;
     out.img.sum().into_scalar_async::<f32>()
         .await
         .expect("loss readback")
@@ -96,7 +96,7 @@ async fn analytical_grads(
     signed: bool,
 ) -> (XRaySplats, Gradients) {
     let splats = build_splats(scene, device);
-    let out = render_xray(splats.clone(), cam, img_size, 1.0, signed).await;
+    let out = render_xray(splats.clone(), cam, img_size, 1.0, signed, 0.0).await;
     let grads = out.img.sum().backward();
     (splats, grads)
 }

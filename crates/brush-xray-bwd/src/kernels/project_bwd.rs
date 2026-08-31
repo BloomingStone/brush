@@ -68,6 +68,27 @@ fn compute_cov2d_cone_bwd(
     let dL_dhate = pi_mu * ((2.0f32 * hatb * hatc - 2.0f32 * hata * hate) / denom) * v_mu;
     let dL_dhatf = pi_mu * ((hata * hatd - hatb * hatb) / denom) * v_mu;
 
+    // Differentiable per-splat screen-area regulariser (Brush #479). The 1σ
+    // ellipse area as a fraction of the image is `area_frac =
+    // π·sqrt(det(cov2d))/(W·H)` (cov2d = the top-left 2x2 of `cov3`, in
+    // pixels; `denom` = det(cov2d)), and the loss contribution is
+    // `w·area_frac²/num_visible`. The gradient flows analytically into the
+    // cov2d gradient through `d(sqrt(det))/d(cov.*)`. NOTE: it must be added
+    // to the cov2d gradient (bounded), NOT pushed through the conic inverse
+    // (which would amplify as O(1/det⁴) on degenerate splats → gradient
+    // explosion). With w=0 the contribution is 0 (branch-free).
+    let sqrt_det = f32::sqrt(f32::max(denom, 1.0e-20f32));
+    let img_area = u.img_w as f32 * u.img_h as f32;
+    let area_frac = pi * sqrt_det / img_area;
+    let dloss_darea =
+        2.0f32 * u.screen_area_penalty * area_frac / f32::max(u.num_visible as f32, 1.0f32);
+    let inv_imghw = 1.0f32 / img_area;
+    let half_pi_over_sqrtdet = pi * 0.5f32 / sqrt_det * inv_imghw;
+    let pi_over_sqrtdet = pi / sqrt_det * inv_imghw;
+    dL_dhata += dloss_darea * hatd * half_pi_over_sqrtdet;
+    dL_dhatb += -dloss_darea * hatb * pi_over_sqrtdet;
+    dL_dhatd += dloss_darea * hata * half_pi_over_sqrtdet;
+
     // dL_dhata..dL_dhatf are the independent-element gradients of the
     // symmetric cov3 (used directly below; no halved-off-diagonal copy
     // needed for the congruence form).

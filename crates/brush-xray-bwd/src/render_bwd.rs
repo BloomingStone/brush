@@ -191,6 +191,7 @@ pub async fn xray_bwd_pipeline(
     transforms: FloatTensor<MainBackendBase>,
     raw_opacities: FloatTensor<MainBackendBase>,
     scale_modifier: f32,
+    screen_area_penalty: f32,
     v_output: FloatTensor<MainBackendBase>,
 ) -> XRaySplatGrads<MainBackendBase> {
     use brush_xray::XRayPass;
@@ -201,6 +202,7 @@ pub async fn xray_bwd_pipeline(
         raw_opacities.clone(),
         scale_modifier,
         false,
+        screen_area_penalty,
         XRayPass::Backward,
     )
     .await;

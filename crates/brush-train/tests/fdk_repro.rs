@@ -75,7 +75,7 @@ async fn drr_wrap_readback_loop() {
     let raw_opac: Vec<f32> = (0..n).map(|i| if i % 2 == 0 { 0.005 } else { -0.005 }).collect();
     let splats = XRaySplats::from_raw(means, rots, log_scales, raw_opac, &device_ad);
     for i in 0..100 {
-        let out = render_xray(splats.clone(), &cam, img, 1.0, true).await;
+        let out = render_xray(splats.clone(), &cam, img, 1.0, true, 0.0).await;
         let mut proj = out.img;
         let ft = unwrap_wgpu_float(volume.clone());
         let drr = <brush_cube::MainBackend as DrrOps>::drr_forward(&settings, ft).await;
@@ -135,7 +135,7 @@ async fn fdk_prior_custom_op_loop() {
     let raw_opac: Vec<f32> = (0..n).map(|i| if i % 2 == 0 { 0.005 } else { -0.005 }).collect();
     let splats = XRaySplats::from_raw(means, rots, log_scales, raw_opac, &device_ad);
     for i in 0..200 {
-        let out = render_xray(splats.clone(), &cam, img, 1.0, true).await;
+        let out = render_xray(splats.clone(), &cam, img, 1.0, true, 0.0).await;
         let mut proj = out.img;
         let fdk = prior.drr_for(&cam, img).await;
         proj = proj.add(fdk);

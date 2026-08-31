@@ -32,6 +32,7 @@ impl XRayOps for MainBackendBase {
         raw_opacities: FloatTensor<Self>,
         scale_modifier: f32,
         signed_opac: bool,
+        screen_area_penalty: f32,
         pass: XRayPass,
     ) -> XRayRenderOutput<Self> {
         assert!(
@@ -45,7 +46,14 @@ impl XRayOps for MainBackendBase {
 
         let total_splats = transforms.shape()[0] as u32;
         let mut project_uniforms =
-            XRayProjectUniformsHost::from_camera(camera, img_size, total_splats, scale_modifier, signed_opac);
+            XRayProjectUniformsHost::from_camera(
+            camera,
+            img_size,
+            total_splats,
+            scale_modifier,
+            signed_opac,
+            screen_area_penalty,
+        );
 
         let device = transforms.device.clone();
         let client = transforms.client.clone();

@@ -88,7 +88,7 @@ async fn moment_loss(scene: &Scene, device: &burn::tensor::Device) -> f32 {
 /// Analytic backward of the same moment loss.
 async fn analytic_grad(scene: &Scene, device: &burn::tensor::Device) -> (Vec<f32>, Vec<f32>, Vec<f32>, f32) {
     let splats = build(scene, device);
-    let out = render_xray(splats.clone(), &cam(), glam::uvec2(IMG, IMG), 1.0, false).await;
+    let out = render_xray(splats.clone(), &cam(), glam::uvec2(IMG, IMG), 1.0, false, 0.0).await;
     let (w, h) = (IMG as usize, IMG as usize);
     let cx = (IMG as f32 - 1.0) * 0.5;
     let cy = (IMG as f32 - 1.0) * 0.5;

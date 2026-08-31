@@ -35,7 +35,9 @@ env -u DISPLAY CUBECL_WGPU_DEFAULT_DEVICE='DiscreteGpu(N)' ./target/release/brus
 ```
 
 `--help` 查看全部参数 (与 fit_static/fit_deform CLI 参数一一对应; FDK 与
-time 相关参数已剔除)。模式敏感字段 (init_shape / init_radius_scale /
+time 相关参数已剔除)。scale 约束默认启用 (ab_cap10_pen01:
+`--screen-area-penalty=0.1 --scale-cap-mm=10 --scale-cap-weight=0.5`,
+细长条抑制); `--scale-aniso-weight` 各向异性正则默认关。模式敏感字段 (init_shape / init_radius_scale /
 init_density / eval_every / percent_dense 等) 缺省按模式默认, 与 fit_*.rs
 一致。形变网络仅以心动 phase 为条件 (time 输入已从 CLI/config 移除, 后端
 time 硬编码 0)。

@@ -263,7 +263,7 @@ async fn main() -> anyhow::Result<()> {
         async fn render(splats: &XRaySplats, cam: &Camera, img_size: glam::UVec2) -> Tensor<2> {
             // 与训练 eval_view 一致: lift 到 autodiff + render_xray (Backward pass)。
             let ad = brush_xray_bwd::lift_xray_splats_to_autodiff(splats.clone());
-            let out = render_xray(ad, cam, img_size, 1.0, false).await;
+            let out = render_xray(ad, cam, img_size, 1.0, false, 0.0).await;
             out.img
         }
 

@@ -1,5 +1,9 @@
 # Brush X-ray 动态重建 (deform 3D Gaussian Splatting)
 
+## Build 规范
+
+除非显示指定，否则一律使用 debug 模式build.
+
 用 4D 高斯泼溅 + HexPlane 形变场，从多角度 C-arm 心脏 DSA 序列（单帧投影）
 重建可形变的 3D 心脏/血管结构。渲染采用 X-ray 圆锥束 Beer-Lambert 模型
 （`intensity = exp(-∫μ ds)`），形变场由心脏相位 + 时间条件化。

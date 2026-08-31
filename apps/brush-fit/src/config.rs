@@ -108,6 +108,16 @@ pub struct FitConfig {
     pub min_splats: u32,
     pub density_reset: u32,
 
+    // ---- scale 约束 (细长条抑制) -------------------------------------------
+    /// 屏幕面积惩罚权重 (Brush #479, 默认 0.1 = ab_cap10_pen01 最优配置)。
+    pub screen_area_penalty: f32,
+    /// log 空间各向异性正则权重 (默认 0 关; 0.02 轻量版实验可选)。
+    pub scale_aniso_weight: f32,
+    /// log-scale 软上限 (mm; 默认 10)。
+    pub scale_cap_mm: f32,
+    /// log-scale 软上限正则权重 (默认 0.5)。
+    pub scale_cap_weight: f32,
+
     // ---- 损失 --------------------------------------------------------------
     /// "l1" | "charbonnier" | "huber" | "l2"。
     pub loss: String,
@@ -128,8 +138,11 @@ pub struct FitConfig {
     /// 每 N 帧扣一个 held-out 视图 (None = 用 train view 0)。
     pub eval_split_every: Option<usize>,
     pub eval_views: usize,
-    /// 保存 eval GT|pred NRRD stack (默认开)。
+    /// 保存 eval GT|pred NRRD stack (默认开; --no-eval 时忽略)。
     pub save_eval: bool,
+    /// 关闭 eval: 不 eval/不建 eval 目录/不写 metrics.csv (省 VGG 推理与
+    /// readback; 训练结束无验证指标)。
+    pub eval_enabled: bool,
     /// 导出 canonical PLY 点云 (默认关)。
     pub save_ply: bool,
     /// deform 模式导出 deform_final.bin + 每相位网格场 nii.gz (默认关)。
@@ -186,7 +199,7 @@ impl Default for FitConfig {
             hex_mlp_layers: 2,
             plane_tv_weight: 0.0,
             rigid_anchor_weight: 0.0,
-            growth_frac: 0.25,
+            growth_frac: 1.0,
             refine_every: 400,
             max_splats: 300_000,
             refine_until_frac: 0.9,
@@ -203,6 +216,10 @@ impl Default for FitConfig {
             cull_floor: 1e-3,
             min_splats: 0,
             density_reset: 0,
+            screen_area_penalty: 0.1,
+            scale_aniso_weight: 0.0,
+            scale_cap_mm: 10.0,
+            scale_cap_weight: 0.5,
             loss: "charbonnier".to_owned(),
             loss_eps: 1e-3,
             loss_delta: 0.1,
@@ -218,6 +235,7 @@ impl Default for FitConfig {
             eval_split_every: None,
             eval_views: 8,
             save_eval: true,
+            eval_enabled: true,
             save_ply: false,
             save_deform: false,
             save_bin: false,
@@ -274,7 +292,10 @@ impl FitConfig {
         } else {
             crate::train::GradThr::Fixed(self.fixed_grad_thr.unwrap_or(5e-6))
         };
-        let percent_dense = self.percent_dense.unwrap_or(if deform { 0.0003 } else { 0.0005 });
+        // clone 恢复 (2026-08-28): mm 尺度场景下 0.0003/0.0005 的 clone 阈值
+        // (scene_extent×pd ≈ 0.13mm) 比 splat 实际尺度小两个数量级 → clone 死
+        // 代码; 0.02 与真实尺度同量级 (实验最优 pd002_gf100)。
+        let percent_dense = self.percent_dense.unwrap_or(0.02);
         let split_scale = self
             .split_scale
             .unwrap_or(std::f32::consts::FRAC_1_SQRT_2);

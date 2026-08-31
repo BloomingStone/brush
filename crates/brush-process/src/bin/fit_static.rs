@@ -109,8 +109,9 @@ struct FitStaticArgs {
     cosine_lr: bool,
 
     // ---- 密度控制 / refine ------------------------------------------------
-    /// 每次 refine 只 densify 25% 的过阈值 splat (平衡增长与速度)。
-    #[arg(long, default_value_t = 0.25, help_heading = "密度控制 / refine")]
+    /// 每次 refine densify 的过阈值 splat 比例 (1.0 = 全部, 2026-08-28 实验
+    /// 最优 gf100 + clone 恢复)。
+    #[arg(long, default_value_t = 1.0, help_heading = "密度控制 / refine")]
     growth_frac: f32,
     /// 密度控制 (densify/prune) 间隔 (步)。
     #[arg(long, value_name = "N", default_value_t = 400, help_heading = "密度控制 / refine")]
@@ -131,8 +132,10 @@ struct FitStaticArgs {
     /// 启用 oversized 高梯度点拆分 (默认开)。
     #[arg(long, default_value_t = true, help_heading = "密度控制 / refine")]
     split: bool,
-    /// clone/split 分界阈值系数 (默认 0.0005)。
-    #[arg(long, default_value_t = 0.0005, help_heading = "密度控制 / refine")]
+    /// clone/split 分界阈值系数 (默认 0.02: mm 尺度场景下 clone 阈值
+    /// = scene_extent×pd, 0.0005→0.132mm 比 splat 尺度小两个数量级 → clone
+    /// 死代码; 0.02 恢复 clone, 2026-08-28 实验最优 pd002)。
+    #[arg(long, default_value_t = 0.02, help_heading = "密度控制 / refine")]
     percent_dense: f32,
     /// split 尺度收缩系数 (默认 1/√2)。
     #[arg(long, default_value_t = std::f32::consts::FRAC_1_SQRT_2, help_heading = "密度控制 / refine")]
@@ -200,6 +203,19 @@ struct FitStaticArgs {
     #[arg(long, default_value_t = 0.03, help_heading = "损失")]
     grad_edge_scale: f32,
 
+    // ---- scale 约束 (细长条抑制, 默认全关) -------------------------------
+    /// 屏幕面积惩罚权重 (上游 Brush #479): 可微压小 splat 屏幕覆盖; 0 = 关。
+    #[arg(long, default_value_t = 0.0, help_heading = "scale 约束")]
+    screen_area_penalty: f32,
+    /// log 空间各向异性正则权重: mean((log_s - mean)^2); 0 = 关。
+    #[arg(long, default_value_t = 0.0, help_heading = "scale 约束")]
+    scale_aniso_weight: f32,
+    /// log-scale 软上限 (mm); 0 = 关。
+    #[arg(long, default_value_t = 0.0, help_heading = "scale 约束")]
+    scale_cap_mm: f32,
+    /// log-scale 软上限正则权重。
+    #[arg(long, default_value_t = 0.5, help_heading = "scale 约束")]
+    scale_cap_weight: f32,
     // ---- 评估与输出 -------------------------------------------------------
     /// 每 N 步做一次 eval (PSNR/SSIM/LPIPS + 保存 GT|pred stack)。
     #[arg(long, value_name = "N", default_value_t = 500, help_heading = "评估与输出")]
@@ -432,6 +448,11 @@ async fn main() -> anyhow::Result<()> {
     let grad_ramp_from = args.grad_ramp_from;
     let grad_ramp_to = args.grad_ramp_to;
     let grad_edge_scale = args.grad_edge_scale;
+    // ---- scale 约束 --------------------------------------------------------
+    let screen_area_penalty = args.screen_area_penalty;
+    let scale_aniso_weight = args.scale_aniso_weight;
+    let scale_cap_mm = args.scale_cap_mm;
+    let scale_cap_weight = args.scale_cap_weight;
     // ---- 评估与输出 --------------------------------------------------------
     let eval_every = args.eval_every;
     let eval_split_every = args.eval_split_every;
@@ -584,6 +605,10 @@ async fn main() -> anyhow::Result<()> {
     cfg.grad_ramp_from = grad_ramp_from;
     cfg.grad_ramp_to = grad_ramp_to;
     cfg.grad_edge_scale = grad_edge_scale;
+    cfg.screen_area_penalty = screen_area_penalty;
+    cfg.scale_aniso_weight = scale_aniso_weight;
+    cfg.scale_cap_mm = scale_cap_mm;
+    cfg.scale_cap_weight = scale_cap_weight;
     cfg.refine = XRayRefineConfig {
         refine_every,
         scene_extent,

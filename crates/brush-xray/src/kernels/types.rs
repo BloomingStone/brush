@@ -45,6 +45,11 @@ pub struct XRayProjectUniforms {
     /// Signed (FDK-residual) opacity mode: `opac = MU_WATER · raw` (raw used
     /// directly, can be negative) instead of `MU_WATER · silu(raw) ≥ 0`.
     pub signed_opac: u32,
+    /// Weight of the differentiable per-splat screen-area penalty (Brush #479),
+    /// applied only in the backward projection kernel: the analytic gradient
+    /// of `w·area_frac²/num_visible` (`area_frac` = `π·sqrt(det(cov2d))/(W·H)`)
+    /// flows back to scales/rotations/means. 0 disables.
+    pub screen_area_penalty: f32,
 }
 
 #[cube]

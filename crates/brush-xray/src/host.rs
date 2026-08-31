@@ -35,6 +35,9 @@ pub struct XRayProjectUniforms {
     pub scale_modifier: f32,
     /// Signed (FDK-residual) opacity mode: `opac = MU_WATER · raw`.
     pub signed_opac: u32,
+    /// Weight of the differentiable per-splat screen-area penalty (Brush #479),
+    /// consumed by the backward projection kernel. 0 disables.
+    pub screen_area_penalty: f32,
 }
 
 impl XRayProjectUniforms {
@@ -47,6 +50,7 @@ impl XRayProjectUniforms {
         total_splats: u32,
         scale_modifier: f32,
         signed_opac: bool,
+        screen_area_penalty: f32,
     ) -> Self {
         let viewmat = glam::Mat4::from(camera.world_to_local()).to_cols_array_2d();
         let focal = camera.focal(img_size);
@@ -82,6 +86,7 @@ impl XRayProjectUniforms {
             num_visible: 0,
             scale_modifier,
             signed_opac: signed_opac as u32,
+            screen_area_penalty,
         }
     }
 
@@ -116,6 +121,7 @@ impl XRayProjectUniforms {
             self.num_visible,
             self.scale_modifier,
             self.signed_opac,
+            self.screen_area_penalty,
         )
     }
 }
@@ -161,7 +167,7 @@ mod tests {
             brush_render::kernels::camera_model::CameraModel::Pinhole,
         );
         let img = glam::uvec2(648, 474);
-        let u = XRayProjectUniforms::from_camera(&cam, img, 1000, 1.0, false);
+        let u = XRayProjectUniforms::from_camera(&cam, img, 1000, 1.0, false, 0.0);
 
         // Column-major viewmat.
         let v = |c: usize, r: usize| u.viewmat[c][r];

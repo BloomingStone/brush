@@ -200,7 +200,21 @@ pub struct XRayTrainConfig {
     pub grad_ramp_to: u32,
     /// Per-pixel weight `clamp(|∇gt| / scale, 0, 1)` so the gradient loss
     /// concentrates on strong GT edges. 0 = plain (unweighted) gradient loss.
-    pub grad_edge_scale: f32,    /// Use cosine-annealing for the mean LR (reference-project style) instead
+    pub grad_edge_scale: f32,
+    /// Weight of the differentiable per-splat screen-area penalty (Brush #479):
+    /// the backward kernel adds the analytic gradient of `w·area_frac²/
+    /// num_visible` (1σ ellipse area fraction of the image) to the cov2d
+    /// gradient — suppresses mm-scale elongated splats. 0 disables.
+    pub screen_area_penalty: f32,
+    /// Weight of the log-space scale anisotropy regularizer:
+    /// `mean((log_s - mean(log_s, axis=1))²)` — pushes per-splat scales toward
+    /// isotropic (suppresses thin slivers). 0 disables.
+    pub scale_aniso_weight: f32,
+    /// Soft upper bound (mm) on the splat scale: adds
+    /// `scale_cap_weight·mean(relu(log_s - ln(cap))²)`. 0 disables.
+    pub scale_cap_mm: f32,
+    /// Weight of the log-scale soft cap (see `scale_cap_mm`).
+    pub scale_cap_weight: f32,    /// Use cosine-annealing for the mean LR (reference-project style) instead
     /// of exponential decay.
     pub cosine_lr: bool,
     /// Weight of an optional multi-scale (pyramid) loss: the gray L1+SSIM loss
@@ -255,6 +269,10 @@ impl Default for XRayTrainConfig {
             grad_ramp_from: 3_000,
             grad_ramp_to: 0, // 0 = total_iters
             grad_edge_scale: 0.03,
+            screen_area_penalty: 0.0,
+            scale_aniso_weight: 0.0,
+            scale_cap_mm: 0.0,
+            scale_cap_weight: 0.5,
             cosine_lr: false,
             // 多尺度金字塔损失默认开启 (w=0.5): 2026-08-17 最强项 34.13dB/LPIPS 0.529。
             multiscale_weight: 0.5,
@@ -498,7 +516,15 @@ impl XRayTrainer {
         // 计时探针: 设置环境变量 BRUSH_PROFILE_EVAL=1 打印各段耗时(排查瓶颈)。
         let profile = std::env::var("BRUSH_PROFILE_EVAL").is_ok();
         let t0 = std::time::Instant::now();
-        let out = render_xray(deformed, camera, img_size, 1.0, self.config.fdk_residual).await;
+        let out = render_xray(
+            deformed,
+            camera,
+            img_size,
+            1.0,
+            self.config.fdk_residual,
+            self.config.screen_area_penalty,
+        )
+        .await;
         let t_render = t0.elapsed();
         let mut proj = out.img;
         if let Some(fdk) = &self.fdk {
@@ -696,7 +722,15 @@ impl XRayTrainer {
                 .map_or(0, |g| g.shape[0]) as u32,
         );
         assert!(img_size[0] > 0 && img_size[1] > 0, "X-ray batch needs a gray GT image");
-        let out = render_xray(deformed, &batch.camera, img_size, 1.0, self.config.fdk_residual).await;
+        let out = render_xray(
+            deformed,
+            &batch.camera,
+            img_size,
+            1.0,
+            self.config.fdk_residual,
+            self.config.screen_area_penalty,
+        )
+        .await;
 
         // FDK-residual: total projection = splat residual + static prior DRR
         // (both in the `-ln(gray)` proj domain, so they sum additively).
@@ -836,6 +870,25 @@ impl XRayTrainer {
                 grad_diff.mean()
             };
             loss = loss.add(gl.mul_scalar(self.config.grad_weight * ramp));
+        }
+        // ---- Scale 约束 (细长条抑制, 2026-08-28) -------------------------
+        // Canonical log-scales [N,3]: anisotropy term penalizes the per-splat
+        // log-spread `mean((log_s - mean(log_s, axis=1))²)` (pushes toward
+        // isotropic splats); the cap term soft-limits the max scale with
+        // `mean(relu(log_s - ln(cap_mm))²)` (kills the mm-scale monsters that
+        // blur other directions).
+        if self.config.scale_aniso_weight > 0.0 || self.config.scale_cap_mm > 0.0 {
+            let t = canonical_ad.transforms.val().slice(s![.., 7..10]); // [N,3]
+            if self.config.scale_aniso_weight > 0.0 {
+                let mean_axis: Tensor<2> = t.clone().mean_dim(1); // [N,1]
+                let aniso = t.clone().sub(mean_axis).powi_scalar(2).mean();
+                loss = loss.add(aniso.mul_scalar(self.config.scale_aniso_weight));
+            }
+            if self.config.scale_cap_mm > 0.0 {
+                let cap = self.config.scale_cap_mm.max(1e-6).ln();
+                let over = t.sub_scalar(cap).clamp_min(0.0).powi_scalar(2).mean();
+                loss = loss.add(over.mul_scalar(self.config.scale_cap_weight));
+            }
         }
         let loss_inner = loss.clone().inner();
         let mut grads = loss.backward();

@@ -185,8 +185,8 @@ struct FitDeformArgs {
     rigid_anchor_weight: f32,
 
     // ---- 密度控制 / refine ------------------------------------------------
-    /// 每次 refine 只 densify 25% 的过阈值 splat (平衡增长与速度)。
-    #[arg(long, default_value_t = 0.25, help_heading = "密度控制 / refine")]
+    /// 每次 refine densify 的过阈值 splat 比例 (1.0 = 全部, clone 恢复)。
+    #[arg(long, default_value_t = 1.0, help_heading = "密度控制 / refine")]
     growth_frac: f32,
     /// 密度控制 (densify/prune) 间隔 (步)。
     #[arg(long, value_name = "N", default_value_t = 400, help_heading = "密度控制 / refine")]
@@ -278,6 +278,19 @@ struct FitDeformArgs {
     /// 残差稀疏权重。
     #[arg(long, default_value_t = 0.0, help_heading = "损失")]
     resid_sparse_weight: f32,
+    // ---- scale 约束 (细长条抑制, 默认全关) -------------------------------
+    /// 屏幕面积惩罚权重 (上游 Brush #479): 可微压小 splat 屏幕覆盖; 0 = 关。
+    #[arg(long, default_value_t = 0.0, help_heading = "scale 约束")]
+    screen_area_penalty: f32,
+    /// log 空间各向异性正则权重: mean((log_s - mean)^2); 0 = 关。
+    #[arg(long, default_value_t = 0.0, help_heading = "scale 约束")]
+    scale_aniso_weight: f32,
+    /// log-scale 软上限 (mm); 0 = 关。
+    #[arg(long, default_value_t = 0.0, help_heading = "scale 约束")]
+    scale_cap_mm: f32,
+    /// log-scale 软上限正则权重。
+    #[arg(long, default_value_t = 0.5, help_heading = "scale 约束")]
+    scale_cap_weight: f32,
 
     // ---- FDK 先验 / 有符号渲染 --------------------------------------------
     /// FDK 体积 (nii.gz), 残差 GS 先验。
@@ -532,6 +545,11 @@ async fn main() -> anyhow::Result<()> {
     let grad_ramp_to = args.grad_ramp_to;
     let grad_edge_scale = args.grad_edge_scale;
     let resid_sparse_weight = args.resid_sparse_weight;
+    // ---- scale 约束 --------------------------------------------------------
+    let screen_area_penalty = args.screen_area_penalty;
+    let scale_aniso_weight = args.scale_aniso_weight;
+    let scale_cap_mm = args.scale_cap_mm;
+    let scale_cap_weight = args.scale_cap_weight;
     // ---- FDK 先验 / 有符号渲染 --------------------------------------------
     let fdk_volume = args.fdk_volume.clone();
     let fdk_meta = args.fdk_meta.clone();

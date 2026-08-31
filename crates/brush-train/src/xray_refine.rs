@@ -24,6 +24,7 @@ use std::collections::VecDeque;
 
 use brush_cube::MU_WATER;
 use brush_xray::XRaySplats;
+use tracing::warn;
 use burn::tensor::{Bool, Device, Distribution, IndexingUpdateOp, Int, Tensor, TensorData, s};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -370,9 +371,10 @@ impl XRayRefiner {
             .squeeze_dim(1);
 
         let mut prune_mask = prune_density
-            .bool_or(transforms_bad)
-            .bool_or(opac_bad)
-            .bool_or(bound_mask);
+            .clone()
+            .bool_or(transforms_bad.clone())
+            .bool_or(opac_bad.clone())
+            .bool_or(bound_mask.clone());
         if self.config.max_screen_size > 0.0 {
             // 屏幕上过大的点 (参考项目 max_radii2D > max_screen_size)。
             let screen_big = self
@@ -402,6 +404,121 @@ impl XRayRefiner {
             // Hard floor: never cull below min_splats.
             if self.config.min_splats == 0 || n.saturating_sub(cand) >= self.config.min_splats {
                 prune_mask = prune_mask.bool_or(below);
+            }
+        }
+
+        let num_pruned = prune_mask
+            .clone()
+            .int()
+            .sum()
+            .into_scalar_async::<i32>()
+            .await
+            .expect("count pruned") as u32;
+
+        // ---- Catastrophic-prune guard -------------------------------------
+        // Rare latent failure: a global NaN/out-of-bounds event can put every
+        // splat in the prune mask at once → 0 splats → the pipeline panics in
+        // burn-fusion. Never prune more than `max_prune_frac` in one refine:
+        // if the mask wants more, keep the densest survivors so training can
+        // recover (or at least finish and report garbage instead of crashing).
+        let max_prune_frac = 0.85f32;
+        if num_pruned as f32 > splats.num_splats() as f32 * max_prune_frac {
+            // Diagnostics: what drove the catastrophic mask?
+            let n_tot = splats.num_splats() as usize;
+            let count_density_below = prune_density
+                .clone()
+                .int()
+                .sum()
+                .into_scalar_async::<i32>()
+                .await
+                .unwrap_or(0) as usize;
+            let count_nonfinite_tf = transforms_bad
+                .clone()
+                .int()
+                .sum()
+                .into_scalar_async::<i32>()
+                .await
+                .unwrap_or(0) as usize;
+            let count_nonfinite_opac = opac_bad
+                .clone()
+                .int()
+                .sum()
+                .into_scalar_async::<i32>()
+                .await
+                .unwrap_or(0) as usize;
+            let count_oob = bound_mask
+                .clone()
+                .int()
+                .sum()
+                .into_scalar_async::<i32>()
+                .await
+                .unwrap_or(0) as usize;
+            warn!(
+                "refine iter {iter}: catastrophic prune guard fired ({num_pruned}/{n_tot}); \
+                 density_below={count_density_below} nonfinite_transform={count_nonfinite_tf} \
+                 nonfinite_opac={count_nonfinite_opac} out_of_bounds={count_oob}",
+            );
+            let keep_count = ((splats.num_splats() as f32 * (1.0 - max_prune_frac)).ceil() as usize)
+                .max(1)
+                .min(splats.num_splats() as usize);
+            let density_vec: Vec<f32> = density
+                .clone()
+                .into_data_async()
+                .await
+                .expect("guard density readback")
+                .into_vec::<f32>()
+                .expect("guard density f32");
+            let cand_inds: Vec<usize> = prune_mask
+                .clone()
+                .argwhere_async()
+                .await
+                .squeeze_dim::<1>(1)
+                .into_data_async()
+                .await
+                .expect("guard cand data")
+                .into_vec::<i32>()
+                .expect("guard cand vec")
+                .into_iter()
+                .map(|i| i as usize)
+                .collect();
+            let mut ranked: Vec<(usize, f32)> = cand_inds
+                .iter()
+                .map(|&i| (i, density_vec[i]))
+                .filter(|(_, d)| d.is_finite())
+                .collect();
+            ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            // Fallback: even fully-NaN states must leave survivors (keeps the
+            // pipeline alive to report garbage instead of crashing at 0 splats).
+            if ranked.len() < keep_count {
+                use std::collections::HashSet;
+                let have: HashSet<usize> = ranked.iter().map(|&(i, _)| i).collect();
+                for &i in &cand_inds {
+                    if ranked.len() >= keep_count {
+                        break;
+                    }
+                    if !have.contains(&i) {
+                        ranked.push((i, f32::NEG_INFINITY));
+                    }
+                }
+            }
+            ranked.truncate(keep_count);
+            let saved = ranked
+                .iter()
+                .map(|&(i, _)| i as i32)
+                .collect::<Vec<_>>();
+            if !saved.is_empty() {
+                let saved_t = Tensor::<1, Int>::from_data(
+                    TensorData::new(saved.clone(), [saved.len()]),
+                    &device,
+                );
+                let saved_ones = Tensor::<1>::ones([saved.len()], &device);
+                let saved_float = Tensor::<1>::zeros(
+                    [splats.num_splats() as usize],
+                    &device,
+                )
+                .scatter(0, saved_t, saved_ones, IndexingUpdateOp::Assign);
+                let saved_mask = saved_float.greater_elem(0.5);
+                prune_mask = prune_mask.bool_and(saved_mask.bool_not());
             }
         }
         let num_pruned = prune_mask

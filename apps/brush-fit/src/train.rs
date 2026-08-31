@@ -117,6 +117,10 @@ async fn run(cfg: FitConfig, mut progress: Option<ProgressFn>) -> anyhow::Result
     tcfg.grad_ramp_from = cfg.grad_ramp_from;
     tcfg.grad_ramp_to = cfg.grad_ramp_to;
     tcfg.grad_edge_scale = cfg.grad_edge_scale;
+    tcfg.screen_area_penalty = cfg.screen_area_penalty;
+    tcfg.scale_aniso_weight = cfg.scale_aniso_weight;
+    tcfg.scale_cap_mm = cfg.scale_cap_mm;
+    tcfg.scale_cap_weight = cfg.scale_cap_weight;
     tcfg.refine = brush_train::xray_refine::XRayRefineConfig {
         refine_every: cfg.refine_every,
         scene_extent,
@@ -189,19 +193,28 @@ async fn run(cfg: FitConfig, mut progress: Option<ProgressFn>) -> anyhow::Result
 
     let mut dataloader = data::make_loader(&loaded);
 
-    // ---- Eval 视图 ---------------------------------------------------------
-    let eval_views = data::eval_views(&loaded, cfg.eval_views);
+    // ---- Eval 视图 (--no-eval 时完全跳过) ---------------------------------
+    let eval_on = cfg.eval_enabled;
+    let eval_views = if eval_on {
+        data::eval_views(&loaded, cfg.eval_views)
+    } else {
+        Vec::new()
+    };
     let eval_every = res.eval_every;
-    println!("{} eval on {} views every {} steps", ts(), eval_views.len(), eval_every);
+    if eval_on {
+        println!("{} eval on {} views every {} steps", ts(), eval_views.len(), eval_every);
+    }
 
     std::fs::create_dir_all(&out)?;
     let eval_nrrd = out.join("eval/nrrd");
-    std::fs::create_dir_all(&eval_nrrd)?;
+    if eval_on {
+        std::fs::create_dir_all(&eval_nrrd)?;
+    }
 
-    // 指标 CSV。
+    // 指标 CSV (no-eval 时不写)。
     let t0 = Instant::now();
     let mut csv_writer: Option<std::fs::File> = {
-        let off = cfg.log_csv.as_deref() == Some(Path::new("off"));
+        let off = cfg.log_csv.as_deref() == Some(Path::new("off")) || !eval_on;
         if off {
             None
         } else {
@@ -220,9 +233,9 @@ async fn run(cfg: FitConfig, mut progress: Option<ProgressFn>) -> anyhow::Result
         }
     };
 
-    // ---- 初始 eval ----------------------------------------------------------
+    // ---- 初始 eval (no-eval 跳过) -------------------------------------------
     let mut final_eval = (0.0f32, 0.0f32, 0.0f32);
-    {
+    if eval_on {
         let (mut p, mut s, mut l) = (0.0f32, 0.0f32, 0.0f32);
         let mut pairs = Vec::with_capacity(eval_views.len());
         for view in eval_views.iter() {
@@ -246,7 +259,7 @@ async fn run(cfg: FitConfig, mut progress: Option<ProgressFn>) -> anyhow::Result
     // ---- 训练循环 -----------------------------------------------------------
     for iter in 0..cfg.iters {
         let step = iter + 1;
-        let is_eval_step = step % eval_every == 0 || step == cfg.iters;
+        let is_eval_step = eval_on && (step % eval_every == 0 || step == cfg.iters);
         trainer.set_collect_grads(is_eval_step);
         trainer.set_collect_loss(is_eval_step);
         let batch = dataloader.next_batch().await;
