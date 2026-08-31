@@ -32,8 +32,11 @@ cargo build --release -p brush-fit
 - **C 调用方**: MSVC `cl my_prog.c /I apps/brush-fit/include /link brush_fit.dll.lib`;
   MinGW/GCC `gcc my_prog.c -I apps/brush-fit/include -L target/release -lbrush_fit`
   (自动找 .dll)。头文件已带 `BRUSH_FIT_API` (dllimport/dllexport) 宏。
-- **GPU 后端**: wgpu 在 Windows 优先 DX12 (Vulkan/GL 可选), 无需 DISPLAY
-  处理; 选卡仍用 `CUBECL_WGPU_DEFAULT_DEVICE='DiscreteGpu(N)'`。
+- **GPU 后端**: Windows 默认按 `dx12 → vulkan` 自动降级 (DX12 枚举不到
+  适配器时 cubecl 会 panic, 已做多候选降级); 可用 `BRUSH_FIT_GRAPHICS_API`
+  指定 (如 `BRUSH_FIT_GRAPHICS_API=vulkan`)。核显未装驱动时 DX12 枚举不到
+  设备 → 降级 Vulkan 软件渲染 (慢); 装 AMD/NVIDIA 驱动后自动硬件加速。
+  选卡仍用 `CUBECL_WGPU_DEFAULT_DEVICE='DiscreteGpu(N)'`。
 - **deform 场导出**: `brush-fit-dump.exe` 需与宿主程序同目录 (或 PATH /
   `BRUSH_FIT_DUMP_BIN`), 与 Linux 行为一致。
 - 若需交叉编译 (Linux → Windows): 需 MSVC link.exe (cargo-xwin) 或
