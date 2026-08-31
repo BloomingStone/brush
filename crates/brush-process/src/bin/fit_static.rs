@@ -698,7 +698,7 @@ async fn main() -> anyhow::Result<()> {
         for view in eval_views.iter() {
             let gray = view.gray_image.as_ref().expect("gray GT");
             let gt = TensorData::new(gray.data.as_ref().to_vec(), [gray.height, gray.width]);
-            let sample = trainer.eval_view(&view.camera, &gt, view.phase, view.time).await;
+            let sample = trainer.eval_view(&view.camera, &gt, view.phase, 0.0).await;
             p += sample.psnr;
             s += sample.ssim;
             l += sample.lpips;
@@ -769,7 +769,7 @@ async fn main() -> anyhow::Result<()> {
             for view in eval_views.iter() {
                 let gray = view.gray_image.as_ref().expect("gray GT");
                 let vgt = TensorData::new(gray.data.as_ref().to_vec(), [gray.height, gray.width]);
-                let sample = trainer.eval_view(&view.camera, &vgt, view.phase, view.time).await;
+                let sample = trainer.eval_view(&view.camera, &vgt, view.phase, 0.0).await;
                 avg_psnr += sample.psnr;
                 avg_ssim += sample.ssim;
                 avg_lpips += sample.lpips;

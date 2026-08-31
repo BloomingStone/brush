@@ -17,7 +17,7 @@ use burn::module::Module;
 use burn::record::{BinFileRecorder, FullPrecisionSettings, Recorder};
 use burn::tensor::{Device, Tensor, TensorData};
 
-use brush_fit::export::{write_nifti_vec5d_f32, write_npy_f32};
+use brush_fit::export::write_nifti_vec5d_f32;
 
 fn parse_args() -> anyhow::Result<DumpArgs> {
     let mut a = DumpArgs::default();
@@ -47,14 +47,6 @@ fn parse_args() -> anyhow::Result<DumpArgs> {
             a.mlp_l = v.parse()?;
         } else if let Some(v) = s.strip_prefix("--predict-scaling") {
             a.predict_scaling = true;
-        } else if let Some(v) = s.strip_prefix("--time-freqs=") {
-            a.time_freqs = v.parse()?;
-        } else if let Some(v) = s.strip_prefix("--time-min-freq=") {
-            a.time_min_freq = v.parse()?;
-        } else if let Some(v) = s.strip_prefix("--time-max-freq=") {
-            a.time_max_freq = v.parse()?;
-        } else if let Some(v) = s.strip_prefix("--no-time") {
-            a.enable_time = false;
         }
         i += 1;
     }
@@ -74,10 +66,6 @@ struct DumpArgs {
     mlp_w: usize,
     mlp_l: usize,
     predict_scaling: bool,
-    enable_time: bool,
-    time_freqs: usize,
-    time_min_freq: f32,
-    time_max_freq: f32,
 }
 
 impl Default for DumpArgs {
@@ -94,10 +82,6 @@ impl Default for DumpArgs {
             mlp_w: 128,
             mlp_l: 2,
             predict_scaling: false,
-            enable_time: true,
-            time_freqs: 10,
-            time_min_freq: 0.2,
-            time_max_freq: 1.5,
         }
     }
 }
@@ -129,15 +113,9 @@ async fn run(a: &DumpArgs) -> Result<()> {
         mlp_hidden: a.mlp_w,
         mlp_layers: a.mlp_l,
         predict_scaling: a.predict_scaling,
-        enable_time: a.enable_time,
-        time_enc: brush_deform::TimeEncodingConfig {
-            n_freqs: a.time_freqs,
-            min_freq: a.time_min_freq,
-            max_freq: a.time_max_freq,
-            ..Default::default()
-        },
         plane_tv_weight: 0.0,
         rigid_anchor_weight: 0.0,
+        ..HexPlaneDeformConfig::default()
     };
     let model = HexPlaneDeformModel::new(cfg, &device_ad);
     // ckpt 是 DeformNetwork 枚举记录, 先按枚举加载再解包 HexPlane 子记录。
@@ -204,12 +182,11 @@ async fn run(a: &DumpArgs) -> Result<()> {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "deform_field".to_owned());
-        let stem = format!("{stem}_phase{p:02}");
-        let npy = a.out.with_file_name(format!("{stem}.npy"));
-        write_npy_f32(&npy, &dv, &[grid[0], grid[1], grid[2], 3])?;
-        let nii = a.out.with_file_name(format!("{stem}.nii.gz"));
+        let nii = a
+            .out
+            .with_file_name(format!("{stem}_phase{p:02}.nii.gz"));
         write_nifti_vec5d_f32(&nii, &dv, grid, [a.spacing; 3], origin)?;
-        println!("[dump] phase={ph:.3} -> {} / {}", npy.display(), nii.display());
+        println!("[dump] phase={ph:.3} -> {}", nii.display());
         paths.push(nii);
     }
     println!("[dump] done -> {}", a.out.display());

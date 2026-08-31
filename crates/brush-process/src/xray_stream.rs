@@ -227,7 +227,7 @@ pub(crate) async fn xray_stream(
         let view = &eval_views[0];
         let gray = view.gray_image.as_ref().expect("gray GT");
         let gt_data = TensorData::new(gray.data.as_ref().to_vec(), [gray.height, gray.width]);
-        let sample = trainer.eval_view(&view.camera, &gt_data, view.phase, view.time).await;
+        let sample = trainer.eval_view(&view.camera, &gt_data, view.phase, 0.0).await;
         let pred = sample.pred.as_slice::<f32>().expect("f32");
         let mut vals: Vec<f32> = pred.iter().copied().filter(|v| v.is_finite()).collect();
         vals.sort_by(|a, b| a.total_cmp(b));
@@ -368,7 +368,7 @@ pub(crate) async fn xray_stream(
                 let gray = view.gray_image.as_ref().expect("xray eval needs gray GT");
                 let gt_data =
                     TensorData::new(gray.data.as_ref().to_vec(), [gray.height, gray.width]);
-                let sample = trainer.eval_view(&view.camera, &gt_data, view.phase, view.time).await;
+                let sample = trainer.eval_view(&view.camera, &gt_data, view.phase, 0.0).await;
                 avg_psnr += sample.psnr;
                 avg_ssim += sample.ssim;
 

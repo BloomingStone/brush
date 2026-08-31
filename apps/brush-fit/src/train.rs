@@ -143,18 +143,8 @@ async fn run(cfg: FitConfig, mut progress: Option<ProgressFn>) -> anyhow::Result
         tcfg.warm_up = cfg.warm_up;
         tcfg.deform_backend = res.deform_backend;
         tcfg.predict_scaling = res.predict_scaling;
-        tcfg.enable_time = res.enable_time;
-        tcfg.time_jitter = cfg.time_jitter;
-        tcfg.time_tv_weight = cfg.time_tv_weight;
-        tcfg.time_tv_dp = cfg.time_tv_dp;
-        tcfg.time_tv_dt = cfg.time_tv_dt;
-        tcfg.time_tv_sample = cfg.time_tv_sample;
-        tcfg.time_enc = brush_deform::TimeEncodingConfig {
-            n_freqs: cfg.time_freqs,
-            min_freq: cfg.time_min_freq,
-            max_freq: cfg.time_max_freq,
-            ..brush_deform::TimeEncodingConfig::default()
-        };
+        // time 条件化已移除 (CLI/config 无 time 输入; 后端 time 输入固定 0,
+        // enable_time 保持默认 false → 形变场仅由 phase 驱动)。
         tcfg.hex_plane = brush_deform::HexPlaneDeformConfig {
             hex_plane: brush_deform::HexPlaneConfig {
                 n_feature_dim: cfg.hex_features,
@@ -165,20 +155,12 @@ async fn run(cfg: FitConfig, mut progress: Option<ProgressFn>) -> anyhow::Result
             mlp_hidden: cfg.hex_mlp_width,
             mlp_layers: cfg.hex_mlp_layers,
             predict_scaling: res.predict_scaling,
-            enable_time: res.enable_time,
-            time_enc: brush_deform::TimeEncodingConfig {
-                n_freqs: cfg.time_freqs,
-                min_freq: cfg.time_min_freq,
-                max_freq: cfg.time_max_freq,
-                ..brush_deform::TimeEncodingConfig::default()
-            },
             plane_tv_weight: cfg.plane_tv_weight,
             rigid_anchor_weight: cfg.rigid_anchor_weight,
+            ..brush_deform::HexPlaneDeformConfig::default()
         };
         tcfg.lr_deform = cfg.lr_deform;
         tcfg.lr_deform_end = cfg.lr_deform_end;
-        tcfg.respi_after = cfg.respi_after;
-        tcfg.respi_freeze = res.respi_freeze;
     }
 
     let init = data::init_region(&loaded, &cfg, &res);
@@ -245,7 +227,7 @@ async fn run(cfg: FitConfig, mut progress: Option<ProgressFn>) -> anyhow::Result
         let mut pairs = Vec::with_capacity(eval_views.len());
         for view in eval_views.iter() {
             let gt = data::gt_tensor(view);
-            let sample = trainer.eval_view(&view.camera, &gt, view.phase, view.time).await;
+            let sample = trainer.eval_view(&view.camera, &gt, view.phase, 0.0).await;
             p += sample.psnr;
             s += sample.ssim;
             l += sample.lpips;
@@ -299,7 +281,7 @@ async fn run(cfg: FitConfig, mut progress: Option<ProgressFn>) -> anyhow::Result
             let mut pairs = Vec::with_capacity(eval_views.len());
             for view in eval_views.iter() {
                 let vgt = data::gt_tensor(view);
-                let sample = trainer.eval_view(&view.camera, &vgt, view.phase, view.time).await;
+                let sample = trainer.eval_view(&view.camera, &vgt, view.phase, 0.0).await;
                 p += sample.psnr;
                 s += sample.ssim;
                 l += sample.lpips;
@@ -352,7 +334,8 @@ async fn run(cfg: FitConfig, mut progress: Option<ProgressFn>) -> anyhow::Result
         deform_fields = fields;
     }
 
-    let volume_phase0 = export::export_volume_phase0(&cfg, &trainer, &device, &out).await?;
+    let volume_phase0 =
+        export::export_volume_phase0(&cfg, &trainer, &device, loaded.half_w, loaded.half_h, &out).await?;
 
     let mut ply = None;
     if cfg.save_ply {
@@ -362,30 +345,6 @@ async fn run(cfg: FitConfig, mut progress: Option<ProgressFn>) -> anyhow::Result
     let mut bin_prefix = None;
     if cfg.save_bin {
         bin_prefix = Some(export::export_bin(&trainer, &out).await?);
-    }
-
-    // 可学习时间频率诊断。
-    if deform && res.enable_time {
-        if let Some(freqs) = trainer.learned_time_freqs().await {
-            let mut sorted = freqs.clone();
-            sorted.sort_by(|a, b| a.total_cmp(b));
-            println!(
-                "{} learned time freqs (Hz): {}",
-                ts(),
-                sorted.iter().map(|f| format!("{f:.3}")).collect::<Vec<_>>().join(" ")
-            );
-        }
-    }
-    if deform && cfg.respi_after > 0 {
-        if let Some(freqs) = trainer.respi_learned_time_freqs().await {
-            let mut sorted = freqs.clone();
-            sorted.sort_by(|a, b| a.total_cmp(b));
-            println!(
-                "{} respi learned time freqs (Hz): {}",
-                ts(),
-                sorted.iter().map(|f| format!("{f:.3}")).collect::<Vec<_>>().join(" ")
-            );
-        }
     }
 
     if let Some(cb) = progress.as_mut() {

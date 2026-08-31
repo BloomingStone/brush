@@ -34,9 +34,11 @@ env -u DISPLAY CUBECL_WGPU_DEFAULT_DEVICE='DiscreteGpu(N)' ./target/release/brus
   --eval-views=8 --eval-every=1000 --out=target/fit_deform
 ```
 
-`--help` 查看全部参数 (与 fit_static/fit_deform CLI 参数一一对应; FDK 相关
-参数已剔除)。模式敏感字段 (init_shape / init_radius_scale / init_density /
-eval_every / percent_dense 等) 缺省按模式默认, 与 fit_*.rs 一致。
+`--help` 查看全部参数 (与 fit_static/fit_deform CLI 参数一一对应; FDK 与
+time 相关参数已剔除)。模式敏感字段 (init_shape / init_radius_scale /
+init_density / eval_every / percent_dense 等) 缺省按模式默认, 与 fit_*.rs
+一致。形变网络仅以心动 phase 为条件 (time 输入已从 CLI/config 移除, 后端
+time 硬编码 0)。
 
 ## 输出
 
@@ -44,13 +46,16 @@ eval_every / percent_dense 等) 缺省按模式默认, 与 fit_*.rs 一致。
 <out>/
 ├── volume_phase00.nii.gz          # 必须: phase=0 volume (3D float32, sform
 │                                  #   affine; deform 模式先过 phase=0 形变场)
+│                                  #   网格 = 输入 DCM 图像的等中心尺寸
+│                                  #   (XY 全宽 = 图宽, Z 全高 = 图高)
 ├── metrics.csv                    # 训练指标 (loss/PSNR/SSIM/LPIPS/梯度)
 ├── eval/nrrd/gt_pred_*.nrrd       # eval GT|pred 拼接栈 (--no-save-eval 关闭)
 ├── canonical_final.ply            # --save-ply: 点云 (激活域)
 ├── canonical_final_{transforms,raw}.bin  # --save-bin: 原始参数 (gs2volume --bin= 复用)
-├── deform_final.bin               # --save-deform (deform 模式, 默认开): 网络权重
-└── deform_field_phase{p:02}.{npy,nii.gz} # 8 相位网格形变场 (行主序 [nx,ny,nz,3]
-                                         #   + 5D nii.gz 同 ASOCA dvf)
+├── deform_final.bin               # --save-deform (deform 模式, 默认关): 网络权重
+└── deform_field_phase{p:02}.nii.gz # --save-deform: 8 相位网格形变场 (5D
+                                    #   [x,y,z,1,3] 同 ASOCA dvf, affine 随 nii)
+                                    #   (仅 nii.gz, 不导出 npy)
 ```
 
 ## Rust lib
@@ -94,7 +99,8 @@ rc = lib.brush_fit_run(json.dumps(cfg).encode(), err, 4096)
 
 ## 注意事项
 
-- **deform 网格场导出走独立进程 `brush-fit-dump`**: 训练后 GPU 内存池状态
+- **deform 网格场导出走独立进程 `brush-fit-dump`** (仅 nii.gz, 默认不导出;
+  `--save-deform` 开启): 训练后 GPU 内存池状态
   不稳定 (整网格 matmul autotune OOM / memory_manage 断言), 独立进程干净
   设备导出稳定 (与 fit_deform spawn dump_deform 同行为, 日志中 DSD 线程
   断言 panic 噪音无害)。子进程路径: 当前 exe 同目录; 可

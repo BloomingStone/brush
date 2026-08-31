@@ -329,16 +329,10 @@ async fn main() -> anyhow::Result<()> {
             mlp_hidden: 128,
             mlp_layers: 2,
             predict_scaling: false,
-            enable_time: true,
-            time_enc: brush_deform::TimeEncodingConfig {
-                n_freqs: 10,
-                min_freq: 0.2,
-                max_freq: 1.5,
-                ..Default::default()
-            },
             plane_tv_weight: 0.0,
             rigid_anchor_weight: 0.0,
-        };
+            ..HexPlaneDeformConfig::default()
+    };
         let model = HexPlaneDeformModel::new(cfg, &device_ad);
         type DeformRec = <DeformNetwork as burn::module::Module>::Record;
         let rec: DeformRec =

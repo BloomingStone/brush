@@ -91,24 +91,6 @@ struct CommonArgs {
     deform_backend: String,
     #[arg(long)]
     predict_scaling: bool,
-    #[arg(long)]
-    no_time: bool,
-    #[arg(long, default_value_t = 10)]
-    time_freqs: usize,
-    #[arg(long, default_value_t = 0.2)]
-    time_min_freq: f32,
-    #[arg(long, default_value_t = 1.5)]
-    time_max_freq: f32,
-    #[arg(long, default_value_t = 0.0)]
-    time_jitter: f32,
-    #[arg(long, default_value_t = 0.0)]
-    time_tv_weight: f32,
-    #[arg(long, default_value_t = 0.0)]
-    time_tv_dp: f32,
-    #[arg(long, default_value_t = 0.0125)]
-    time_tv_dt: f32,
-    #[arg(long, default_value_t = 1024)]
-    time_tv_sample: usize,
 
     // ---- HexPlane ----
     #[arg(long, default_value_t = 64)]
@@ -186,12 +168,6 @@ struct CommonArgs {
     #[arg(long, default_value_t = 0.03)]
     grad_edge_scale: f32,
 
-    // ---- 分阶段呼吸场 ----
-    #[arg(long, default_value_t = 0)]
-    respi_after: u32,
-    #[arg(long)]
-    no_respi_freeze: bool,
-
     // ---- 评估与输出 ----
     #[arg(long)]
     eval_every: Option<u32>,
@@ -205,9 +181,9 @@ struct CommonArgs {
     /// 导出 canonical PLY 点云。
     #[arg(long)]
     save_ply: bool,
-    /// 关闭 deform 权重/网格场导出 (deform 模式)。
+    /// 导出 deform 权重 (deform_final.bin) + 每相位网格场 nii.gz (默认关)。
     #[arg(long)]
-    no_save_deform: bool,
+    save_deform: bool,
     /// 导出原始参数 .bin (供 gs2volume 复用)。
     #[arg(long)]
     save_bin: bool,
@@ -259,16 +235,6 @@ impl CommonArgs {
             warm_up: self.warm_up,
             deform_backend: self.deform_backend,
             predict_scaling: self.predict_scaling,
-            enable_time: true,
-            no_time: self.no_time,
-            time_freqs: self.time_freqs,
-            time_min_freq: self.time_min_freq,
-            time_max_freq: self.time_max_freq,
-            time_jitter: self.time_jitter,
-            time_tv_weight: self.time_tv_weight,
-            time_tv_dp: self.time_tv_dp,
-            time_tv_dt: self.time_tv_dt,
-            time_tv_sample: self.time_tv_sample,
             hex_res: self.hex_res,
             hex_time_res: self.hex_time_res,
             hex_features: self.hex_features,
@@ -304,14 +270,12 @@ impl CommonArgs {
             grad_ramp_from: self.grad_ramp_from,
             grad_ramp_to: self.grad_ramp_to,
             grad_edge_scale: self.grad_edge_scale,
-            respi_after: self.respi_after,
-            no_respi_freeze: self.no_respi_freeze,
             eval_every: self.eval_every,
             eval_split_every: self.eval_split_every,
             eval_views: self.eval_views,
             save_eval: !self.no_save_eval,
             save_ply: self.save_ply,
-            save_deform: !self.no_save_deform,
+            save_deform: self.save_deform,
             save_bin: self.save_bin,
             log_csv: self.log_csv,
             voxel_mm: self.voxel_mm,

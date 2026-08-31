@@ -18,10 +18,8 @@
 //!      高斯噪声 (参考项目 `get_linear_noise_func`), 增强相位泛化。
 //!   4. **warm-up**: 前 `warm_up` 步不施加形变 (dummy 梯度), 让 canonical
 //!      splats 先收敛到静态结构。
-//!   5. **可学习时间条件化** (`--enable-time`, 默认关): 形变网络额外以真实
-//!      物理时间 `t = f/fps` (FrameTimeVector 缺失/退化时) 为条件, 通过一个
-//!      **可学习频率的傅里叶编码** 自动拟合数据中的呼吸 (及其它非周期)
-//!      运动频率 —— 无需预知呼吸频率范围。心脏 phase 保持已知圆环轴。
+//!   (time 条件化已移除 2026-08-31: CLI 无 time 输入, 后端 time 硬编码 0,
+//!   形变场仅由心动 phase 驱动。)
 //!
 //! 每 `eval_every` 步对 held-out 视图做 eval (每个视图用其真实 phase),
 //! 打印 PSNR/SSIM/LPIPS 并保存 GT|pred 拼接 NRRD stack; 训练结束导出
@@ -162,36 +160,6 @@ struct FitDeformArgs {
     /// 关闭保质量形变 (预测 d_scaling)。
     #[arg(long = "no-predict-scaling", help_heading = "形变网络 (deform)")]
     no_predict_scaling: bool,
-    /// 可学习时间条件化 (默认开): 用可学习傅里叶频率拟合呼吸等非周期运动。
-    #[arg(long, default_value_t = true, help_heading = "形变网络 (deform)")]
-    enable_time: bool,
-    /// 关闭可学习时间条件化。
-    #[arg(long = "no-time", help_heading = "形变网络 (deform)")]
-    no_time: bool,
-    /// 时间编码频率个数。
-    #[arg(long, value_name = "N", default_value_t = 10, help_heading = "形变网络 (deform)")]
-    time_freqs: usize,
-    /// 时间编码最小频率 (Hz)。
-    #[arg(long, default_value_t = 0.2, help_heading = "形变网络 (deform)")]
-    time_min_freq: f32,
-    /// 时间编码最大频率 (Hz)。
-    #[arg(long, default_value_t = 1.5, help_heading = "形变网络 (deform)")]
-    time_max_freq: f32,
-    /// 时间抖动 (秒, 高斯std; 0=关)。
-    #[arg(long, default_value_t = 0.0, help_heading = "形变网络 (deform)")]
-    time_jitter: f32,
-    /// 时间 TV 正则权重 (0=关)。
-    #[arg(long, default_value_t = 0.0, help_heading = "形变网络 (deform)")]
-    time_tv_weight: f32,
-    /// 时间 TV 相位步长 (每帧心搏推进)。
-    #[arg(long, default_value_t = 0.0, help_heading = "形变网络 (deform)")]
-    time_tv_dp: f32,
-    /// 时间 TV 时间步长 (1帧 @80fps)。
-    #[arg(long, default_value_t = 0.0125, help_heading = "形变网络 (deform)")]
-    time_tv_dt: f32,
-    /// 时间 TV 子集 splat 数。
-    #[arg(long, value_name = "N", default_value_t = 1024, help_heading = "形变网络 (deform)")]
-    time_tv_sample: usize,
 
     // ---- HexPlane 超参 ----------------------------------------------------
     /// 空间分辨率。
@@ -333,14 +301,6 @@ struct FitDeformArgs {
     /// 有符号渲染 (opac=MU_WATER·raw, 可负), 不要求 FDK 体积。
     #[arg(long, help_heading = "FDK 先验 / 有符号渲染")]
     signed: bool,
-
-    // ---- 分阶段呼吸场 (respi) ----------------------------------------------
-    /// 分阶段双场训练: N 步后开训时间条件呼吸场 (0 = 单场训练)。
-    #[arg(long, value_name = "N", default_value_t = 0, help_heading = "分阶段呼吸场 (respi)")]
-    respi_after: u32,
-    /// 关闭默认的"冻结心电场" (改为联合训练)。
-    #[arg(long = "no-respi-freeze", help_heading = "分阶段呼吸场 (respi)")]
-    no_respi_freeze: bool,
 
     // ---- 评估与输出 -------------------------------------------------------
     /// 每 N 步做一次 eval (PSNR/SSIM/LPIPS + 保存 GT|pred stack)。
@@ -529,19 +489,6 @@ async fn main() -> anyhow::Result<()> {
     let deform_backend = args.deform_backend;
     // 保质量形变 (默认): 不预测 d_scaling, 局部密度变化由位移/旋转产生。
     let predict_scaling = args.predict_scaling && !args.no_predict_scaling;
-    // 可学习时间条件化 (默认开): 形变网络用可学习傅里叶频率拟合呼吸等非周期运动。
-    let enable_time = args.enable_time && !args.no_time;
-    // 时间编码参数: 频率个数 / 初始化范围 (Hz, 对数间隔)。
-    let time_freqs = args.time_freqs;
-    let time_min_freq = args.time_min_freq;
-    let time_max_freq = args.time_max_freq;
-    // 时间抖动 (秒, 高斯std; 0=关): 强制形变场时间局部平滑。
-    let time_jitter = args.time_jitter;
-    // 时间 TV 正则权重 (0=关): 惩罚 deform 相邻帧位移差, 提升 held-out 泛化。
-    let time_tv_weight = args.time_tv_weight;
-    let time_tv_dp = args.time_tv_dp; // 相位步长 (每帧心搏推进)
-    let time_tv_dt = args.time_tv_dt; // 时间步长 = 1帧 @80fps
-    let time_tv_sample = args.time_tv_sample; // TV 子集 splat 数
     // ---- HexPlane 超参 ----------------------------------------------------
     let hex_res = args.hex_res;
     let hex_time_res = args.hex_time_res;
@@ -593,10 +540,6 @@ async fn main() -> anyhow::Result<()> {
     let fdk_residual_init_density = args.fdk_resid_init_density;
     let fdk_transpose = args.fdk_transpose;
     let signed_only = args.signed;
-    // ---- 分阶段呼吸场 (respi) ----------------------------------------------
-    let respi_after = args.respi_after;
-    // 默认冻结心电场 (--no-respi-freeze 改为联合训练)。
-    let respi_freeze = !args.no_respi_freeze;
     // ---- 评估与输出 --------------------------------------------------------
     let eval_every = args.eval_every;
     let eval_split_every = args.eval_split_every;
@@ -738,18 +681,6 @@ async fn main() -> anyhow::Result<()> {
     cfg.warm_up = warm_up; // 前 N 步不施加形变
     cfg.deform_backend = deform_backend;
     cfg.predict_scaling = predict_scaling; // 保质量形变 (默认关缩放)
-    cfg.enable_time = enable_time; // 可学习时间条件化 (默认关)
-    cfg.time_jitter = time_jitter; // 时间抖动 (连续视频平滑)
-    cfg.time_tv_weight = time_tv_weight; // 时间 TV 正则 (相邻帧形变小)
-    cfg.time_tv_dp = time_tv_dp;
-    cfg.time_tv_dt = time_tv_dt;
-    cfg.time_tv_sample = time_tv_sample;
-    cfg.time_enc = brush_deform::TimeEncodingConfig {
-        n_freqs: time_freqs,
-        min_freq: time_min_freq,
-        max_freq: time_max_freq,
-        ..brush_deform::TimeEncodingConfig::default()
-    };
     cfg.hex_plane = HexPlaneDeformConfig {
         hex_plane: HexPlaneConfig {
             n_feature_dim: hex_features,
@@ -760,15 +691,9 @@ async fn main() -> anyhow::Result<()> {
         mlp_hidden: hex_mlp_width,
         mlp_layers: hex_mlp_layers,
         predict_scaling,
-        enable_time,
-        time_enc: brush_deform::TimeEncodingConfig {
-            n_freqs: time_freqs,
-            min_freq: time_min_freq,
-            max_freq: time_max_freq,
-            ..brush_deform::TimeEncodingConfig::default()
-        },
         plane_tv_weight,
         rigid_anchor_weight,
+        ..HexPlaneDeformConfig::default()
     };
     cfg.init_density = init_density;
     cfg.lr_mean = lr_mean;
@@ -789,13 +714,6 @@ async fn main() -> anyhow::Result<()> {
     cfg.grad_ramp_from = grad_ramp_from;
     cfg.grad_ramp_to = grad_ramp_to;
     cfg.grad_edge_scale = grad_edge_scale;
-    cfg.respi_after = respi_after;
-    cfg.respi_freeze = respi_freeze;
-    cfg.time_jitter = time_jitter;
-    cfg.time_tv_weight = time_tv_weight;
-    cfg.time_tv_dp = time_tv_dp;
-    cfg.time_tv_dt = time_tv_dt;
-    cfg.time_tv_sample = time_tv_sample;
     // 梯度阈值: --dyn-grad-percentile 动态分位 (0~1) 或 --fixed-grad-thr 固定阈值 (默认)。
     let grad_threshold = match dyn_grad_percentile {
         Some(pct) => {
@@ -942,7 +860,7 @@ async fn main() -> anyhow::Result<()> {
         DeformBackend::HashGrid => "hashgrid".to_owned(),
     };
     println!(
-        "{} init splats: {} (init region {:?}, r={}mm, init μ={} mm⁻¹, lr_mean={}->{}, lr_deform={}->{}), deform={} (predict_scaling={}, enable_time={}, time_freqs={}[{}-{}Hz]), refine every {}{}",
+        "{} init splats: {} (init region {:?}, r={}mm, init μ={} mm⁻¹, lr_mean={}->{}, lr_deform={}->{}), deform={} (predict_scaling={}), refine every {}",
         ts(),
         trainer.num_splats(),
         init,
@@ -954,16 +872,7 @@ async fn main() -> anyhow::Result<()> {
         lr_deform_end,
         backend_name,
         predict_scaling,
-        enable_time,
-        time_freqs,
-        time_min_freq,
-        time_max_freq,
         refine_every,
-        if respi_after > 0 {
-            format!(", respi staged @ {respi_after} (cardiac phase-only, respi time-only)")
-        } else {
-            String::new()
-        }
     );
 
     let mut dataloader = SceneLoader::new(&dataset.train, 42, &load_config);
@@ -1027,7 +936,7 @@ async fn main() -> anyhow::Result<()> {
         for view in eval_views.iter() {
             let gray = view.gray_image.as_ref().expect("gray GT");
             let gt = TensorData::new(gray.data.as_ref().to_vec(), [gray.height, gray.width]);
-            let sample = trainer.eval_view(&view.camera, &gt, view.phase, view.time).await;
+            let sample = trainer.eval_view(&view.camera, &gt, view.phase, 0.0).await;
             p += sample.psnr;
             s += sample.ssim;
             l += sample.lpips;
@@ -1098,7 +1007,7 @@ async fn main() -> anyhow::Result<()> {
             for view in eval_views.iter() {
                 let gray = view.gray_image.as_ref().expect("gray GT");
                 let vgt = TensorData::new(gray.data.as_ref().to_vec(), [gray.height, gray.width]);
-                let sample = trainer.eval_view(&view.camera, &vgt, view.phase, view.time).await;
+                let sample = trainer.eval_view(&view.camera, &vgt, view.phase, 0.0).await;
                 avg_psnr += sample.psnr;
                 avg_ssim += sample.ssim;
                 avg_lpips += sample.lpips;
@@ -1206,46 +1115,6 @@ async fn main() -> anyhow::Result<()> {
         if !st.success() {
             anyhow::bail!("dump_deform 导出失败 (status={st})");
         }
-    }
-
-    // 可学习时间频率诊断: 训练后网络把频率收敛到数据中的真实运动频率
-    // (如 ~0.8Hz 呼吸)。对照人工统计核验。
-    if enable_time
-        && let Some(freqs) = trainer.learned_time_freqs().await
-    {
-        let sorted = {
-            let mut s = freqs.clone();
-            s.sort_by(|a, b| a.total_cmp(b));
-            s
-        };
-        println!(
-            "{} learned time freqs (Hz): {}",
-            ts(),
-            sorted
-                .iter()
-                .map(|f| format!("{f:.3}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-    }
-    // 分阶段模式: 打印呼吸场学习到的频率 (诊断呼吸收敛)。
-    if respi_after > 0
-        && let Some(freqs) = trainer.respi_learned_time_freqs().await
-    {
-        let sorted = {
-            let mut s = freqs.clone();
-            s.sort_by(|a, b| a.total_cmp(b));
-            s
-        };
-        println!(
-            "{} respi learned time freqs (Hz): {}",
-            ts(),
-            sorted
-                .iter()
-                .map(|f| format!("{f:.3}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
     }
 
     println!("{} done -> {}", ts(), out.display());

@@ -72,16 +72,6 @@ pub struct FitConfig {
     pub deform_backend: String,
     /// 预测 d_scaling (默认不预测 = 保质量形变)。
     pub predict_scaling: bool,
-    pub enable_time: bool,
-    pub no_time: bool,
-    pub time_freqs: usize,
-    pub time_min_freq: f32,
-    pub time_max_freq: f32,
-    pub time_jitter: f32,
-    pub time_tv_weight: f32,
-    pub time_tv_dp: f32,
-    pub time_tv_dt: f32,
-    pub time_tv_sample: usize,
 
     // ---- HexPlane 超参 ----------------------------------------------------
     pub hex_res: u32,
@@ -132,11 +122,6 @@ pub struct FitConfig {
     pub grad_ramp_to: u32,
     pub grad_edge_scale: f32,
 
-    // ---- 分阶段呼吸场 (仅 deform) -------------------------------------------
-    pub respi_after: u32,
-    /// 关闭默认的"冻结心电场"。
-    pub no_respi_freeze: bool,
-
     // ---- 评估与输出 ---------------------------------------------------------
     /// None → static: 500, deform: 100。
     pub eval_every: Option<u32>,
@@ -147,7 +132,7 @@ pub struct FitConfig {
     pub save_eval: bool,
     /// 导出 canonical PLY 点云 (默认关)。
     pub save_ply: bool,
-    /// deform 模式导出 deform_final.bin + 每相位网格场 (默认开)。
+    /// deform 模式导出 deform_final.bin + 每相位网格场 nii.gz (默认关)。
     pub save_deform: bool,
     /// 导出原始参数 .bin (transforms+raw, 供 gs2volume --bin= 复用; 默认关)。
     pub save_bin: bool,
@@ -194,16 +179,6 @@ impl Default for FitConfig {
             warm_up: 300,
             deform_backend: "hexplane".to_owned(),
             predict_scaling: false,
-            enable_time: true,
-            no_time: false,
-            time_freqs: 10,
-            time_min_freq: 0.2,
-            time_max_freq: 1.5,
-            time_jitter: 0.0,
-            time_tv_weight: 0.0,
-            time_tv_dp: 0.0,
-            time_tv_dt: 0.0125,
-            time_tv_sample: 1024,
             hex_res: 64,
             hex_time_res: 32,
             hex_features: 16,
@@ -239,14 +214,12 @@ impl Default for FitConfig {
             grad_ramp_from: 3_000,
             grad_ramp_to: 0,
             grad_edge_scale: 0.03,
-            respi_after: 0,
-            no_respi_freeze: false,
             eval_every: None,
             eval_split_every: None,
             eval_views: 8,
             save_eval: true,
             save_ply: false,
-            save_deform: true,
+            save_deform: false,
             save_bin: false,
             log_csv: None,
             voxel_mm: 1.0,
@@ -272,8 +245,6 @@ pub struct Resolved {
     pub max_screen_size: f32,
     pub enable_ast: bool,
     pub predict_scaling: bool,
-    pub enable_time: bool,
-    pub respi_freeze: bool,
     pub loss_type: brush_loss::gray::GrayLossType,
     pub deform_backend: brush_train::xray_train::DeformBackend,
     pub roi: brush_dataset::config::RoiSpec,
@@ -312,8 +283,6 @@ impl FitConfig {
         let max_screen_size = self.max_screen_size.unwrap_or(0.0);
         let enable_ast = !self.no_ast;
         let predict_scaling = self.predict_scaling;
-        let enable_time = self.enable_time && !self.no_time;
-        let respi_freeze = !self.no_respi_freeze;
         let loss_type = match self.loss.as_str() {
             "l1" => brush_loss::gray::GrayLossType::L1,
             "charbonnier" => brush_loss::gray::GrayLossType::Charbonnier,
@@ -342,8 +311,6 @@ impl FitConfig {
             max_screen_size,
             enable_ast,
             predict_scaling,
-            enable_time,
-            respi_freeze,
             loss_type,
             deform_backend,
             roi,

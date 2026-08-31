@@ -132,48 +132,31 @@ fn xray_to_splats(canonical: &XRaySplats, device: &burn::tensor::Device) -> Spla
     Splats::from_tensor_data(means, rots, log_scales, sh, opac, SplatRenderMode::Default)
 }
 
-/// 自适应体积网格: 每轴 p99.9 的 |mean|+3σ (与显式 extent 取 max, cap
-/// 400mm) — 保证 voxelizer 不截断 splat 密度 (DRR ≈ GS)。
-pub fn adaptive_grid(
-    means: &[f32],
-    log_scales: &[f32],
-    cfg: &FitConfig,
-) -> (f32, f32) {
-    let n = means.len() / 3;
-    let mut half_w: Option<f32> = cfg.extent_xy.map(|e| 0.5 * e);
-    let mut half_z: Option<f32> = cfg.extent_z.map(|e| 0.5 * e);
-    if cfg.extent_xy.is_none() && cfg.extent_z.is_none() && n > 0 {
-        let sig: Vec<f32> = log_scales.iter().map(|&l| l.exp()).collect();
-        let mut p999 = [0.0f32; 3];
-        let mut cmax = [0.0f32; 3];
-        for ax in 0..3 {
-            let mut vals: Vec<f32> = (0..n)
-                .map(|i| means[i * 3 + ax].abs() + 3.0 * sig[i * 3 + ax])
-                .collect();
-            vals.sort_by(|a, b| a.partial_cmp(b).expect("f32"));
-            p999[ax] = vals[((0.999 * vals.len() as f32) as usize).min(vals.len() - 1)];
-            cmax[ax] = vals[vals.len() - 1];
+/// 体积网格 = 输入 DICOM 图像的等中心尺寸 (XY 全宽 = 图像等中心宽度,
+/// Z 全高 = 图像等中心高度), 保证 volume 与输入图像视野一致; `--extent-xy`
+/// / `--extent-z` 可显式覆盖 (半宽 mm)。
+pub fn image_extent_grid(cfg: &FitConfig, half_w_img: f32, half_h_img: f32) -> (f32, f32) {
+    let half_w = cfg.extent_xy.map(|e| 0.5 * e).unwrap_or(half_w_img);
+    let half_z = cfg.extent_z.map(|e| 0.5 * e).unwrap_or(half_h_img);
+    println!(
+        "[volume] grid = image iso-extent: half XY {half_w:.1}mm (W {:.0}mm) Z {half_z:.1}mm (H {:.0}mm){}",
+        2.0 * half_w,
+        2.0 * half_z,
+        if cfg.extent_xy.is_some() || cfg.extent_z.is_some() {
+            " (显式 extent 覆盖)"
+        } else {
+            ""
         }
-        let cap = 400.0f32;
-        let w = p999[0].min(cap).max(p999[1].min(cap));
-        let z = p999[2].min(cap);
-        half_w = Some(half_w.unwrap_or(0.0).max(w));
-        half_z = Some(half_z.unwrap_or(0.0).max(z));
-        println!(
-            "[volume] adaptive grid: splat |mean|+3σ p99.9 = ({:.0},{:.0},{:.0}) max = ({:.0},{:.0},{:.0})mm -> half XY {:.0}mm Z {:.0}mm (cap {cap:.0})",
-            p999[0], p999[1], p999[2], cmax[0], cmax[1], cmax[2],
-            half_w.unwrap(), half_z.unwrap(),
-        );
-    }
-    (half_w.unwrap_or(1.0), half_z.unwrap_or(1.0))
+    );
+    (half_w, half_z)
 }
 
-/// 导出必须的 phase=0 volume: ①deform 模式: canonical 经 phase=0/time=0
-/// 形变场 → deformed splats; ②自适应网格 → voxelize → <out>/volume_phase00.nii.gz。
 pub async fn export_volume_phase0(
     cfg: &FitConfig,
     trainer: &XRayTrainer,
     device: &burn::tensor::Device,
+    half_w_img: f32,
+    half_h_img: f32,
     out: &Path,
 ) -> anyhow::Result<PathBuf> {
     let canonical = trainer.canonical();
@@ -182,7 +165,6 @@ pub async fn export_volume_phase0(
 
     // deform 模式: phase=0, time=0 的形变 (网络 forward, 含 d_rotation)。
     let (means, rots) = if cfg.mode == FitMode::Deform {
-        use burn::module::Module;
         let deform = trainer
             .deform()
             .ok_or_else(|| anyhow::anyhow!("deform mode requires a trained deform network"))?;
@@ -207,7 +189,7 @@ pub async fn export_volume_phase0(
         (means, rots)
     };
 
-    let (half_w, half_z) = adaptive_grid(&means, &log_scales, cfg);
+    let (half_w, half_z) = image_extent_grid(cfg, half_w_img, half_h_img);
     let voxel_mm = cfg.voxel_mm.max(1e-3);
     let n_xy = (2.0 * half_w / voxel_mm).round().max(1.0) as usize;
     let n_z = (2.0 * half_z / voxel_mm).round().max(1.0) as usize;
@@ -345,16 +327,9 @@ pub async fn export_deform(
         .arg(format!("--hex-time-res={}", hex.hex_time_res))
         .arg(format!("--hex-features={}", hex.hex_features))
         .arg(format!("--mlp-width={}", hex.hex_mlp_width))
-        .arg(format!("--mlp-layers={}", hex.hex_mlp_layers))
-        .arg(format!("--time-freqs={}", hex.time_freqs))
-        .arg(format!("--time-min-freq={}", hex.time_min_freq))
-        .arg(format!("--time-max-freq={}", hex.time_max_freq));
+        .arg(format!("--mlp-layers={}", hex.hex_mlp_layers));
     if hex.predict_scaling {
         cmd.arg("--predict-scaling");
-    }
-    let time_on = hex.enable_time && !hex.no_time;
-    if !time_on {
-        cmd.arg("--no-time");
     }
     let st = cmd
         .status()
