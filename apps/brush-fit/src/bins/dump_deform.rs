@@ -74,7 +74,7 @@ impl Default for DumpArgs {
             ckpt: PathBuf::new(),
             scene_extent: 153.0,
             spacing: 1.2,
-            out: PathBuf::from("/tmp/dump"),
+            out: PathBuf::from("dump"),
             n_phase: 8,
             hex_res: 64,
             hex_time: 32,

@@ -18,6 +18,27 @@ cargo build --release -p brush-fit
 env -u DISPLAY CUBECL_WGPU_DEFAULT_DEVICE='DiscreteGpu(N)' ./target/release/brush-fit ...
 ```
 
+### Windows (DLL) 构建
+
+```bash
+# 原生构建 (MSVC 工具链, rustup 默认 host 即 msvc; 无需交叉工具链)
+cargo build --release -p brush-fit
+# 产物 (target\release\):
+#   brush_fit.dll + brush_fit.dll.lib   — C ABI 动态库 + MSVC 导入库
+#   brush-fit.exe / brush-fit-dump.exe  — CLI + deform 场导出子进程
+#   libbrush_fit.a                      — MinGW/GCC 链接用导入库
+```
+
+- **C 调用方**: MSVC `cl my_prog.c /I apps/brush-fit/include /link brush_fit.dll.lib`;
+  MinGW/GCC `gcc my_prog.c -I apps/brush-fit/include -L target/release -lbrush_fit`
+  (自动找 .dll)。头文件已带 `BRUSH_FIT_API` (dllimport/dllexport) 宏。
+- **GPU 后端**: wgpu 在 Windows 优先 DX12 (Vulkan/GL 可选), 无需 DISPLAY
+  处理; 选卡仍用 `CUBECL_WGPU_DEFAULT_DEVICE='DiscreteGpu(N)'`。
+- **deform 场导出**: `brush-fit-dump.exe` 需与宿主程序同目录 (或 PATH /
+  `BRUSH_FIT_DUMP_BIN`), 与 Linux 行为一致。
+- 若需交叉编译 (Linux → Windows): 需 MSVC link.exe (cargo-xwin) 或
+  mingw-w64; 依赖树大 (burn/wgpu/naga), 强烈建议 Windows 原生构建。
+
 ## CLI 用法
 
 ```bash

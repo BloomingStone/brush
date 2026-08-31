@@ -15,6 +15,16 @@
 extern "C" {
 #endif
 
+/* Windows 动态库导出/导入: Rust cdylib 自动 dllexport 符号, 头文件侧
+ * dllimport 供 MSVC 调用方链接 import lib; 非 Windows 为空。 */
+#if defined(_WIN32) && defined(BRUSH_FIT_BUILD)
+#define BRUSH_FIT_API __declspec(dllexport)
+#elif defined(_WIN32)
+#define BRUSH_FIT_API __declspec(dllimport)
+#else
+#define BRUSH_FIT_API
+#endif
+
 #define BRUSH_FIT_OK 0
 #define BRUSH_FIT_ERR 1
 
@@ -26,7 +36,7 @@ typedef void (*brush_fit_progress_cb)(uint32_t iter, uint32_t total, float loss,
  * 注册进度回调 (全局, 训练开始前调用; 线程安全)。
  * user_data 为不透明指针, 原样回传回调。
  */
-void brush_fit_set_progress_cb(brush_fit_progress_cb cb, void* user_data);
+BRUSH_FIT_API void brush_fit_set_progress_cb(brush_fit_progress_cb cb, void* user_data);
 
 /**
  * 训练入口 (同步阻塞直到完成)。
@@ -42,12 +52,12 @@ void brush_fit_set_progress_cb(brush_fit_progress_cb cb, void* user_data);
  *   deform_final.bin + deform_field_phase{p:02}.nii.gz (save_deform=true)
  *   canonical_final_{transforms,raw}.bin (save_bin=true)
  */
-int brush_fit_run(const char* config_json, char* errbuf, size_t errbuf_len);
+BRUSH_FIT_API int brush_fit_run(const char* config_json, char* errbuf, size_t errbuf_len);
 
 /**
  * 生成示例 FitConfig JSON (全部字段 + 默认值), 写入 errbuf; 返回 0。
  */
-int brush_fit_example_config(char* errbuf, size_t errbuf_len);
+BRUSH_FIT_API int brush_fit_example_config(char* errbuf, size_t errbuf_len);
 
 #ifdef __cplusplus
 }
