@@ -140,8 +140,8 @@ pub struct FitConfig {
     pub eval_views: usize,
     /// 保存 eval GT|pred NRRD stack (默认开; --no-eval 时忽略)。
     pub save_eval: bool,
-    /// 关闭 eval: 不 eval/不建 eval 目录/不写 metrics.csv (省 VGG 推理与
-    /// readback; 训练结束无验证指标)。
+    /// 默认关闭: 不 eval/不建 eval 目录/不写 metrics.csv (省 VGG 推理与
+    /// readback; 训练结束无验证指标)。`--eval` 开启。
     pub eval_enabled: bool,
     /// 导出 canonical PLY 点云 (默认关)。
     pub save_ply: bool,
@@ -235,7 +235,7 @@ impl Default for FitConfig {
             eval_split_every: None,
             eval_views: 8,
             save_eval: true,
-            eval_enabled: true,
+            eval_enabled: false,
             save_ply: false,
             save_deform: false,
             save_bin: false,

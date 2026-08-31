@@ -21,21 +21,23 @@ env -u DISPLAY CUBECL_WGPU_DEFAULT_DEVICE='DiscreteGpu(N)' ./target/release/brus
 ## CLI 用法
 
 ```bash
-# 静态重建
+# 静态重建 (默认 no-eval; 加 --eval 开验证集评估)
 ./target/release/brush-fit static images/RXA_chest.dcm \
   --points=5000 --iters=5000 --refine-every=400 \
-  --eval-split-every=5 --eval-views=8 --eval-every=1000 \
+  --eval --eval-split-every=5 --eval-views=8 --eval-every=1000 \
   --fixed-grad-thr=5e-6 --cull-density=0.001 --save-ply --save-bin \
   --out=target/fit_static
 
-# 动态重建 (deform 网络 + 心动相位)
-./target/release/brush-fit deform images/rotate_dsa_raw_gamma_preprocessed.dcm \
-  --points=5000 --iters=10000 --refine-every=400 --eval-split-every=5 \
-  --eval-views=8 --eval-every=1000 --out=target/fit_deform
+# 动态重建 10k 参考命令 (deform 网络 + 心动相位, 仅 phase; no-eval ~10min)
+env -u DISPLAY CUBECL_WGPU_DEFAULT_DEVICE='DiscreteGpu(1)' \
+  ./target/release/brush-fit deform images/rotate_dsa_raw_gamma_preprocessed.dcm \
+  --points=5000 --iters=10000 --refine-every=400 \
+  --save-deform --out=experiments/output/260831-1500_brush-fit-deform-10k-v2
 ```
 
-`--help` 查看全部参数 (与 fit_static/fit_deform CLI 参数一一对应; FDK 与
-time 相关参数已剔除)。scale 约束默认启用 (ab_cap10_pen01:
+**eval 默认关闭** (`--eval` 显式开启; 不 eval 时无 metrics.csv / eval 目录,
+省 VGG 推理与 readback)。`--help` 查看全部参数 (与 fit_static/fit_deform CLI
+参数一一对应; FDK 与 time 相关参数已剔除)。scale 约束默认启用 (ab_cap10_pen01:
 `--screen-area-penalty=0.1 --scale-cap-mm=10 --scale-cap-weight=0.5`,
 细长条抑制); `--scale-aniso-weight` 各向异性正则默认关。模式敏感字段 (init_shape / init_radius_scale /
 init_density / eval_every / percent_dense 等) 缺省按模式默认, 与 fit_*.rs
@@ -50,8 +52,8 @@ time 硬编码 0)。
 │                                  #   affine; deform 模式先过 phase=0 形变场)
 │                                  #   网格 = 输入 DCM 图像的等中心尺寸
 │                                  #   (XY 全宽 = 图宽, Z 全高 = 图高)
-├── metrics.csv                    # 训练指标 (loss/PSNR/SSIM/LPIPS/梯度)
-├── eval/nrrd/gt_pred_*.nrrd       # eval GT|pred 拼接栈 (--no-save-eval 关闭)
+├── metrics.csv                    # 训练指标 (loss/PSNR/SSIM/LPIPS/梯度; 仅 --eval)
+├── eval/nrrd/gt_pred_*.nrrd       # eval GT|pred 拼接栈 (仅 --eval; --no-save-eval 关闭)
 ├── canonical_final.ply            # --save-ply: 点云 (激活域)
 ├── canonical_final_{transforms,raw}.bin  # --save-bin: 原始参数 (gs2volume --bin= 复用)
 ├── deform_final.bin               # --save-deform (deform 模式, 默认关): 网络权重

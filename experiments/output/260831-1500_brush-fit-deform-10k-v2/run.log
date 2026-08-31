@@ -1,0 +1,78 @@
+[15:15:29] brush-fit deform -> experiments/output/260831-1500_brush-fit-deform-10k-v2
+ROI crop: full 648x474 -> (20,20) 608x434
+[loaded] 402 views, frame0 608x434
+[cardiac phase] 402 views, range [0.000, 0.988], 80 unique values
+[real time] [0.000, 5.012] s (402 frames, 5.012 s total)
+[auto scene_extent] 264.0 mm (min(SOD 760, SDD-SOD 440) x 0.6)
+[auto gamma] = 1.000 (median -> 0.50)
+FOV filter: kept 5000/5000 random points (rejected 7340 outside every view)
+[15:15:44] init splats: 5000 (init region Ball { radius: 264.0 }, r=264mm, init μ=0.01 mm⁻¹, lr_mean=0.00002->0.000002)
+[15:16:02] refine iter 400: 5000 splats (added 0, split 0, pruned 0) grad_thr=-1 | >R0=4041/5000 (80.8%), meanμ=0.00765
+[15:16:19] refine iter 800: 8708 splats (added 3708, split 2067, pruned 0) grad_thr=0.000005 | >R0=7048/8708 (80.9%), meanμ=0.00660
+[15:16:47] refine iter 1200: 13789 splats (added 5460, split 2862, pruned 379) grad_thr=0.000005 | >R0=11347/13789 (82.3%), meanμ=0.00491
+[15:17:10] refine iter 1600: 19283 splats (added 6854, split 4092, pruned 1360) grad_thr=0.000005 | >R0=16020/19283 (83.1%), meanμ=0.00392
+[15:17:39] refine iter 2000: 24525 splats (added 7634, split 4872, pruned 2392) grad_thr=0.000005 | >R0=20453/24525 (83.4%), meanμ=0.00338
+[15:18:12] refine iter 2400: 29482 splats (added 8007, split 4953, pruned 3050) grad_thr=0.000005 | >R0=24515/29482 (83.2%), meanμ=0.00307
+[15:18:45] refine iter 2800: 33657 splats (added 7699, split 4423, pruned 3524) grad_thr=0.000005 | >R0=27713/33657 (82.3%), meanμ=0.00284
+[15:19:20] refine iter 3200: 36993 splats (added 6906, split 3830, pruned 3570) grad_thr=0.000005 | >R0=29905/36993 (80.8%), meanμ=0.00264
+[15:19:56] refine iter 3600: 39546 splats (added 6147, split 3493, pruned 3594) grad_thr=0.000005 | >R0=31236/39546 (79.0%), meanμ=0.00252
+[15:20:32] refine iter 4000: 41451 splats (added 5487, split 3193, pruned 3582) grad_thr=0.000005 | >R0=32035/41451 (77.3%), meanμ=0.00241
+[15:21:10] refine iter 4400: 42916 splats (added 4962, split 2948, pruned 3497) grad_thr=0.000005 | >R0=32365/42916 (75.4%), meanμ=0.00234
+[15:21:48] refine iter 4800: 44047 splats (added 4504, split 2688, pruned 3373) grad_thr=0.000005 | >R0=32448/44047 (73.7%), meanμ=0.00229
+[15:22:27] refine iter 5200: 44700 splats (added 3938, split 2461, pruned 3285) grad_thr=0.000005 | >R0=32338/44700 (72.3%), meanμ=0.00224
+[15:23:06] refine iter 5600: 45317 splats (added 3723, split 2332, pruned 3106) grad_thr=0.000005 | >R0=32132/45317 (70.9%), meanμ=0.00220
+[15:23:45] refine iter 6000: 45542 splats (added 3255, split 2066, pruned 3030) grad_thr=0.000005 | >R0=31824/45542 (69.9%), meanμ=0.00217
+[15:24:25] refine iter 6400: 46002 splats (added 3152, split 2046, pruned 2692) grad_thr=0.000005 | >R0=31499/46002 (68.5%), meanμ=0.00215
+[15:25:06] refine iter 6800: 46051 splats (added 2735, split 1788, pruned 2686) grad_thr=0.000005 | >R0=31179/46051 (67.7%), meanμ=0.00213
+[15:25:47] refine iter 7200: 45856 splats (added 2482, split 1671, pruned 2677) grad_thr=0.000005 | >R0=30604/45856 (66.7%), meanμ=0.00211
+[15:26:28] refine iter 7600: 46033 splats (added 2471, split 1690, pruned 2294) grad_thr=0.000005 | >R0=30258/46033 (65.7%), meanμ=0.00209
+[15:27:08] refine iter 8000: 46164 splats (added 2323, split 1629, pruned 2192) grad_thr=0.000005 | >R0=29949/46164 (64.9%), meanμ=0.00208
+[15:27:42] refine iter 8400: 46230 splats (added 2230, split 1586, pruned 2164) grad_thr=0.000005 | >R0=29609/46230 (64.0%), meanμ=0.00206
+[15:28:11] refine iter 8800: 46153 splats (added 2107, split 1521, pruned 2184) grad_thr=0.000005 | >R0=29203/46153 (63.3%), meanμ=0.00205
+[export] deform ckpt -> experiments/output/260831-1500_brush-fit-deform-10k-v2/deform_final.bin
+[export] deform field via brush-fit-dump (spacing 4.12mm, cell 8.25mm, 每单元 2.0 采样)...
+[dump] loaded experiments/output/260831-1500_brush-fit-deform-10k-v2/deform_final.bin (coord_scale=264, rs=64)
+[dump] grid 128^3, spacing 4.125mm (cell 8.25mm, 每单元 2.0 采样)
+[dump] phase=0.000 -> experiments/output/260831-1500_brush-fit-deform-10k-v2/deform_field_phase00.nii.gz
+[dump] phase=0.125 -> experiments/output/260831-1500_brush-fit-deform-10k-v2/deform_field_phase01.nii.gz
+[dump] phase=0.250 -> experiments/output/260831-1500_brush-fit-deform-10k-v2/deform_field_phase02.nii.gz
+[dump] phase=0.375 -> experiments/output/260831-1500_brush-fit-deform-10k-v2/deform_field_phase03.nii.gz
+[dump] phase=0.500 -> experiments/output/260831-1500_brush-fit-deform-10k-v2/deform_field_phase04.nii.gz
+[dump] phase=0.625 -> experiments/output/260831-1500_brush-fit-deform-10k-v2/deform_field_phase05.nii.gz
+
+thread 'DSD-4-0' (3349398) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+[dump] phase=0.750 -> experiments/output/260831-1500_brush-fit-deform-10k-v2/deform_field_phase06.nii.gz
+
+thread 'DSD-4-0' (3349398) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+
+thread 'DSD-4-0' (3349398) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+
+thread 'DSD-4-0' (3349398) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+
+thread 'DSD-4-0' (3349398) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+
+thread 'DSD-4-0' (3349398) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+
+thread 'DSD-4-0' (3349398) panicked at /home/shi_jie/.cargo/git/checkouts/wgpu-50febe783b343bfe/49686ba/wgpu/src/backend/wgpu_core.rs:1616:18:
+wgpu error: Out of Memory
+
+[dump] phase=0.875 -> experiments/output/260831-1500_brush-fit-deform-10k-v2/deform_field_phase07.nii.gz
+[dump] done -> experiments/output/260831-1500_brush-fit-deform-10k-v2/deform_field
+[volume] deform phase=0, time=0: max |d| = 50.74 mm (含 d_rotation)
+[volume] grid = image iso-extent: half XY 118.6mm (W 237mm) Z 84.7mm (H 169mm)
+[volume] grid 237x237x169 @ 1.00mm (span XY 237mm Z 169mm)
+[export] volume -> experiments/output/260831-1500_brush-fit-deform-10k-v2/volume_phase00.nii.gz
+[15:29:47] done -> experiments/output/260831-1500_brush-fit-deform-10k-v2

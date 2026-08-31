@@ -192,9 +192,9 @@ struct CommonArgs {
     /// 关闭 eval GT|pred NRRD 保存。
     #[arg(long)]
     no_save_eval: bool,
-    /// 完全关闭 eval (不建 eval 目录, 不写 metrics.csv)。
+    /// 开启 eval (默认关闭: 不建 eval 目录, 不写 metrics.csv)。
     #[arg(long)]
-    no_eval: bool,
+    eval: bool,
     /// 导出 canonical PLY 点云。
     #[arg(long)]
     save_ply: bool,
@@ -295,7 +295,7 @@ impl CommonArgs {
             eval_split_every: self.eval_split_every,
             eval_views: self.eval_views,
             save_eval: !self.no_save_eval,
-            eval_enabled: !self.no_eval,
+            eval_enabled: self.eval,
             save_ply: self.save_ply,
             save_deform: self.save_deform,
             save_bin: self.save_bin,
