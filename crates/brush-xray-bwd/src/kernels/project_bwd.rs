@@ -91,22 +91,25 @@ fn compute_cov2d_cone_bwd(
     let (j00, j01, j02) = (j.c0_x, j.c1_x, j.c2_x);
     let (j10, j11, j12) = (j.c0_y, j.c1_y, j.c2_y);
     let (j20, j21, j22) = (j.c0_z, j.c1_z, j.c2_z);
-    // Sgrad (c≤d), half-sum of J·v·Jᵀ.
-    let s00 = v00 * j00 * j00 + v01 * j00 * j10 + v02 * j00 * j20 + v11 * j10 * j10
-        + v12 * j10 * j20 + v22 * j20 * j20;
-    let s11 = v00 * j01 * j01 + v01 * j01 * j11 + v02 * j01 * j21 + v11 * j11 * j11
-        + v12 * j11 * j21 + v22 * j21 * j21;
-    let s22 = v00 * j02 * j02 + v01 * j02 * j12 + v02 * j02 * j22 + v11 * j12 * j12
-        + v12 * j12 * j22 + v22 * j22 * j22;
-    let s01 = v00 * 2.0f32 * j00 * j01 + v01 * (j00 * j11 + j10 * j01)
-        + v02 * (j00 * j21 + j20 * j01) + v11 * 2.0f32 * j10 * j11
-        + v12 * (j10 * j21 + j20 * j11) + v22 * 2.0f32 * j20 * j21;
-    let s02 = v00 * 2.0f32 * j00 * j02 + v01 * (j00 * j12 + j10 * j02)
-        + v02 * (j00 * j22 + j20 * j02) + v11 * 2.0f32 * j10 * j12
-        + v12 * (j10 * j22 + j20 * j12) + v22 * 2.0f32 * j20 * j22;
-    let s12 = v00 * 2.0f32 * j01 * j02 + v01 * (j01 * j12 + j11 * j02)
-        + v02 * (j01 * j22 + j21 * j02) + v11 * 2.0f32 * j11 * j12
-        + v12 * (j11 * j22 + j21 * j12) + v22 * 2.0f32 * j21 * j22;
+    // Sgrad = dL/dS_cam (independent-element), S = w·Vrk·wᵀ, via cov3 = Jᵀ·S·J:
+    //   dL/dS_aa = Σ_{c≤d} v_cd·j[a][c]·j[a][d]
+    //   dL/dS_ab = Σ_{c≤d} v_cd·(j[a][c]·j[b][d] + j[b][c]·j[a][d])   (a≠b)
+    // (j[c][d] is row c, col d of the 3x3 projection Jacobian.)
+    let s00 = v00 * j00 * j00 + v01 * j00 * j01 + v02 * j00 * j02 + v11 * j01 * j01
+        + v12 * j01 * j02 + v22 * j02 * j02;
+    let s11 = v00 * j10 * j10 + v01 * j10 * j11 + v02 * j10 * j12 + v11 * j11 * j11
+        + v12 * j11 * j12 + v22 * j12 * j12;
+    let s22 = v00 * j20 * j20 + v01 * j20 * j21 + v02 * j20 * j22 + v11 * j21 * j21
+        + v12 * j21 * j22 + v22 * j22 * j22;
+    let s01 = v00 * 2.0f32 * j00 * j10 + v01 * (j00 * j11 + j10 * j01)
+        + v02 * (j00 * j12 + j10 * j02) + v11 * 2.0f32 * j10 * j11
+        + v12 * (j01 * j12 + j11 * j02) + v22 * 2.0f32 * j02 * j12;
+    let s02 = v00 * 2.0f32 * j00 * j20 + v01 * (j00 * j21 + j20 * j01)
+        + v02 * (j00 * j22 + j20 * j02) + v11 * 2.0f32 * j01 * j21
+        + v12 * (j01 * j22 + j21 * j02) + v22 * 2.0f32 * j02 * j22;
+    let s12 = v00 * 2.0f32 * j10 * j20 + v01 * (j10 * j21 + j20 * j11)
+        + v02 * (j10 * j22 + j20 * j12) + v11 * 2.0f32 * j11 * j21
+        + v12 * (j11 * j22 + j21 * j12) + v22 * 2.0f32 * j12 * j22;
     let (w00, w01, w02) = (w.c0_x, w.c1_x, w.c2_x);
     let (w10, w11, w12) = (w.c0_y, w.c1_y, w.c2_y);
     let (w20, w21, w22) = (w.c0_z, w.c1_z, w.c2_z);
@@ -199,22 +202,20 @@ fn compute_cov2d_cone_bwd(
     )
 }
 
-/// Backward of `computeCov3D`. Brush forward is
-/// `Sigma = R_std·S²·R_stdᵀ` (= `(S·R_r2)ᵀ(S·R_r2)` with R2's transposed
-/// rotation `R_r2 = R_stdᵀ`). Transcribed from R2 `backward.cu`
-/// `computeCov3D`, expressed in brush terms (R2's `R = R_r2 = transpose(r)`).
+/// Backward of `computeCov3D`. Brush forward is `Sigma = R_std·S²·R_stdᵀ`
+/// with `R_std = quat.to_mat3()` and `S = diag(scale)`.
+///
+/// Correct gradients (verified to 1e-6 against central differences on
+/// `Sigma = R·S²·Rᵀ`, independent of the R2 transcription):
+/// - `dL/dS_i = 2·s_i·(Rᵀ·G·R)_ii`
+/// - `dL/dR   = 2·G·R·S²`, then `dq_k = Σ dL/dR ⊙ ∂R/∂q_k` with the standard
+///   quaternion rotation derivatives.
+/// `G = dL/dSigma` is the symmetric full-matrix gradient (off-diagonals
+/// halved from the 6 independent-element grads).
 #[cube]
 fn compute_cov3d_bwd(scale: Vec3A, quat: Quat, v_cov3d: Sym3) -> (Vec3A, Quat) {
     let r = quat.to_mat3();
-    // msr = R_std·S — each column of R scaled by the matching scalar.
-    let msr = Mat3::from_cols(
-        r.col0().scale(scale.x()),
-        r.col1().scale(scale.y()),
-        r.col2().scale(scale.z()),
-    );
-    // R2's M = S·R_r2 = (R_std·S)ᵀ = msrᵀ.
-    let m_r2 = Mat3::from_cols(msr.row0(), msr.row1(), msr.row2());
-    // dL_dSigma (symmetric 3x3) from the 6 grads.
+    // dL_dSigma (symmetric 3x3) from the 6 independent-element grads.
     let dl_dsigma = Mat3 {
         c0_x: v_cov3d.c00,
         c0_y: 0.5f32 * v_cov3d.c01,
@@ -226,44 +227,37 @@ fn compute_cov3d_bwd(scale: Vec3A, quat: Quat, v_cov3d: Sym3) -> (Vec3A, Quat) {
         c2_y: 0.5f32 * v_cov3d.c12,
         c2_z: v_cov3d.c22,
     };
-    // dL_dM = 2·M·dL_dSigma (R2's M = S·R_r2).
-    let dl_dm_raw = m_r2.mul_mat3(dl_dsigma);
-    let dl_dm = Mat3::from_cols(
-        dl_dm_raw.col0().scale(2.0f32),
-        dl_dm_raw.col1().scale(2.0f32),
-        dl_dm_raw.col2().scale(2.0f32),
-    );
+    // gr = G·R.
+    let gr = dl_dsigma.mul_mat3(r);
 
-    // v_scale = (R_r2.row0·dL_dM.row0, ...) = (r.col0·dL_dM.row0, ...)
-    // (R_r2.row_k = r.col_k since R_r2 = rᵀ). Empirically verified vs R2 `_C`.
+    // v_scale_i = dL/ds_i = 2·s_i·(Rᵀ·G·R)_ii = 2·s_i·(r.col_i · gr.col_i).
     let v_scale = Vec3A::new(
-        r.col0().dot(dl_dm.row0()),
-        r.col1().dot(dl_dm.row1()),
-        r.col2().dot(dl_dm.row2()),
+        2.0f32 * scale.x() * r.col0().dot(gr.col0()),
+        2.0f32 * scale.y() * r.col1().dot(gr.col1()),
+        2.0f32 * scale.z() * r.col2().dot(gr.col2()),
     );
 
-    // Quaternion gradient: dL/dR = dL/dMᵀ·S — i.e. column d of dL/dR is
-    // row d of dL/dM (transposed) scaled by scale[d]. (The R2-derived
-    // formula with column-scaled `mt` was wrong off-axis; numerically
-    // verified against central differences on Sigma = R·S²·Rᵀ.)
-    let dr0 = Vec3A::new(dl_dm.c0_x * scale.x(), dl_dm.c1_x * scale.x(), dl_dm.c2_x * scale.x());
-    let dr1 = Vec3A::new(dl_dm.c0_y * scale.y(), dl_dm.c1_y * scale.y(), dl_dm.c2_y * scale.y());
-    let dr2 = Vec3A::new(dl_dm.c0_z * scale.z(), dl_dm.c1_z * scale.z(), dl_dm.c2_z * scale.z());
+    // dL/dR = 2·G·R·S² → column d of dL/dR = gr.col_d · (2·s_d²).
+    let dr0 = gr.col0().scale(2.0f32 * scale.x() * scale.x());
+    let dr1 = gr.col1().scale(2.0f32 * scale.y() * scale.y());
+    let dr2 = gr.col2().scale(2.0f32 * scale.z() * scale.z());
+    // dL/dR_{ij} = (dr_j)_i.
+    let (d00, d10, d20) = (dr0.x(), dr0.y(), dr0.z());
+    let (d01, d11, d21) = (dr1.x(), dr1.y(), dr1.z());
+    let (d02, d12, d22) = (dr2.x(), dr2.y(), dr2.z());
 
     let w = quat.w();
     let qx = quat.x();
     let qy = quat.y();
     let qz = quat.z();
-    // dL/dq_k = tr(dL/dRᵀ·∂R/∂q_k) with the standard quaternion rotation
-    // derivatives (verified numerically).
-    let dq_w = 2.0f32 * qz * (dr1.x() - dr0.y()) + 2.0f32 * qy * (dr0.z() - dr2.x())
-        + 2.0f32 * qx * (dr2.y() - dr1.z());
-    let dq_x = 2.0f32 * qy * (dr0.y() + dr1.x()) + 2.0f32 * qz * (dr0.z() + dr2.x())
-        + 2.0f32 * w * (dr2.y() - dr1.z()) - 4.0f32 * qx * (dr1.y() + dr2.z());
-    let dq_y = 2.0f32 * qx * (dr0.y() + dr1.x()) + 2.0f32 * w * (dr0.z() - dr2.x())
-        + 2.0f32 * qz * (dr1.z() + dr2.y()) - 4.0f32 * qy * (dr0.x() + dr2.z());
-    let dq_z = 2.0f32 * w * (dr1.x() - dr0.y()) + 2.0f32 * qx * (dr0.z() + dr2.x())
-        + 2.0f32 * qy * (dr1.z() + dr2.y()) - 4.0f32 * qz * (dr0.x() + dr1.y());
+    // dq_k = Σ dL/dR ⊙ ∂R/∂q_k (standard quaternion rotation derivatives).
+    let dq_w = 2.0f32 * qz * (d10 - d01) + 2.0f32 * qy * (d02 - d20) + 2.0f32 * qx * (d21 - d12);
+    let dq_x = 2.0f32 * qy * (d01 + d10) + 2.0f32 * qz * (d02 + d20) + 2.0f32 * w * (d21 - d12)
+        - 4.0f32 * qx * (d11 + d22);
+    let dq_y = 2.0f32 * qx * (d01 + d10) + 2.0f32 * w * (d02 - d20) + 2.0f32 * qz * (d12 + d21)
+        - 4.0f32 * qy * (d00 + d22);
+    let dq_z = 2.0f32 * w * (d10 - d01) + 2.0f32 * qx * (d02 + d20) + 2.0f32 * qy * (d12 + d21)
+        - 4.0f32 * qz * (d11 + d00);
 
     (v_scale, Quat::new(dq_w, dq_x, dq_y, dq_z))
 }

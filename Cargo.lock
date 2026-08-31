@@ -1060,6 +1060,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "brush-fit"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "brush-cube",
+ "brush-dataset",
+ "brush-deform",
+ "brush-dicom",
+ "brush-loss",
+ "brush-render",
+ "brush-serde",
+ "brush-train",
+ "brush-vfs",
+ "brush-voxel",
+ "brush-xray",
+ "brush-xray-bwd",
+ "burn",
+ "burn-cubecl",
+ "burn-wgpu",
+ "clap",
+ "flate2",
+ "glam",
+ "log",
+ "ndarray 0.16.1",
+ "nifti",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-stream",
+ "web-time",
+]
+
+[[package]]
 name = "brush-js"
 version = "0.3.0"
 dependencies = [
