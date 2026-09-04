@@ -70,5 +70,7 @@ experiments/output/**/*.nrrd
 experiments/output/**/*.npy
 experiments/output/**/*.png
 experiments/output/**/*.json
+experiments/output/**/*.txt
+experiments/output/**/*.npz
 # 边缘分析输出
 **/*.edge_analysis/
